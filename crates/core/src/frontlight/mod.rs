@@ -1,11 +1,13 @@
 mod standard;
 mod natural;
 mod premixed;
+mod kindle;
 
 use serde::{Serialize, Deserialize};
 pub use self::standard::StandardFrontlight;
 pub use self::natural::NaturalFrontlight;
 pub use self::premixed::PremixedFrontlight;
+pub use self::kindle::KindleFrontlight;
 use crate::geom::lerp;
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]

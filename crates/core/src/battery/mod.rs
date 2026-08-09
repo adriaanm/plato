@@ -1,9 +1,11 @@
 mod kobo;
+mod kindle;
 mod fake;
 
 use anyhow::Error;
 
 pub use self::kobo::KoboBattery;
+pub use self::kindle::KindleBattery;
 pub use self::fake::FakeBattery;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
