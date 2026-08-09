@@ -52,7 +52,7 @@ use crate::document::{Document, open, Location, TextLocation, BoundedText, Neigh
 use crate::document::layout;
 use crate::document::{TocEntry, SimpleTocEntry, TocLocation, toc_as_html, annotations_as_html, bookmarks_as_html};
 use crate::document::html::HtmlDocument;
-use crate::metadata::{Info, FileInfo, ReaderInfo, Annotation, TextAlign, ZoomMode, ScrollMode, PageScheme};
+use crate::metadata::{Info, FileInfo, ReaderInfo, Annotation, TextAlign, ZoomMode, ScrollMode, ColumnMode, PageScheme};
 use crate::metadata::{Margin, CroppingMargins, make_query};
 use crate::metadata::{DEFAULT_CONTRAST_EXPONENT, DEFAULT_CONTRAST_GRAY};
 use crate::geom::{Point, Vec2, Rectangle, Boundary, CornerSpec, BorderSpec};
@@ -77,6 +77,7 @@ pub struct Reader {
     doc: Arc<Mutex<Box<dyn Document>>>,
     cache: BTreeMap<usize, Resource>,                // Cached page pixmaps.
     chunks: Vec<RenderChunk>,                        // Chunks of pages being rendered.
+    column_splits: FxHashMap<usize, Option<f32>>,    // Which pages follow the document's column layout.
     text: FxHashMap<usize, Vec<BoundedText>>,        // Text of the current chunks.
     annotations: FxHashMap<usize, Vec<Annotation>>,  // Annotations for the current chunks.
     noninverted_regions: FxHashMap<usize, Vec<Boundary>>,
@@ -106,6 +107,7 @@ struct ViewPort {
     scroll_mode: ScrollMode,
     page_offset: Point,   // Offset relative to the top left corner of a resource's frame.
     margin_width: i32,
+    column: u8,           // Which column of the current page is being read.
 }
 
 impl Default for ViewPort {
@@ -115,6 +117,7 @@ impl Default for ViewPort {
             scroll_mode: ScrollMode::Screen,
             page_offset: pt!(0, 0),
             margin_width: 0,
+            column: 0,
         }
     }
 }
@@ -146,6 +149,7 @@ struct RenderChunk {
     frame: Rectangle,  // A subrectangle of the corresponding resource's frame.
     position: Point,
     scale: f32,
+    column: u8,        // Which column of its page this chunk shows.
 }
 
 #[derive(Debug)]
@@ -205,6 +209,20 @@ fn scaling_factor(rect: &Rectangle, cropping_margin: &Margin, screen_margin_widt
     }
 }
 
+/// What one sampling pass over a paginated document can say about its layout.
+///
+/// Both halves come out of the *same* pass, and that is the point: sampling is
+/// the expensive part -- one fz_stext extraction per sampled page, on a 1 GHz
+/// Cortex-A9 -- and the column histogram wants exactly the lines the content
+/// box already asked for, over exactly the crop box it just computed.
+/// Detecting columns therefore costs no extra extraction at all.
+struct LayoutAnalysis {
+    /// The aggregate content box, as cropping margins.
+    margin: Option<Margin>,
+    /// The number of columns and the gutter, as a fraction of the page width.
+    columns: Option<(u8, f32)>,
+}
+
 /// Detect a paginated document's content box and return it as cropping
 /// margins. `None` means "leave it uncropped", which is always correct.
 ///
@@ -220,10 +238,11 @@ fn scaling_factor(rect: &Rectangle, cropping_margin: &Margin, screen_margin_widt
 /// layer has already failed on most of the sample -- `boundary_box` includes
 /// rules, page borders and scanner edge noise, so it is a worse estimator
 /// wherever stext works at all.
-fn auto_crop_margins(doc: &mut dyn Document, sample: usize) -> Option<Margin> {
+fn analyse_layout(doc: &mut dyn Document, sample: usize, detect_columns: bool) -> LayoutAnalysis {
+    let nothing = LayoutAnalysis { margin: None, columns: None };
     let indices = layout::sample_indices(doc.pages_count(), sample);
-    let &first = indices.first()?;
-    let dims = doc.dims(first)?;
+    let Some(&first) = indices.first() else { return nothing };
+    let Some(dims) = doc.dims(first) else { return nothing };
     let same_size = |index: usize, doc: &mut dyn Document| {
         doc.dims(index).map_or(false, |(w, h)| {
             (w - dims.0).abs() < 1.0 && (h - dims.1).abs() < 1.0
@@ -231,6 +250,7 @@ fn auto_crop_margins(doc: &mut dyn Document, sample: usize) -> Option<Margin> {
     };
 
     let mut boxes = Vec::with_capacity(indices.len());
+    let mut per_page = Vec::with_capacity(indices.len());
 
     for &index in &indices {
         if !same_size(index, doc) {
@@ -242,15 +262,44 @@ fn auto_crop_margins(doc: &mut dyn Document, sample: usize) -> Option<Margin> {
                         .map(|(images, _)| images).unwrap_or_default();
         if let Some(bnd) = layout::content_box(&lines, &images) {
             boxes.push(bnd);
+            if detect_columns {
+                per_page.push(lines.iter().filter(|l| l.is_horizontal())
+                                   .map(|l| l.rect).collect::<Vec<Boundary>>());
+            }
         }
     }
+
+    let columns = if detect_columns {
+        // Over the *unpadded* aggregate box, and per page: a summed histogram
+        // is a different and wrong answer. See `layout::page_gutter`.
+        layout::aggregate_box(&boxes).and_then(|content| {
+            let gutters: Vec<Option<f32>> = per_page.iter()
+                .map(|lines| layout::page_gutter(lines, &content))
+                .collect();
+            let vote = layout::column_vote(&gutters);
+            vote.is_two_column(layout::COLUMN_VOTE_THRESHOLD)
+                .then(|| vote.gutter.map(|x| (2u8, x / dims.0)))
+                .flatten()
+        })
+    } else {
+        None
+    };
+
+    LayoutAnalysis { margin: auto_crop_margins(doc, &indices, dims, boxes, same_size), columns }
+}
+
+/// The crop half of [`analyse_layout`], split out only to keep the scan
+/// fallback readable. `boxes` is what the shared pass already collected.
+fn auto_crop_margins(doc: &mut dyn Document, indices: &[usize], dims: (f32, f32),
+                     mut boxes: Vec<Boundary>,
+                     same_size: impl Fn(usize, &mut dyn Document) -> bool) -> Option<Margin> {
 
     // No text layer worth the name: a scan. Every method in `layout` is
     // stext-based and degrades to nothing here, so fall back to the ink bbox,
     // which MuPDF computes from the display list and which works on an image.
     if boxes.len() < layout::MIN_USABLE_PAGES {
         boxes.clear();
-        for &index in &indices {
+        for &index in indices {
             if !same_size(index, doc) {
                 continue;
             }
@@ -432,6 +481,10 @@ impl Reader {
                     view_port.page_offset = page_offset;
                 }
 
+                if let Some(column) = r.current_column {
+                    view_port.column = column;
+                }
+
                 if !doc.is_reflowable() {
                     view_port.margin_width = mm_to_px(r.screen_margin_width.unwrap_or(0) as f32,
                                                       CURRENT_DEVICE.dpi) as i32;
@@ -482,20 +535,44 @@ impl Reader {
             // overwrite one. Turning `auto-crop` off later leaves the crops it
             // already detected in place, which is the same contract the manual
             // cropper has always had.
-            if !reflowable && settings.reader.auto_crop &&
-               info.reader.as_ref().is_some_and(|r| r.cropping_margins.is_none()) {
-                if let Some(margin) = auto_crop_margins(doc.as_mut(), settings.reader.crop_sample_pages) {
-                    if let Some(r) = info.reader.as_mut() {
-                        r.cropping_margins = Some(CroppingMargins::Any(margin));
+            //
+            // Columns are decided in the same pass and on the same terms:
+            // once, on first open, from the sample the crop already paid for.
+            // A single-column document is stored as `columns: Some(1)`, which
+            // is what stops the pass running a second time -- "not measured"
+            // and "measured, one column" are different states.
+            let needs_crop = settings.reader.auto_crop &&
+                             info.reader.as_ref().is_some_and(|r| r.cropping_margins.is_none());
+            let needs_columns = settings.reader.auto_columns &&
+                                info.reader.as_ref().is_some_and(|r| r.columns.is_none());
+
+            if !reflowable && (needs_crop || needs_columns) {
+                let analysis = analyse_layout(doc.as_mut(), settings.reader.crop_sample_pages,
+                                              needs_columns);
+                if let Some(r) = info.reader.as_mut() {
+                    if needs_crop {
+                        if let Some(margin) = analysis.margin {
+                            r.cropping_margins = Some(CroppingMargins::Any(margin));
+                            // A stored `page_offset` was measured against the
+                            // uncropped frame and means something else under a
+                            // crop. `Reader` has no cache to remap it through
+                            // yet -- that is what `crop_margins` does for a
+                            // crop applied to a *running* reader -- so the
+                            // honest thing is to start at the top of the page
+                            // rather than at a position computed from a frame
+                            // that no longer exists.
+                            view_port.page_offset = pt!(0, 0);
+                        }
                     }
-                    // A stored `page_offset` was measured against the uncropped
-                    // frame and means something else under a crop. `Reader` has
-                    // no cache to remap it through yet -- that is what
-                    // `crop_margins` does for a crop applied to a *running*
-                    // reader -- so the honest thing is to start at the top of
-                    // the page rather than at a position computed from a frame
-                    // that no longer exists.
-                    view_port.page_offset = pt!(0, 0);
+                    if needs_columns {
+                        match analysis.columns {
+                            Some((columns, split)) => {
+                                r.columns = Some(columns);
+                                r.column_split = Some(split);
+                            },
+                            None => r.columns = Some(1),
+                        }
+                    }
                 }
             }
 
@@ -510,6 +587,7 @@ impl Reader {
                 doc: Arc::new(Mutex::new(doc)),
                 cache: BTreeMap::new(),
                 chunks: Vec::new(),
+                column_splits: FxHashMap::default(),
                 text: FxHashMap::default(),
                 annotations: FxHashMap::default(),
                 noninverted_regions: FxHashMap::default(),
@@ -575,6 +653,7 @@ impl Reader {
             doc: Arc::new(Mutex::new(Box::new(doc))),
             cache: BTreeMap::new(),
             chunks: Vec::new(),
+            column_splits: FxHashMap::default(),
             text: FxHashMap::default(),
             annotations: FxHashMap::default(),
             noninverted_regions: FxHashMap::default(),
@@ -599,10 +678,107 @@ impl Reader {
         }
     }
 
+    /// The gutter this document is read around, as a fraction of the page
+    /// width, or `None` when it is not being read in columns at all.
+    ///
+    /// Column mode lives entirely inside fit-to-width plus screen scrolling.
+    /// Anywhere else -- fit to page, a custom zoom, page-at-a-time scrolling --
+    /// a column is not a unit the navigation knows how to move through, so the
+    /// document renders exactly as it did before columns existed.
+    fn column_split(&self) -> Option<f32> {
+        if self.reflowable ||
+           self.view_port.zoom_mode != ZoomMode::FitToWidth ||
+           self.view_port.scroll_mode != ScrollMode::Screen {
+            return None;
+        }
+
+        let r = self.info.reader.as_ref()?;
+
+        match r.column_mode.unwrap_or(ColumnMode::Auto) {
+            ColumnMode::Off => None,
+            ColumnMode::Auto => if r.columns.unwrap_or(1) >= 2 { r.column_split } else { None },
+            // Forced on with nothing detected: split the crop down the middle.
+            // Someone asking for two columns on a document the detector called
+            // single is telling us the detector was wrong about it.
+            ColumnMode::On => r.column_split.or_else(|| {
+                let m = r.cropping_margins.as_ref()
+                         .map(|c| c.margin(self.current_page).clone())
+                         .unwrap_or_default();
+                Some((m.left + 1.0 - m.right) / 2.0)
+            }),
+        }
+    }
+
+    /// The split to use for one page, or `None` if that page is read full
+    /// width.
+    ///
+    /// This is the per-page opt-out, and it is what keeps a title page, a
+    /// full-width table or a plate from being sliced down the middle -- 0-21%
+    /// of the content of the two-column papers measured. A page votes with its
+    /// own histogram but is always split at the *document's* gutter, which is
+    /// stable to a couple of points within a paper and is the more reliable
+    /// number.
+    ///
+    /// The answer is memoised per page: it costs one fz_stext extraction, and
+    /// it is asked once per rasterisation and again on every turn.
+    fn page_split(&mut self, location: usize) -> Option<f32> {
+        let split = self.column_split()?;
+
+        if let Some(cached) = self.column_splits.get(&location) {
+            return *cached;
+        }
+
+        let (dims, lines) = {
+            let mut doc = self.doc.lock().unwrap();
+            (doc.dims(location),
+             doc.lines(Location::Exact(location)).map(|(lines, _)| lines).unwrap_or_default())
+        };
+
+        // No dimensions means no page; don't memoise an answer about it.
+        let dims = match dims {
+            Some(dims) => dims,
+            None => return None,
+        };
+
+        let margin = self.info.reader.as_ref()
+                         .and_then(|r| r.cropping_margins.as_ref().map(|c| c.margin(location)))
+                         .cloned().unwrap_or_default();
+        let rects: Vec<Boundary> = lines.iter().map(|l| l.rect).collect();
+        let gutter = layout::page_gutter(&rects, &layout::crop_box(&margin, dims));
+        let follows = layout::page_follows_document(gutter, split * dims.0, dims.0);
+        let result = if follows { Some(split) } else { None };
+
+        self.column_splits.insert(location, result);
+        result
+    }
+
+    /// How many columns a page is read in: two, or one if it opted out.
+    fn columns_at(&mut self, location: usize) -> u8 {
+        if self.page_split(location).is_some() { 2 } else { 1 }
+    }
+
+    /// A cached page's frame, narrowed to one column of it. The page must
+    /// already be in the cache.
+    fn column_frame(&mut self, location: usize, column: u8) -> Rectangle {
+        let split = self.page_split(location);
+        let Resource { ref pixmap, frame, .. } = self.cache[&location];
+        match split {
+            None => frame,
+            Some(split) => {
+                let split_x = (split * pixmap.width as f32).round() as i32;
+                let (min_x, max_x) = layout::column_bounds(frame.min.x, frame.max.x, split_x, column);
+                rect![min_x, frame.min.y, max_x, frame.max.y]
+            },
+        }
+    }
+
     fn load_pixmap(&mut self, location: usize) {
         if self.cache.contains_key(&location) {
             return;
         }
+
+        // Asked before the lock below, because it takes one of its own.
+        let split = self.page_split(location);
 
         let mut doc = self.doc.lock().unwrap();
         let cropping_margin = self.info.reader.as_ref()
@@ -611,7 +787,15 @@ impl Reader {
                                   .cloned().unwrap_or_default();
         let dims = doc.dims(location).unwrap_or((3.0, 4.0));
         let screen_margin_width = self.view_port.margin_width;
-        let scale = scaling_factor(&self.rect, &cropping_margin, screen_margin_width, dims, self.view_port.zoom_mode);
+        // One pixmap per page, so one scale per page: it is the scale that
+        // fits the *wider* column, because the other one would overflow the
+        // panel. The frame below is still the whole crop -- narrowing to a
+        // column happens per chunk, in `column_frame`.
+        let scale_margin = match split {
+            Some(split) => layout::widest_column_margin(&cropping_margin, split),
+            None => cropping_margin.clone(),
+        };
+        let scale = scaling_factor(&self.rect, &scale_margin, screen_margin_width, dims, self.view_port.zoom_mode);
         if let Some((pixmap, _)) = doc.pixmap(Location::Exact(location), scale, CURRENT_DEVICE.color_samples()) {
             let frame = rect![(cropping_margin.left * pixmap.width as f32).ceil() as i32,
                               (cropping_margin.top * pixmap.height as f32).ceil() as i32,
@@ -660,6 +844,7 @@ impl Reader {
 
             self.current_page = location;
             self.view_port.page_offset = pt!(0);
+            self.view_port.column = 0;
             self.selection = None;
             self.state = State::Idle;
             self.update(None, hub, rq, context);
@@ -775,40 +960,73 @@ impl Reader {
 
         let mut next_top_offset = self.view_port.page_offset.y + delta_y;
         let mut location = self.current_page;
+        let mut column = self.view_port.column;
 
         match self.view_port.scroll_mode {
             ScrollMode::Screen => {
-                let max_top_offset = self.cache[&location].frame.height().saturating_sub(1) as i32;
+                // Dragging moves through the same reading units a page turn
+                // does -- off the top of column 2 is the bottom of column 1,
+                // not the previous page.
+                let max_top_offset = self.column_frame(location, column)
+                                         .height().saturating_sub(1) as i32;
 
                 if next_top_offset < 0 {
-                    let mut doc = self.doc.lock().unwrap();
-                    if let Some(previous_location) = doc.resolve_location(Location::Previous(location)) {
-                        if !self.cache.contains_key(&previous_location) {
-                            return;
-                        }
-                        location = previous_location;
-                        let frame = self.cache[&location].frame;
+                    match layout::step_backward(column) {
+                        layout::Step::Column(previous_column) => column = previous_column,
+                        layout::Step::Page => {
+                            let previous = self.doc.lock().unwrap()
+                                               .resolve_location(Location::Previous(location));
+                            match previous {
+                                Some(previous_location) => {
+                                    if !self.cache.contains_key(&previous_location) {
+                                        return;
+                                    }
+                                    location = previous_location;
+                                    column = layout::last_column(self.columns_at(location));
+                                },
+                                None => {
+                                    next_top_offset = 0;
+                                },
+                            }
+                        },
+                    }
+                    if next_top_offset < 0 {
+                        let frame = self.column_frame(location, column);
                         next_top_offset = (frame.height() as i32 + next_top_offset).max(0);
-                    } else {
-                        next_top_offset = 0;
                     }
                 } else if next_top_offset > max_top_offset {
-                    let mut doc = self.doc.lock().unwrap();
-                    if let Some(next_location) = doc.resolve_location(Location::Next(location)) {
-                        if !self.cache.contains_key(&next_location) {
-                            return;
-                        }
-                        location = next_location;
-                        let frame = self.cache[&location].frame;
-                        let mto = frame.height().saturating_sub(1) as i32;
+                    let columns = self.columns_at(location);
+                    let mut moved = true;
+                    match layout::step_forward(column, columns) {
+                        layout::Step::Column(next_column) => column = next_column,
+                        layout::Step::Page => {
+                            let next = self.doc.lock().unwrap()
+                                           .resolve_location(Location::Next(location));
+                            match next {
+                                Some(next_location) => {
+                                    if !self.cache.contains_key(&next_location) {
+                                        return;
+                                    }
+                                    location = next_location;
+                                    column = 0;
+                                },
+                                None => {
+                                    next_top_offset = max_top_offset;
+                                    moved = false;
+                                },
+                            }
+                        },
+                    }
+                    if moved {
+                        let mto = self.column_frame(location, column)
+                                      .height().saturating_sub(1) as i32;
                         next_top_offset = (next_top_offset - max_top_offset - 1).min(mto);
-                    } else {
-                        next_top_offset = max_top_offset;
                     }
                 }
 
                 {
-                    let Resource { frame, scale, .. } = *self.cache.get(&location).unwrap();
+                    let frame = self.column_frame(location, column);
+                    let scale = self.cache[&location].scale;
                     let mut doc = self.doc.lock().unwrap();
                     if let Some((lines, _)) = doc.lines(Location::Exact(location)) {
                         if let Some(mut y_pos) = find_cut(&frame, frame.min.y + next_top_offset,
@@ -831,11 +1049,13 @@ impl Reader {
         }
 
         let location_changed = location != self.current_page;
-        if !location_changed && next_top_offset == self.view_port.page_offset.y {
+        if !location_changed && column == self.view_port.column &&
+           next_top_offset == self.view_port.page_offset.y {
             return;
         }
 
         self.view_port.page_offset.y = next_top_offset;
+        self.view_port.column = column;
         self.current_page = location;
         self.update(None, hub, rq, context);
 
@@ -874,9 +1094,10 @@ impl Reader {
 
         let current_page = self.current_page;
         let page_offset = self.view_port.page_offset;
+        let current_column = self.view_port.column;
 
         let loc = {
-            let neighloc = match dir { 
+            let neighloc = match dir {
                 CycleDir::Previous => {
                     match self.view_port.zoom_mode {
                         ZoomMode::FitToPage => Location::Previous(current_page),
@@ -884,6 +1105,7 @@ impl Reader {
                             ScrollMode::Screen => {
                                 let first_chunk = self.chunks.first().cloned().unwrap();
                                 let mut location = first_chunk.location;
+                                let mut column = first_chunk.column;
                                 let available_height = self.rect.height() as i32 - 2 * self.view_port.margin_width;
 
                                 // The mirror image of the overlap on a Next
@@ -896,7 +1118,8 @@ impl Reader {
                                 self.load_pixmap(location);
                                 self.load_text(location);
                                 let overlap = {
-                                    let Resource { frame, scale, .. } = self.cache[&location];
+                                    let frame = self.column_frame(location, column);
+                                    let scale = self.cache[&location].scale;
                                     let mut doc = self.doc.lock().unwrap();
                                     let lines = doc.lines(Location::Exact(location))
                                                    .map(|(lines, _)| lines).unwrap_or_default();
@@ -907,28 +1130,43 @@ impl Reader {
                                                layout::clamp_overlap(overlap, available_height));
                                 let mut height = 0;
 
+                                // The walk is over reading *units* -- a column
+                                // of a page, or a whole page where it opted
+                                // out -- so a two-column page contributes
+                                // twice, once per column, exactly as it does
+                                // going forwards.
                                 loop {
                                     self.load_pixmap(location);
                                     self.load_text(location);
-                                    let Resource { mut frame, .. } = self.cache[&location];
-                                    if location == first_chunk.location {
+                                    let mut frame = self.column_frame(location, column);
+                                    if location == first_chunk.location && column == first_chunk.column {
                                         frame.max.y = first_chunk.frame.min.y;
                                     }
                                     height += frame.height() as i32;
                                     if height >= span {
                                         break;
                                     }
-                                    let mut doc = self.doc.lock().unwrap();
-                                    if let Some(previous_location) = doc.resolve_location(Location::Previous(location)) {
-                                        location = previous_location;
-                                    } else {
-                                        break;
+                                    match layout::step_backward(column) {
+                                        layout::Step::Column(previous_column) => column = previous_column,
+                                        layout::Step::Page => {
+                                            let previous = self.doc.lock().unwrap()
+                                                               .resolve_location(Location::Previous(location));
+                                            match previous {
+                                                Some(previous_location) => {
+                                                    location = previous_location;
+                                                    self.load_pixmap(location);
+                                                    column = layout::last_column(self.columns_at(location));
+                                                },
+                                                None => break,
+                                            }
+                                        },
                                     }
                                 }
 
                                 let mut next_top_offset = (height - span).max(0);
                                 if height > span {
-                                    let Resource { frame, scale, .. } = self.cache[&location];
+                                    let frame = self.column_frame(location, column);
+                                    let scale = self.cache[&location].scale;
                                     let mut doc = self.doc.lock().unwrap();
                                     if let Some((lines, _)) = doc.lines(Location::Exact(location)) {
                                         if let Some(mut y_pos) = find_cut(&frame, frame.min.y + next_top_offset,
@@ -940,6 +1178,7 @@ impl Reader {
                                 }
 
                                 self.view_port.page_offset.y = next_top_offset;
+                                self.view_port.column = column;
                                 Location::Exact(location)
                             },
                             ScrollMode::Page => {
@@ -970,10 +1209,11 @@ impl Reader {
                         ZoomMode::FitToPage => Location::Next(current_page),
                         ZoomMode::FitToWidth => match self.view_port.scroll_mode {
                             ScrollMode::Screen => {
-                                let &RenderChunk { location, frame, .. } = self.chunks.last().unwrap();
+                                let &RenderChunk { location, frame, column, .. } = self.chunks.last().unwrap();
                                 self.load_pixmap(location);
                                 self.load_text(location);
-                                let Resource { frame: pixmap_frame, scale, .. } = self.cache[&location];
+                                let pixmap_frame = self.column_frame(location, column);
+                                let scale = self.cache[&location].scale;
                                 let available_height = self.rect.height() as i32 - 2 * self.view_port.margin_width;
 
                                 // Start the next screenful a couple of text
@@ -991,15 +1231,36 @@ impl Reader {
                                 let overlap = layout::clamp_overlap(overlap, available_height);
 
                                 let cut = frame.max.y - pixmap_frame.min.y;
-                                let current = if location == current_page { page_offset.y } else { 0 };
+                                let current = if location == current_page && column == current_column {
+                                    page_offset.y
+                                } else {
+                                    0
+                                };
 
                                 match layout::next_screen(cut, pixmap_frame.height() as i32, overlap, current) {
                                     layout::NextScreen::NextPage => {
                                         self.view_port.page_offset.y = 0;
-                                        Location::Next(location)
+                                        // Down column 1, then column 2, then
+                                        // the next page. The overlap does not
+                                        // cross a column boundary: there is no
+                                        // cut through text to anchor over, the
+                                        // eye is jumping back to the top of
+                                        // the page either way.
+                                        let columns = self.columns_at(location);
+                                        match layout::step_forward(column, columns) {
+                                            layout::Step::Column(next_column) => {
+                                                self.view_port.column = next_column;
+                                                Location::Exact(location)
+                                            },
+                                            layout::Step::Page => {
+                                                self.view_port.column = 0;
+                                                Location::Next(location)
+                                            },
+                                        }
                                     },
                                     layout::NextScreen::Same(next_top_offset) => {
                                         self.view_port.page_offset.y = next_top_offset;
+                                        self.view_port.column = column;
                                         Location::Exact(location)
                                     },
                                 }
@@ -1027,8 +1288,14 @@ impl Reader {
             let mut doc = self.doc.lock().unwrap();
             doc.resolve_location(neighloc)
         };
+        // A turn from the bottom of one column to the top of the next changes
+        // neither the page nor, when that column filled less than a screen,
+        // the offset -- and a turn that appears to change nothing is reported
+        // as the end of the document.
         match loc {
-            Some(location) if location != current_page || self.view_port.page_offset != page_offset => {
+            Some(location) if location != current_page ||
+                              self.view_port.page_offset != page_offset ||
+                              self.view_port.column != current_column => {
                 if let Some(ref mut s) = self.search {
                     s.current_page = s.highlights.range(..=location).count().saturating_sub(1);
                 }
@@ -1046,6 +1313,10 @@ impl Reader {
             _ => {
                 match dir {
                     CycleDir::Next => {
+                        // Nothing moved, so nothing should have been written
+                        // down as having moved.
+                        self.view_port.page_offset = page_offset;
+                        self.view_port.column = current_column;
                         self.finished = true;
                         let action = if self.ephemeral {
                             FinishedAction::Notify
@@ -1065,6 +1336,8 @@ impl Reader {
                         }
                     },
                     CycleDir::Previous => {
+                        self.view_port.page_offset = page_offset;
+                        self.view_port.column = current_column;
                         let notif = Notification::new("No previous page.".to_string(),
                                                       hub, rq, context);
                         self.children.push(Box::new(notif) as Box<dyn View>);
@@ -1085,6 +1358,7 @@ impl Reader {
         if let Some(location) = loc {
             self.current_page = location;
             self.view_port.page_offset = pt!(0, 0);
+            self.view_port.column = 0;
             self.selection = None;
             self.state = State::Idle;
             self.update_results_bar(rq);
@@ -1107,6 +1381,7 @@ impl Reader {
                 s.current_page = s.highlights.range(..=location).count().saturating_sub(1);
             }
             self.view_port.page_offset = pt!(0, 0);
+            self.view_port.column = 0;
             self.current_page = location;
             self.update_results_bar(rq);
             self.update_bottom_bar(rq);
@@ -1243,41 +1518,75 @@ impl Reader {
                 let Resource { frame, scale, .. } = self.cache[&location];
                 let dx = smw + ((self.rect.width() - frame.width()) as i32 - 2 * smw) / 2;
                 let dy = smw + ((self.rect.height() - frame.height()) as i32 - 2 * smw) / 2;
-                self.chunks.push(RenderChunk { frame, location, position: pt!(dx, dy), scale });
+                self.chunks.push(RenderChunk { frame, location, position: pt!(dx, dy), scale, column: 0 });
             },
             ZoomMode::FitToWidth => match self.view_port.scroll_mode {
                 ScrollMode::Screen => {
                     let available_height = self.rect.height() as i32 - 2 * smw;
+                    let available_width = self.rect.width() as i32 - 2 * smw;
+                    let mut column = self.view_port.column;
                     let mut height = 0;
                     while height < available_height {
                         self.load_pixmap(location);
                         self.load_text(location);
-                        let Resource { mut frame, scale, .. } = self.cache[&location];
-                        if location == self.current_page {
+                        // A page that opted out of the document's columns is
+                        // read in one, so an offset into its second column is
+                        // not a position that exists any more.
+                        let columns = self.columns_at(location);
+                        if column >= columns {
+                            column = layout::last_column(columns);
+                        }
+                        let mut frame = self.column_frame(location, column);
+                        let scale = self.cache[&location].scale;
+                        if self.chunks.is_empty() {
                             frame.min.y += self.view_port.page_offset.y;
                         }
-                        let position = pt!(smw, smw + height);
-                        self.chunks.push(RenderChunk { frame, location, position, scale });
+                        // A column is only as wide as the *widest* column of
+                        // its page, so the narrower one is centred rather than
+                        // left against the margin. A full-width page keeps the
+                        // old arithmetic exactly.
+                        let dx = if columns > 1 {
+                            (available_width - frame.width() as i32) / 2
+                        } else {
+                            0
+                        };
+                        let position = pt!(smw + dx, smw + height);
+                        self.chunks.push(RenderChunk { frame, location, position, scale, column });
                         height += frame.height() as i32;
-                        if let Ok(mut doc) = self.doc.lock() {
-                            if let Some(next_location) = doc.resolve_location(Location::Next(location)) {
-                                location = next_location;
-                            } else {
-                                break;
-                            }
+                        match layout::step_forward(column, columns) {
+                            layout::Step::Column(next_column) => column = next_column,
+                            layout::Step::Page => {
+                                let next = self.doc.lock().ok()
+                                               .and_then(|mut doc| doc.resolve_location(Location::Next(location)));
+                                match next {
+                                    Some(next_location) => {
+                                        location = next_location;
+                                        column = 0;
+                                    },
+                                    None => break,
+                                }
+                            },
                         }
                     }
                     if height > available_height {
-                        if let Some(last_chunk) = self.chunks.last_mut() {
-                            last_chunk.frame.max.y -= height - available_height;
-                            let mut doc = self.doc.lock().unwrap();
-                            if let Some((lines, _)) = doc.lines(Location::Exact(last_chunk.location)) {
-                                let pixmap_frame = self.cache[&last_chunk.location].frame;
-                                if let Some(mut y_pos) = find_cut(&pixmap_frame, last_chunk.frame.max.y, last_chunk.scale, LinearDir::Backward, &lines) {
-                                    y_pos = y_pos.clamp(pixmap_frame.min.y, pixmap_frame.max.y - 1);
-                                    last_chunk.frame.max.y = y_pos;
+                        let last = self.chunks.last()
+                                       .map(|c| (c.location, c.column, c.scale, c.frame.max.y));
+                        if let Some((last_location, last_column, last_scale, last_max_y)) = last {
+                            // The cut is looked for inside the *column*, so a
+                            // line in the other one can neither be chosen nor
+                            // block the choice.
+                            let pixmap_frame = self.column_frame(last_location, last_column);
+                            let mut max_y = last_max_y - (height - available_height);
+                            {
+                                let mut doc = self.doc.lock().unwrap();
+                                if let Some((lines, _)) = doc.lines(Location::Exact(last_location)) {
+                                    if let Some(y_pos) = find_cut(&pixmap_frame, max_y, last_scale,
+                                                                  LinearDir::Backward, &lines) {
+                                        max_y = y_pos.clamp(pixmap_frame.min.y, pixmap_frame.max.y - 1);
+                                    }
                                 }
                             }
+                            self.chunks.last_mut().unwrap().frame.max.y = max_y;
                         }
                         let actual_height: i32 = self.chunks.iter().map(|c| c.frame.height() as i32).sum();
                         let dy = (available_height - actual_height) / 2;
@@ -1294,7 +1603,7 @@ impl Reader {
                     frame.min.y += self.view_port.page_offset.y;
                     frame.max.y = (frame.min.y + available_height).min(frame.max.y);
                     let position = pt!(smw, smw + (available_height - frame.height() as i32) / 2);
-                    self.chunks.push(RenderChunk { frame, location, position, scale });
+                    self.chunks.push(RenderChunk { frame, location, position, scale, column: 0 });
                 },
             },
             ZoomMode::Custom(_) => {
@@ -1306,7 +1615,7 @@ impl Reader {
                 let vpr = rect![pt!(0), pt!(vpw, vph)] + self.view_port.page_offset + frame.min;
                 if let Some(rect) = frame.intersection(&vpr) {
                     let position = pt!(smw) + rect.min - vpr.min;
-                    self.chunks.push(RenderChunk { frame: rect, location, position, scale });
+                    self.chunks.push(RenderChunk { frame: rect, location, position, scale, column: 0 });
                 }
             },
         }
@@ -2025,6 +2334,31 @@ impl Reader {
                                         EntryId::SetScrollMode(ScrollMode::Page),
                                         scroll_mode == ScrollMode::Page)]));
 
+            // Columns, for a paginated document. The detected verdict is named
+            // in the Automatic entry rather than hidden behind it, because the
+            // only reason to open this menu is to disagree with it -- and the
+            // override is stored with the document, not with the app.
+            if !self.reflowable {
+                let column_mode = self.info.reader.as_ref()
+                                      .and_then(|r| r.column_mode).unwrap_or(ColumnMode::Auto);
+                let detected = self.info.reader.as_ref()
+                                   .and_then(|r| r.columns).unwrap_or(1);
+                let automatic = match detected {
+                    0 | 1 => "Automatic (one)".to_string(),
+                    n => format!("Automatic ({} columns)", n),
+                };
+                entries.push(EntryKind::SubMenu("Columns".to_string(), vec![
+                     EntryKind::RadioButton(automatic,
+                                            EntryId::SetColumnMode(ColumnMode::Auto),
+                                            column_mode == ColumnMode::Auto),
+                     EntryKind::RadioButton("Two".to_string(),
+                                            EntryId::SetColumnMode(ColumnMode::On),
+                                            column_mode == ColumnMode::On),
+                     EntryKind::RadioButton("One".to_string(),
+                                            EntryId::SetColumnMode(ColumnMode::Off),
+                                            column_mode == ColumnMode::Off)]));
+            }
+
             if self.ephemeral {
                 entries.push(EntryKind::Command("Save".to_string(), EntryId::Save));
             }
@@ -2585,6 +2919,9 @@ impl Reader {
         if reset_page_offset {
             self.view_port.page_offset = pt!(0, 0);
         }
+        // Column mode only exists under fit-to-width, and the pixmaps in the
+        // cache were rasterised at a column's scale.
+        self.view_port.column = 0;
         self.cache.clear();
         self.update(None, hub, rq, context);
     }
@@ -2593,8 +2930,41 @@ impl Reader {
         if self.view_port.scroll_mode == scroll_mode || self.view_port.zoom_mode != ZoomMode::FitToWidth {
             return;
         }
+        // Likewise: a column is not a unit page-at-a-time scrolling knows how
+        // to move through, so leaving screen scrolling leaves column mode, and
+        // the scale every cached pixmap was rendered at changes with it.
+        let columns = self.column_split().is_some();
         self.view_port.scroll_mode = scroll_mode;
         self.view_port.page_offset = pt!(0, 0);
+        if columns || self.column_split().is_some() {
+            self.view_port.column = 0;
+            self.cache.clear();
+        }
+        self.update(None, hub, rq, context);
+    }
+
+    /// Override the detected column verdict for this document.
+    ///
+    /// Everything about the page changes with it -- the scale each pixmap was
+    /// rasterised at, which pages opted out, where the reader is -- so all of
+    /// it is thrown away and the document reopens at the top of the current
+    /// page rather than at an offset measured into a frame that no longer
+    /// exists.
+    fn set_column_mode(&mut self, column_mode: ColumnMode, hub: &Hub, rq: &mut RenderQueue, context: &Context) {
+        let current = self.info.reader.as_ref()
+                          .and_then(|r| r.column_mode).unwrap_or(ColumnMode::Auto);
+        if current == column_mode {
+            return;
+        }
+
+        if let Some(r) = self.info.reader.as_mut() {
+            r.column_mode = Some(column_mode);
+        }
+
+        self.view_port.column = 0;
+        self.view_port.page_offset = pt!(0, 0);
+        self.column_splits.clear();
+        self.cache.clear();
         self.update(None, hub, rq, context);
     }
 
@@ -2628,6 +2998,7 @@ impl Reader {
                 *c.margin_mut(index) = margin.clone();
             }
         }
+        self.column_splits.clear();
         self.cache.clear();
         self.update(None, hub, rq, context);
     }
@@ -2834,6 +3205,12 @@ impl Reader {
                 r.scroll_mode = Some(self.view_port.scroll_mode);
             } else {
                 r.scroll_mode = None;
+            }
+
+            if store_view && self.view_port.column > 0 {
+                r.current_column = Some(self.view_port.column);
+            } else {
+                r.current_column = None;
             }
 
             r.rotation = Some(CURRENT_DEVICE.to_canonical(context.display.rotation));
@@ -3982,6 +4359,10 @@ impl View for Reader {
             },
             Event::Select(EntryId::SetZoomMode(zoom_mode)) => {
                 self.set_zoom_mode(zoom_mode, true, hub, rq, context);
+                true
+            },
+            Event::Select(EntryId::SetColumnMode(column_mode)) => {
+                self.set_column_mode(column_mode, hub, rq, context);
                 true
             },
             Event::Select(EntryId::SetScrollMode(scroll_mode)) => {

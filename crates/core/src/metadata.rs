@@ -211,6 +211,20 @@ pub struct ReaderInfo {
     pub rotation: Option<i8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cropping_margins: Option<CroppingMargins>,
+    /// How many columns this document is read in, as detected once on first
+    /// open. `Some(1)` is a document that was measured and found to be single
+    /// column; `None` is one that has not been measured yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub columns: Option<u8>,
+    /// Where the gutter runs, as a fraction of the page width.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column_split: Option<f32>,
+    /// The reader's override of the detected verdict. `None` is `Auto`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column_mode: Option<ColumnMode>,
+    /// Which column the document was left in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_column: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub margin_width: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -240,6 +254,20 @@ pub enum ZoomMode {
     FitToPage,
     FitToWidth,
     Custom(f32),
+}
+
+/// Whether a paginated document is read column by column.
+///
+/// `Auto` is the detected verdict and is what every document starts as; the
+/// other two are the reader saying otherwise about this one document, and they
+/// are stored with it. There is deliberately no global setting for this beyond
+/// switching the detection off altogether: two-column-ness is a property of a
+/// paper, not of a person.
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ColumnMode {
+    Auto,
+    On,
+    Off,
 }
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, Eq, PartialEq)]
@@ -280,6 +308,10 @@ impl Default for ReaderInfo {
             page_offset: None,
             rotation: None,
             cropping_margins: None,
+            columns: None,
+            column_split: None,
+            column_mode: None,
+            current_column: None,
             margin_width: None,
             screen_margin_width: None,
             font_family: None,

@@ -83,3 +83,60 @@ fn a_real_pdf_crops_to_something_plausible() {
              path.display(), doc.pages_count(), indices.len(), boxes.len(),
              content, rotated_seen);
 }
+
+/// The column vote through the real FFI, on the same terms `Reader::new` runs
+/// it: per page, over the aggregate crop box, then vote.
+///
+/// It cannot assert a verdict -- the PDF it is pointed at is whatever the
+/// person running it has -- so it asserts what must hold whichever way the
+/// vote goes, and prints the numbers. The verdicts themselves are pinned in
+/// `document/layout.rs`'s fixture tests, on three real papers.
+#[test]
+fn a_real_pdf_votes_on_its_columns() {
+    let Some(path) = sample_pdf() else {
+        eprintln!("skipped: set PLATO_TEST_PDF to a PDF to run this");
+        return;
+    };
+
+    let mut doc = open(&path).expect("can't open the PDF");
+    let indices = layout::sample_indices(doc.pages_count(), 16);
+    let dims = doc.dims(indices[0]).expect("no page dimensions");
+
+    let mut boxes = Vec::new();
+    let mut per_page = Vec::new();
+
+    for &index in &indices {
+        let (lines, _) = doc.text_lines(Location::Exact(index)).expect("no text lines");
+        let images = doc.images(Location::Exact(index))
+                        .map(|(images, _)| images).unwrap_or_default();
+        if let Some(bnd) = layout::content_box(&lines, &images) {
+            boxes.push(bnd);
+            per_page.push(lines.iter().filter(|l| l.is_horizontal())
+                               .map(|l| l.rect).collect::<Vec<_>>());
+        }
+    }
+
+    let content = layout::aggregate_box(&boxes).expect("no aggregate box");
+    let gutters: Vec<Option<f32>> = per_page.iter()
+        .map(|lines| layout::page_gutter(lines, &content))
+        .collect();
+    let vote = layout::column_vote(&gutters);
+
+    assert!((0.0..=1.0).contains(&vote.fraction()));
+
+    if let Some(gutter) = vote.gutter {
+        assert!(gutter > content.min.x && gutter < content.max.x,
+                "gutter {} is outside the crop box {:?}", gutter, content);
+        // Both columns have to be worth rendering.
+        let split = gutter / dims.0;
+        let margin = layout::crop_margin(&content, dims, CROP_PADDING_PT).unwrap();
+        for column in 0..2 {
+            let m = layout::column_margin(&margin, split, column);
+            assert!(1.0 - m.left - m.right > 0.1, "column {} is {:?}", column, m);
+        }
+    }
+
+    println!("{}: {}/{} pages voted ({:.0}%), gutter {:?}, two-column: {}",
+             path.display(), vote.voted, vote.sampled, 100.0 * vote.fraction(), vote.gutter,
+             vote.is_two_column(layout::COLUMN_VOTE_THRESHOLD));
+}

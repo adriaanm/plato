@@ -56,7 +56,7 @@ use crate::font::Fonts;
 use crate::color::Color;
 use crate::document::{Location, TextLocation};
 use crate::settings::{ButtonScheme, FirstColumn, SecondColumn, RotationLock};
-use crate::metadata::{Info, ZoomMode, ScrollMode, SortMethod, TextAlign, SimpleStatus, PageScheme, Margin};
+use crate::metadata::{Info, ZoomMode, ScrollMode, ColumnMode, SortMethod, TextAlign, SimpleStatus, PageScheme, Margin};
 use crate::geom::{LinearDir, CycleDir, Rectangle, Boundary};
 use crate::framebuffer::{Framebuffer, UpdateMode};
 use crate::input::{DeviceEvent, FingerStatus};
@@ -556,6 +556,7 @@ pub enum EntryId {
     RemoveCroppings,
     SetZoomMode(ZoomMode),
     SetScrollMode(ScrollMode),
+    SetColumnMode(ColumnMode),
     SetPageName,
     RemovePageName,
     HighlightSelection,
