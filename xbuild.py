@@ -9,11 +9,14 @@ Design
 ------
 * ``SOURCES`` is a declarative table of external C sources: name, version,
   URL and **sha256**.  Nothing is ever fetched unverified.
-* ``PROFILES`` names a build target.  Two exist today:
+* ``PROFILES`` names a build target.  Two exist:
     ``host``    macOS/arm64 native, for the SDL2 emulator (phase 0).
-    ``kindle``  armv7 soft-float static via zig — phase 1, stubbed out.
+    ``kindle``  armv7 soft-float **static musl** via ``zig cc`` (phase 1).
 * Each profile declares which system (Homebrew) packages it expects, which
   ``SOURCES`` entries it builds, and the cargo invocation it ends with.
+* Every profile keeps its trees apart: ``.xbuild/<profile>/<lib>``.  The two
+  profiles build the same MuPDF tarball with different compilers, so they
+  must not share an extracted source directory.
 
 Checksums are TOFU — trust on first use.  Each hash below was recorded by
 downloading the tarball once and running ``shasum -a 256`` on it.  The point
@@ -23,12 +26,31 @@ silently re-rolled upstream tarball fails the build instead of being
 compiled.  To add a library: put ``sha256=""`` in the table, run once, and
 paste the hash the driver prints.
 
+The kindle toolchain
+--------------------
+Exactly two pinned toolchains, glued by ``cargo-zigbuild``:
+
+* ``zig cc`` / ``zig c++`` for every C and C++ object, targeting
+  ``arm-linux-musleabi`` — soft-float **ABI**, which is what the device's
+  loader and every Amazon binary use (ezkindle ``docs/toolchain.md``).
+  ``-mfloat-abi=softfp -mcpu=cortex_a9`` keeps the soft-float calling
+  convention while still emitting VFPv3/NEON instructions: the same choice
+  koxtoolchain makes for kindlepw2.
+* rustup, pinned by ``rust-toolchain.toml``, target
+  ``armv7-unknown-linux-musleabi``, linked through zig, fully static.
+
+Every ARM binary this driver produces goes through the ABI gate before the
+build is allowed to succeed — a hard-float slip fails on the device as a
+bare "No such file or directory", which is the least debuggable error in
+the project.
+
 Usage
 -----
     python3 xbuild.py host              # build the C prerequisites + emulator
     python3 xbuild.py host --run        # ... and launch the emulator
-    python3 xbuild.py host --clean      # discard .xbuild/ and rebuild
-    python3 xbuild.py kindle            # phase 1: not implemented yet
+    python3 xbuild.py host --clean      # discard .xbuild/<profile>/ and rebuild
+    python3 xbuild.py kindle            # cross-build the static armv7 binary
+    python3 xbuild.py kindle -- --bin plato-harness
 """
 
 from __future__ import annotations
@@ -38,6 +60,7 @@ import hashlib
 import os
 import platform
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -51,6 +74,14 @@ ROOT = Path(__file__).resolve().parent
 WORK = ROOT / ".xbuild"          # everything this driver creates lives here
 CACHE = WORK / "cache"           # verified tarballs
 JOBS = str(os.cpu_count() or 4)
+
+# The device, from ezkindle docs/device.md + docs/toolchain.md.
+ZIG_TARGET = "arm-linux-musleabi"     # soft-float ABI, static musl
+RUST_TARGET = "armv7-unknown-linux-musleabi"
+# softfp: soft-float calling convention, VFPv3/NEON instructions.  The i.MX6SL
+# has NEON and there is no reason to leave it unused; the *ABI* stays soft,
+# which is the part the device cares about.
+ZIG_ARCH_FLAGS = ["-mfloat-abi=softfp", "-mcpu=cortex_a9"]
 
 
 # --------------------------------------------------------------------------
@@ -72,9 +103,8 @@ class Source:
 
     # (`tarball` is also where a .zip asset lands; _suffix keeps the name honest.)
 
-    @property
-    def src_dir(self) -> Path:
-        return WORK / self.name
+    def src_dir(self, profile: "Profile") -> Path:
+        return WORK / profile.name / self.name
 
 
 def _suffix(url: str) -> str:
@@ -89,17 +119,22 @@ def _suffix(url: str) -> str:
 # --------------------------------------------------------------------------
 
 def build_mupdf(src: Path, profile: "Profile") -> None:
-    """Build libmupdf.a + libmupdf-third.a against the system libraries.
+    """Build libmupdf.a + libmupdf-third.a.
 
     Upstream's thirdparty/mupdf/build-kobo.sh does the same two make calls
-    with a cross toolchain and a hand-written shared-link line.  On the host
-    we want static archives and the Homebrew copies of freetype/harfbuzz/…,
-    so that exactly one copy of each library ends up in the binary (Plato's
-    Rust also links freetype and harfbuzz directly).
+    with a cross toolchain, a ``kobo.patch`` that hardcodes it into Makerules,
+    and a hand-written shared-link line.  We want static archives and we want
+    no patch, so the toolchain and the SYS_*_CFLAGS / SYS_*_LIBS go on the
+    make command line instead — the same variables the patch sets.
 
-    MuPDF's Makerules has no pkg-config path for these on macOS, so the
-    SYS_*_CFLAGS / SYS_*_LIBS are passed in explicitly — the same variables
-    upstream's kobo.patch sets, pointed at Homebrew instead.
+    ``OS`` is deliberately set to a name MuPDF does not know (``kindle``).
+    That is not cosmetic: ``Makerules`` sets ``HAVE_OBJCOPY := yes`` **only**
+    for ``OS=Linux``, and with objcopy the embedded fonts get ELF-style
+    ``_binary_resources_fonts_..._start`` symbol names.  Without it MuPDF
+    falls back to ``scripts/hexdump.sh``, which emits the short
+    ``_binary_DroidSansFallback_ttf`` names — and those short names are
+    exactly what ``crates/core/src/font/mod.rs`` declares for
+    ``target_arch = "arm"``.  Upstream gets this for free via ``OS=kobo``.
     """
     common = [
         "make", "-j", JOBS,
@@ -111,15 +146,31 @@ def build_mupdf(src: Path, profile: "Profile") -> None:
         "USE_SYSTEM_LIBS=yes",
         "build=release",
     ]
-    for pkg, var in (("freetype2", "FREETYPE"), ("harfbuzz", "HARFBUZZ"),
-                     ("gumbo", "GUMBO"), ("jbig2dec", "JBIG2DEC"),
-                     ("libjpeg", "LIBJPEG"), ("libopenjp2", "OPENJPEG"),
-                     ("zlib", "ZLIB")):
-        common.append(f"SYS_{var}_CFLAGS={pkgconfig(pkg, '--cflags')}")
-        common.append(f"SYS_{var}_LIBS={pkgconfig(pkg, '--libs')}")
+    if profile.cross:
+        common += [
+            f"OS={profile.mupdf_os}",
+            f"CC={profile.cc}", f"CXX={profile.cxx}", f"AR={profile.ar}",
+            f"LD={profile.cc}", f"RANLIB={profile.ranlib}",
+            "HAVE_PTHREAD=yes", "SYS_PTHREAD_CFLAGS=", "SYS_PTHREAD_LIBS=",
+            # ARCH_HAS_NEON=0 turns off MuPDF's hand-written NEON kernels
+            # (deskew_neon.h and friends).  Same wall as libpng's: clang
+            # cannot lower <arm_neon.h> vector types for a soft-float-ABI
+            # target.  MuPDF exposes the switch as a plain #ifndef, so this
+            # costs no patch.  See PATCHES.md.
+            "XCFLAGS=" + " ".join(profile.cflags + ["-DARCH_HAS_NEON=0"]),
+        ]
+        for pkg, var in _MUPDF_SYS_LIBS:
+            common.append(f"SYS_{var}_CFLAGS={profile.staged_cflags(pkg)}")
+            common.append(f"SYS_{var}_LIBS={profile.staged_libs(pkg)}")
+    else:
+        for pkg, var in _MUPDF_SYS_LIBS:
+            common.append(f"SYS_{var}_CFLAGS={pkgconfig(pkg, '--cflags')}")
+            common.append(f"SYS_{var}_LIBS={pkgconfig(pkg, '--libs')}")
 
-    # 'generate' bakes the built-in fonts/CMaps into C sources; it must run
-    # with the *host* compiler, which on the host profile it already is.
+    # 'generate' bakes the built-in fonts/CMaps into C sources.  It builds and
+    # runs *host* tools, so it must never see the cross compiler -- MuPDF's own
+    # Makerules says as much ("Run 'make generate' before doing the cross
+    # compile").  Hence a plain, unqualified make here in both profiles.
     run(["make", "-j", JOBS, "generate"], cwd=src)
     run(common + ["libs"], cwd=src)
 
@@ -130,24 +181,164 @@ def build_mupdf(src: Path, profile: "Profile") -> None:
     profile.link_search.append(out)
 
 
+# MuPDF's system-library knobs, in (pkg-config name, Makerules variable) form.
+_MUPDF_SYS_LIBS = (
+    ("freetype2", "FREETYPE"), ("harfbuzz", "HARFBUZZ"),
+    ("gumbo", "GUMBO"), ("jbig2dec", "JBIG2DEC"),
+    ("libjpeg", "LIBJPEG"), ("libopenjp2", "OPENJPEG"),
+    ("zlib", "ZLIB"),
+)
+
+
 def build_mupdf_wrapper(profile: "Profile") -> None:
     """Compile Plato's own C shim against the MuPDF headers we just built.
 
     Upstream does this in mupdf_wrapper/build.sh, which hardcodes
     ../thirdparty/mupdf/include.  We keep that script untouched (it is what
     a rebase onto upstream expects) and compile the one .c file here so the
-    include path can point at .xbuild/mupdf instead.
+    include path can point at .xbuild/<profile>/mupdf instead.
     """
     src = ROOT / "mupdf_wrapper" / "mupdf_wrapper.c"
-    out = ROOT / "target" / "mupdf_wrapper" / platform.system()
+    out = ROOT / "target" / "mupdf_wrapper" / profile.target_os
     out.mkdir(parents=True, exist_ok=True)
     obj, lib = out / "mupdf_wrapper.o", out / "libmupdf_wrapper.a"
-    run([profile.cc, "-O2", "-fPIC",
-         f"-I{WORK / 'mupdf' / 'include'}",
+    run([profile.cc, *profile.cflags, "-O2", "-fPIC",
+         f"-I{SOURCES['mupdf'].src_dir(profile) / 'include'}",
          "-c", str(src), "-o", str(obj)])
     lib.unlink(missing_ok=True)
     run([profile.ar, "-rcs", str(lib), str(obj)])
     profile.link_search.append(out)
+
+
+# ---- the cross C stack ----------------------------------------------------
+#
+# Each of these replaces one thirdparty/<lib>/build-kobo.sh.  They install
+# into a single staging prefix so that MuPDF, the Rust link line and each
+# other all see one -I/-L pair.
+
+def build_zlib(src: Path, profile: "Profile") -> None:
+    """zlib's configure is not autoconf: no --host, and it decides how to make
+    an archive from ``uname``.  Left alone on macOS it picks Apple's
+    ``libtool``, which cannot put ARM ELF objects in an archive
+    ("adler32.o is not an object file").  ``--uname=Linux`` is the documented
+    override and puts it back on ``$AR rc``."""
+    env = profile.autotools_env()
+    env["CHOST"] = ZIG_TARGET
+    run(["./configure", "--static", "--uname=Linux",
+         f"--prefix={profile.prefix}"], cwd=src, env=env)
+    run(["make", "-j", JOBS, "install"], cwd=src, env=env)
+
+
+def autotools(*extra: str, env_extra: dict | None = None):
+    """A build step that runs ./configure --host=... && make install."""
+    def step(src: Path, profile: "Profile") -> None:
+        env = profile.autotools_env()
+        if env_extra:
+            env.update({k: v.format(prefix=profile.prefix) for k, v in env_extra.items()})
+        run(["./configure",
+             f"--host={ZIG_TARGET}",
+             f"--prefix={profile.prefix}",
+             "--enable-static", "--disable-shared",
+             *extra], cwd=src, env=env)
+        run(["make", "-j", JOBS], cwd=src, env=env)
+        run(["make", "install"], cwd=src, env=env)
+    return step
+
+
+def build_openjpeg(src: Path, profile: "Profile") -> None:
+    """OpenJPEG is cmake-only.  Point cmake at the zig wrappers.
+
+    MuPDF wants ``-lopenjp2`` and the headers on its include path; openjpeg
+    installs them into ``include/openjpeg-2.5/``, so they get copied flat
+    afterwards (MuPDF includes <openjpeg.h>).
+    """
+    build = src / "build"
+    shutil.rmtree(build, ignore_errors=True)
+    build.mkdir()
+    run(["cmake", "..",
+         "-DCMAKE_BUILD_TYPE=Release",
+         "-DCMAKE_SYSTEM_NAME=Linux",
+         "-DCMAKE_SYSTEM_PROCESSOR=arm",
+         f"-DCMAKE_INSTALL_PREFIX={profile.prefix}",
+         f"-DCMAKE_C_COMPILER={profile.cc}",
+         f"-DCMAKE_AR={profile.ar}",
+         f"-DCMAKE_RANLIB={profile.ranlib}",
+         "-DCMAKE_C_FLAGS=" + " ".join(profile.cflags),
+         "-DBUILD_CODEC=OFF", "-DBUILD_SHARED_LIBS=OFF",
+         "-DBUILD_STATIC_LIBS=ON",
+         f"-DZLIB_INCLUDE_DIR={profile.prefix}/include",
+         f"-DZLIB_LIBRARY={profile.prefix}/lib/libz.a",
+         ], cwd=build)
+    run(["make", "-j", JOBS, "install"], cwd=build)
+    inc = profile.prefix / "include"
+    for d in inc.glob("openjpeg-*"):
+        for header in d.glob("*.h"):
+            shutil.copy2(header, inc / header.name)
+
+
+def build_gumbo(src: Path, profile: "Profile") -> None:
+    """gumbo-parser has no ``configure`` in the GitHub archive — only
+    ``configure.ac``, so upstream runs ``autogen.sh``.  It is nine C99 files
+    with no generated headers, so compiling them directly is both simpler and
+    one fewer host tool (no autoreconf/libtool in the dependency set)."""
+    objs = []
+    obj_dir = src / "obj"
+    obj_dir.mkdir(exist_ok=True)
+    for c in sorted((src / "src").glob("*.c")):
+        obj = obj_dir / (c.stem + ".o")
+        run([profile.cc, *profile.cflags, "-O2", "-std=c99", "-fPIC",
+             f"-I{src / 'src'}", "-c", str(c), "-o", str(obj)])
+        objs.append(str(obj))
+    lib = profile.prefix / "lib" / "libgumbo.a"
+    lib.parent.mkdir(parents=True, exist_ok=True)
+    lib.unlink(missing_ok=True)
+    run([profile.ar, "-rcs", str(lib), *objs])
+    run([profile.ranlib, str(lib)])
+    for h in ("gumbo.h", "tag_enum.h"):
+        p = src / "src" / h
+        if p.exists():
+            shutil.copy2(p, profile.prefix / "include" / h)
+
+
+def build_c23_compat(profile: "Profile") -> None:
+    """musl has no fminimum_num*/fmaximum_num*; rustc 1.97 emits calls to
+    them for f32::min / f32::max.  See csupport/c23_math_compat.c."""
+    src = ROOT / "csupport" / "c23_math_compat.c"
+    obj = WORK / profile.name / "c23_math_compat.o"
+    lib = profile.prefix / "lib" / "libc23compat.a"
+    run([profile.cc, *profile.cflags, "-O2", "-std=c11",
+         "-c", str(src), "-o", str(obj)])
+    lib.unlink(missing_ok=True)
+    run([profile.ar, "-rcs", str(lib), str(obj)])
+    run([profile.ranlib, str(lib)])
+
+
+def build_harfbuzz(src: Path, profile: "Profile") -> None:
+    """One ``zig c++`` invocation, no meson, no ninja.
+
+    HarfBuzz ships ``src/harfbuzz.cc``, an amalgam that #includes every other
+    .cc in the library.  Upstream Plato drives meson with a cross file; the
+    amalgam removes meson, ninja and a cross file from our tool list for the
+    cost of one command.  ``HAVE_FREETYPE`` is what pulls in ``hb-ft.cc``,
+    which is the only part Plato's FFI actually needs
+    (``hb_ft_font_create``).
+    """
+    obj = src / "harfbuzz.o"
+    run([profile.cxx, *profile.cflags, "-O2", "-fPIC",
+         "-std=c++17", "-fno-exceptions", "-fno-rtti", "-fno-threadsafe-statics",
+         "-DHAVE_FREETYPE=1", "-DHB_NO_MT",
+         f"-I{profile.prefix / 'include' / 'freetype2'}",
+         f"-I{profile.prefix / 'include'}",
+         f"-I{src / 'src'}",
+         "-c", str(src / "src" / "harfbuzz.cc"), "-o", str(obj)])
+    lib = profile.prefix / "lib" / "libharfbuzz.a"
+    lib.unlink(missing_ok=True)
+    run([profile.ar, "-rcs", str(lib), str(obj)])
+    run([profile.ranlib, str(lib)])
+    inc = profile.prefix / "include" / "harfbuzz"
+    inc.mkdir(parents=True, exist_ok=True)
+    for h in sorted((src / "src").glob("hb*.h")):
+        shutil.copy2(h, inc / h.name)
 
 
 # --------------------------------------------------------------------------
@@ -158,18 +349,61 @@ def build_mupdf_wrapper(profile: "Profile") -> None:
 class Profile:
     name: str
     cc: str = "cc"
+    cxx: str = "c++"
     ar: str = "ar"
+    ranlib: str = "ranlib"
+    cross: bool = False
+    target_os: str = ""            # target/mupdf_wrapper/<target_os>
+    mupdf_os: str = ""             # MuPDF's OS= (see build_mupdf)
     brew_packages: tuple[str, ...] = ()
     pkgconfig_libs: tuple[str, ...] = ()
     sources: tuple[str, ...] = ()
     cargo_package: str = "emulator"
+    cargo_target: str = ""
     cargo_features: tuple[str, ...] = ()      # djvu deliberately absent
     extra_link_libs: tuple[str, ...] = ()
+    extra_rustflags: tuple[str, ...] = ()
+    cflags: list[str] = field(default_factory=list)
     link_search: list[Path] = field(default_factory=list)
+
+    @property
+    def prefix(self) -> Path:
+        return WORK / self.name / "prefix"
+
+    def staged_cflags(self, pkg: str) -> str:
+        # freetype and harfbuzz both put their headers in a subdirectory and
+        # both are #included flat by MuPDF ("ft2build.h", "hb.h").
+        subdir = {"freetype2": "freetype2", "harfbuzz": "harfbuzz"}.get(pkg)
+        extra = f" -I{self.prefix}/include/{subdir}" if subdir else ""
+        return f"-I{self.prefix}/include{extra}"
+
+    def staged_libs(self, pkg: str) -> str:
+        return f"-L{self.prefix}/lib -l{_PKG_LINK_NAME[pkg]}"
+
+    def autotools_env(self) -> dict:
+        env = dict(os.environ)
+        env.update(
+            CC=self.cc, CXX=self.cxx, AR=self.ar, RANLIB=self.ranlib,
+            CFLAGS=" ".join(self.cflags + ["-O2"]),
+            CXXFLAGS=" ".join(self.cflags + ["-O2"]),
+            CPPFLAGS=f"-I{self.prefix}/include",
+            LDFLAGS=f"-L{self.prefix}/lib",
+            PKG_CONFIG_PATH=f"{self.prefix}/lib/pkgconfig",
+            PKG_CONFIG_LIBDIR=f"{self.prefix}/lib/pkgconfig",
+        )
+        return env
+
+
+_PKG_LINK_NAME = {
+    "freetype2": "freetype", "harfbuzz": "harfbuzz", "gumbo": "gumbo",
+    "jbig2dec": "jbig2dec", "libjpeg": "jpeg", "libopenjp2": "openjp2",
+    "zlib": "z",
+}
 
 
 HOST = Profile(
     name="host",
+    target_os=platform.system(),
     brew_packages=("sdl2", "freetype", "harfbuzz", "jpeg-turbo",
                    "openjpeg", "jbig2dec", "gumbo-parser"),
     pkgconfig_libs=("sdl2", "freetype2", "harfbuzz", "libjpeg",
@@ -183,12 +417,93 @@ HOST = Profile(
                      "openjp2", "z"),
 )
 
-KINDLE = Profile(name="kindle")
+KINDLE = Profile(
+    name="kindle",
+    cc=str(WORK / "kindle" / "bin" / "zig-cc"),
+    cxx=str(WORK / "kindle" / "bin" / "zig-cxx"),
+    ar=str(WORK / "kindle" / "bin" / "zig-ar"),
+    ranlib=str(WORK / "kindle" / "bin" / "zig-ranlib"),
+    cross=True,
+    target_os="Kindle",
+    mupdf_os="kindle",
+    # Order matters: each entry is built against the ones before it.
+    sources=("zlib", "libpng", "libjpeg", "openjpeg", "jbig2dec",
+             "freetype2", "harfbuzz", "gumbo", "mupdf"),
+    cargo_package="plato-harness",
+    cargo_target=RUST_TARGET,
+    # Nothing here: crates/core/build.rs already names the whole set for this
+    # target, and naming them twice only makes the link line harder to read.
+    extra_link_libs=(),
+    extra_rustflags=("-C", "target-feature=+crt-static"),
+)
 
 PROFILES = {"host": HOST, "kindle": KINDLE}
 
 SOURCES = {
-    # sha256 recorded 2026-08-09 (TOFU, see module docstring).
+    # sha256 recorded 2026-08-09 (TOFU, see module docstring).  Every URL is
+    # https; upstream's download.sh fetches libjpeg and djvulibre over plain
+    # http, which is one of the reasons it is not used here.
+    "zlib": Source(
+        name="zlib", version="1.3.1",
+        # Upstream Plato uses zlib.net, which serves an HTML stub for anything
+        # but the current release.  The GitHub release tarball is the same
+        # file (this is the widely published 1.3.1 hash).
+        url="https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz",
+        sha256="9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23",
+        build=build_zlib,
+    ),
+    "libpng": Source(
+        name="libpng", version="1.6.53",
+        url="https://download.sourceforge.net/libpng/libpng-1.6.53.tar.gz",
+        sha256="da0b045cbb1d06a8fc9696f9441359f70645f280ff24ae453ccb7c722353654f",
+        # --enable-arm-neon=no is not optional: clang cannot compile
+        # hand-written <arm_neon.h> intrinsics for a soft-float *ABI* target
+        # ("fatal error in backend: Do not know how to split this operator's
+        # operand" under softfp; arm_neon.h isn't even available under plain
+        # soft).  Auto-vectorised NEON is unaffected, and libpng is only here
+        # for freetype's PNG-in-font glyphs, so the filter fast paths are
+        # worth nothing to us.  See PATCHES.md.
+        build=autotools("--enable-arm-neon=no"),
+    ),
+    "libjpeg": Source(
+        name="libjpeg", version="9f",
+        url="https://www.ijg.org/files/jpegsrc.v9f.tar.gz",
+        sha256="04705c110cb2469caa79fb71fba3d7bf834914706e9641a4589485c1f832565b",
+        build=autotools(),
+    ),
+    "openjpeg": Source(
+        name="openjpeg", version="2.5.4",
+        url="https://github.com/uclouvain/openjpeg/archive/v2.5.4.tar.gz",
+        sha256="a695fbe19c0165f295a8531b1e4e855cd94d0875d2f88ec4b61080677e27188a",
+        build=build_openjpeg,
+    ),
+    "jbig2dec": Source(
+        name="jbig2dec", version="0.20",
+        url="https://github.com/ArtifexSoftware/jbig2dec/releases/download/0.20/jbig2dec-0.20.tar.gz",
+        sha256="7b63ff6470289547e7a3a0f145cb8ea6c2afffdd65645b7d87d3b7febc96fb3a",
+        build=autotools("--without-libpng", "--disable-tests"),
+    ),
+    "freetype2": Source(
+        name="freetype2", version="2.14.1",
+        url="https://download.savannah.gnu.org/releases/freetype/freetype-2.14.1.tar.gz",
+        sha256="174d9e53402e1bf9ec7277e22ec199ba3e55a6be2c0740cb18c0ee9850fc8c34",
+        # --with-harfbuzz=no breaks the freetype<->harfbuzz cycle: freetype is
+        # built first and only uses harfbuzz for autohinting complex scripts.
+        build=autotools("--with-zlib=yes", "--with-png=yes", "--with-bzip2=no",
+                        "--with-harfbuzz=no", "--with-brotli=no"),
+    ),
+    "harfbuzz": Source(
+        name="harfbuzz", version="12.3.0",
+        url="https://github.com/harfbuzz/harfbuzz/archive/12.3.0.tar.gz",
+        sha256="e93af4816128fc0a02d2e84106fdfe36a3fde01086b723be8f0656a65562ca9e",
+        build=build_harfbuzz,
+    ),
+    "gumbo": Source(
+        name="gumbo", version="0.10.1",
+        url="https://github.com/google/gumbo-parser/archive/v0.10.1.tar.gz",
+        sha256="28463053d44a5dfbc4b77bcf49c8cee119338ffa636cc17fc3378421d714efad",
+        build=build_gumbo,
+    ),
     "mupdf": Source(
         name="mupdf",
         version="1.27.0",
@@ -286,12 +601,13 @@ def fetch(source: Source) -> None:
             f"blindly.")
 
 
-def extract(source: Source) -> None:
-    if (source.src_dir / ".xbuild-extracted").exists():
+def extract(source: Source, profile: Profile) -> None:
+    src_dir = source.src_dir(profile)
+    if (src_dir / ".xbuild-extracted").exists():
         return
     log(f"extracting {source.name} {source.version}")
-    shutil.rmtree(source.src_dir, ignore_errors=True)
-    source.src_dir.mkdir(parents=True)
+    shutil.rmtree(src_dir, ignore_errors=True)
+    src_dir.mkdir(parents=True)
     with tarfile.open(source.tarball) as tf:
         members = []
         for m in tf.getmembers():
@@ -300,8 +616,8 @@ def extract(source: Source) -> None:
                 continue
             m.name = str(Path(*parts[1:]))     # --strip-components 1
             members.append(m)
-        tf.extractall(source.src_dir, members=members, filter="tar")
-    (source.src_dir / ".xbuild-extracted").touch()
+        tf.extractall(src_dir, members=members, filter="tar")
+    (src_dir / ".xbuild-extracted").touch()
 
 
 def check_system_deps(profile: Profile) -> None:
@@ -314,7 +630,7 @@ def check_system_deps(profile: Profile) -> None:
 
 def cargo_env(profile: Profile) -> dict:
     env = dict(os.environ)
-    flags = []
+    flags = list(profile.extra_rustflags)
     for d in profile.link_search:
         flags += ["-L", f"native={d}"]
     for d in {Path(w[2:]) for lib in profile.pkgconfig_libs
@@ -326,37 +642,160 @@ def cargo_env(profile: Profile) -> dict:
     return env
 
 
+def build_sources(profile: Profile) -> None:
+    for name in profile.sources:
+        source = SOURCES[name]
+        fetch(source)
+        extract(source, profile)
+        src_dir = source.src_dir(profile)
+        if source.build and not (src_dir / ".xbuild-built").exists():
+            log(f"building {source.name} [{profile.name}]")
+            source.build(src_dir, profile)
+            (src_dir / ".xbuild-built").touch()
+        elif source.build:
+            # Already built: re-declare whatever the step would have added to
+            # the link path.  Only MuPDF has an in-tree output directory; the
+            # rest install into the staging prefix.
+            if name == "mupdf":
+                profile.link_search.append(src_dir / "build" / "release")
+
+
+def run_cargo(profile: Profile, args) -> None:
+    env = cargo_env(profile)
+    if profile.cross:
+        cargo, rustc = rustup_tools()
+        env["RUSTC"] = rustc
+        env["PATH"] = f"{Path(rustc).parent}:{env['PATH']}"
+        cmd = [cargo, "zigbuild", "-p", profile.cargo_package,
+               "--target", profile.cargo_target, "--release"]
+    else:
+        cmd = ["cargo", "run" if args.run else "build",
+               "-p", profile.cargo_package]
+    if profile.cargo_features:
+        cmd += ["--features", ",".join(profile.cargo_features)]
+    cmd += args.cargo
+    log(" ".join(cmd))
+    run(cmd, cwd=ROOT, env=env)
+
+
 def build_host(profile: Profile, args) -> None:
     if platform.system() != "Darwin":
         die("the 'host' profile is macOS-only; add a branch here for Linux.")
     check_system_deps(profile)
     fetch_release_assets()
-    for name in profile.sources:
-        source = SOURCES[name]
-        fetch(source)
-        extract(source)
-        if source.build and not (source.src_dir / ".xbuild-built").exists():
-            log(f"building {source.name}")
-            source.build(source.src_dir, profile)
-            (source.src_dir / ".xbuild-built").touch()
-        elif source.build:
-            profile.link_search.append(source.src_dir / "build" / "release")
+    build_sources(profile)
     log("building mupdf_wrapper")
     build_mupdf_wrapper(profile)
+    run_cargo(profile, args)
 
-    cmd = ["cargo", "run" if args.run else "build", "-p", profile.cargo_package]
-    if profile.cargo_features:
-        cmd += ["--features", ",".join(profile.cargo_features)]
-    cmd += args.cargo
-    log(" ".join(cmd))
-    run(cmd, cwd=ROOT, env=cargo_env(profile))
+
+# --------------------------------------------------------------------------
+# The kindle profile
+# --------------------------------------------------------------------------
+
+_ZIG_WRAPPERS = {
+    "zig-cc":     ["cc", "-target", ZIG_TARGET, *ZIG_ARCH_FLAGS],
+    "zig-cxx":    ["c++", "-target", ZIG_TARGET, *ZIG_ARCH_FLAGS],
+    "zig-ar":     ["ar"],
+    "zig-ranlib": ["ranlib"],
+}
+
+
+def write_zig_wrappers(profile: Profile) -> None:
+    """configure, cmake and make all want ``$CC`` to be one word.
+
+    ``zig cc -target ...`` is five, and quoting it survives none of those
+    three.  Four two-line shell wrappers is the whole answer, and it also
+    means the target triple and the -mcpu/-mfloat-abi choice are written
+    down in exactly one place.
+    """
+    zig = shutil.which("zig") or die("zig is not on PATH")
+    bindir = WORK / profile.name / "bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    for name, argv in _ZIG_WRAPPERS.items():
+        p = bindir / name
+        p.write_text("#!/bin/sh\nexec {} {} \"$@\"\n"
+                     .format(zig, " ".join(argv)))
+        p.chmod(p.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def check_arm_abi(path: Path) -> None:
+    """The hard build gate.  A hard-float binary fails on the device as a bare
+    "No such file or directory" -- the missing ld-linux-armhf.so.3 loader --
+    which reads as "the file isn't there", not "the ABI is wrong".  Cheapest
+    possible place to catch it is here.
+
+    Same check as ezkindle's scripts/check-arm-abi.py, reimplemented so this
+    fork has no path dependency on a sibling checkout; if that checkout *is*
+    next door, it is run too, so the two can never silently disagree.
+    """
+    with path.open("rb") as f:
+        if f.read(4) != b"\x7fELF":
+            die(f"{path}: not an ELF")
+        f.seek(0x12)
+        machine = int.from_bytes(f.read(2), "little")
+        f.seek(0x24)
+        flags = int.from_bytes(f.read(4), "little")
+    if machine != 0x28:
+        die(f"{path}: e_machine=0x{machine:x}, not ARM")
+    if flags & 0x400:                      # EF_ARM_ABI_FLOAT_HARD
+        die(f"{path}: e_flags=0x{flags:x} -- HARD-float, WRONG for this device")
+    log(f"ABI gate: {path.name}: e_flags=0x{flags:x} soft-float, correct")
+
+    sibling = ROOT.parent / "ezkindle" / "scripts" / "check-arm-abi.py"
+    if sibling.exists():
+        run([sys.executable, str(sibling), str(path)])
+
+
+def rustup_tools() -> tuple[str, str]:
+    """Resolve (cargo, rustc) from rustup, both by absolute path.
+
+    This Mac has Homebrew's rust first on PATH and other projects depend on
+    it, so nothing here reorders the global PATH or changes rustup's default
+    toolchain.  ``rustup which`` is asked from the repository root, so
+    rust-toolchain.toml decides -- which is what finally makes that pin mean
+    something (see PATCHES.md).
+
+    **rustc has to be named explicitly.**  Homebrew's rustup shim is a bash
+    wrapper, and a cargo reached through it still finds ``rustc`` by PATH --
+    i.e. Homebrew's rustc, which has no cross targets installed.  The symptom
+    is a very convincing lie: "can't find crate for `core` ... the target may
+    not be installed", for a target that *is* installed.
+    """
+    rustup = shutil.which("rustup")
+    if not rustup:
+        die("rustup is not on PATH (brew install rustup), so the "
+            f"{RUST_TARGET} std cannot be found")
+    def which(tool: str) -> str:
+        out = subprocess.run([rustup, "which", tool], cwd=ROOT,
+                             capture_output=True, text=True)
+        if out.returncode != 0:
+            die(f"rustup which {tool} failed:\n{out.stderr.strip()}")
+        return out.stdout.strip()
+    return which("cargo"), which("rustc")
 
 
 def build_kindle(profile: Profile, args) -> None:
-    die("the 'kindle' profile lands in phase 1 (see docs/plato-port.md in "
-        "the ezkindle repo): zig cc -target arm-linux-musleabi, static .a "
-        "output, cargo-zigbuild, armv7-unknown-linux-musleabi. Not "
-        "implemented yet.")
+    if not shutil.which("cargo-zigbuild"):
+        die("cargo-zigbuild is not on PATH (brew install cargo-zigbuild)")
+    write_zig_wrappers(profile)
+    (profile.prefix / "include").mkdir(parents=True, exist_ok=True)
+    (profile.prefix / "lib").mkdir(parents=True, exist_ok=True)
+    profile.cflags = list(ZIG_ARCH_FLAGS)
+    fetch_release_assets()
+    build_sources(profile)
+    log("building c23 math compat shim")
+    build_c23_compat(profile)
+    log("building mupdf_wrapper")
+    build_mupdf_wrapper(profile)
+    profile.link_search.append(profile.prefix / "lib")
+    run_cargo(profile, args)
+
+    out = ROOT / "target" / profile.cargo_target / "release" / profile.cargo_package
+    if not out.exists():
+        die(f"expected a binary at {out}")
+    check_arm_abi(out)
+    log(f"{out}  ({out.stat().st_size // 1024} KiB)")
 
 
 BUILDERS = {"host": build_host, "kindle": build_kindle}
@@ -366,19 +805,22 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("profile", choices=sorted(PROFILES))
     p.add_argument("--run", action="store_true",
-                   help="cargo run instead of cargo build")
+                   help="cargo run instead of cargo build (host only)")
+    p.add_argument("--package", metavar="NAME",
+                   help="cargo package to build instead of the profile's "
+                        "default (host: emulator, kindle: plato-harness)")
     p.add_argument("--clean", action="store_true",
-                   help="remove .xbuild/ (keeping the verified tarballs)")
+                   help="remove .xbuild/<profile>/ (keeping the verified tarballs)")
     p.add_argument("cargo", nargs="*",
                    help="extra arguments passed through to cargo")
     args = p.parse_args()
 
-    if args.clean:
-        for child in WORK.glob("*"):
-            if child != CACHE:
-                shutil.rmtree(child, ignore_errors=True)
-
     profile = PROFILES[args.profile]
+    if args.package:
+        profile.cargo_package = args.package
+    if args.clean:
+        shutil.rmtree(WORK / profile.name, ignore_errors=True)
+
     BUILDERS[args.profile](profile, args)
 
 
