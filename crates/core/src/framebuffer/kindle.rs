@@ -193,6 +193,39 @@ pub struct KindleFramebuffer {
     fix_info: FixScreenInfo,
 }
 
+/// Refuse a framebuffer whose reported geometry is not portrait.
+///
+/// **`vinfo.rotate` is read and deliberately not interpreted.** The PW3 reports
+/// `rotate == 3` (Confirmed, `plato-phase3-probes.txt`) while `xres`/`yres` are
+/// already `1072`/`1448`, i.e. portrait — and the touch coordinates that come
+/// off `/dev/input/event1` are portrait-native screen pixels with no transform
+/// (Confirmed in a live capture: the top-left corner tap reads `(64, 62)`).
+/// KOReader, which drives this panel correctly, likewise never reads the field.
+///
+/// So lab126's `rotate` describes the EPDC's own scanout, in its own numbering,
+/// and there is no consistent way to map it onto Plato's `0..4` — where
+/// rotation is what `Device::should_swap_axes` and `should_mirror_axes` consume
+/// to transform touch input. Feeding a 3 into that machinery would swap
+/// `ABS_MT_POSITION_X`/`_Y` (`should_swap_axes(3)` is true with the default
+/// swapping scheme) and mirror both axes, i.e. break touch on a panel whose
+/// coordinates are already correct. The rotation Plato records for this panel
+/// is therefore `startup_rotation() == 0`, unconditionally, and it is
+/// self-consistent by construction: `dims()` comes from `xres`/`yres`,
+/// `set_rotation` refuses to move off it, and the input transform derived from
+/// it is the identity.
+///
+/// What *would* invalidate all of that is the geometry itself arriving
+/// transposed. That is the thing worth a hard error rather than a silent
+/// misrender, and it is the only thing this check is for.
+pub fn check_geometry(xres: u32, yres: u32, rotate: u32) -> Result<(), Error> {
+    if xres > yres {
+        return Err(format_err!("the panel reports landscape geometry {}x{} (rotate={}); \
+                                this backend assumes a portrait-native panel with an \
+                                untransformed touch layer", xres, yres, rotate));
+    }
+    Ok(())
+}
+
 impl KindleFramebuffer {
     pub fn new<P: AsRef<Path>>(path: P, rotation: i8) -> Result<KindleFramebuffer, Error> {
         let file = OpenOptions::new().read(true)
@@ -211,6 +244,8 @@ impl KindleFramebuffer {
             return Err(format_err!("unsupported framebuffer depth: {} bits per pixel",
                                    var_info.bits_per_pixel));
         }
+
+        check_geometry(var_info.xres, var_info.yres, var_info.rotate)?;
 
         let bytes_per_pixel = var_info.bits_per_pixel / 8;
         let frame_size = (var_info.yres * fix_info.line_length) as libc::size_t;
@@ -434,9 +469,14 @@ impl Framebuffer for KindleFramebuffer {
     /// a lab126 EPDC is not a thing Amazon's own reader ever does.
     ///
     /// So this backend never writes rotation, and the `Device` ladder is set up
-    /// (`startup_rotation() == 0`, `swapping_scheme() == 0`, default mirroring)
-    /// so that the native rotation *is* portrait with an untransformed touch
-    /// panel — the two facts KOReader records for the PW3.
+    /// (`startup_rotation() == 0`, the default `swapping_scheme() == 1` and the
+    /// default mirroring `(2, 1)`) so that the native rotation *is* portrait
+    /// with an untransformed touch panel — the two facts KOReader records for
+    /// the PW3, and both since Confirmed on the device.
+    ///
+    /// Note that the panel *reports* `vinfo.rotate == 3`. That is lab126's
+    /// number, not Plato's: see [`check_geometry`] for why it is read and then
+    /// ignored.
     ///
     /// A request for a different rotation returns `Err`. That is the minimal
     /// correct behaviour, and it is correct rather than merely convenient
@@ -734,5 +774,26 @@ mod tests {
     fn temperature_is_the_lab126_auto_value() {
         assert_eq!(TEMP_USE_AUTO, 0x1001);
         assert_ne!(TEMP_USE_AUTO, TEMP_USE_AMBIENT);
+    }
+
+    /// The device reports `rotate == 3` with portrait `xres`/`yres`. That is
+    /// accepted as-is: the field is informational here, and the geometry is
+    /// what decides.
+    #[test]
+    fn the_pw3s_reported_geometry_is_accepted_whatever_rotate_says() {
+        for rotate in 0..4 {
+            assert!(check_geometry(1072, 1448, rotate).is_ok(), "rotate={rotate}");
+        }
+    }
+
+    /// A transposed panel would render sideways and put every touch in the
+    /// wrong place, because the whole Kindle arm assumes an identity transform.
+    /// Fail at construction instead.
+    #[test]
+    fn a_landscape_panel_is_refused() {
+        assert!(check_geometry(1448, 1072, 3).is_err());
+        assert!(check_geometry(1448, 1072, 0).is_err());
+        // Square is degenerate but harmless: no transposition is possible.
+        assert!(check_geometry(1000, 1000, 3).is_ok());
     }
 }
