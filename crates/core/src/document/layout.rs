@@ -23,13 +23,19 @@
 //! aggregate absorbs all of that; a union absorbs none of it and is also
 //! defeated by a single outlier page.
 //!
+//! The second half of the module is the arithmetic of a *screenful* in
+//! continuous mode: where the next one starts, how tall the previous one is,
+//! and which cached page to drop. Same discipline — integers and slices in,
+//! integers out, so that "does a page turn ever fail to advance?" is a
+//! question a unit test can answer.
+//!
 //! Sampling is likewise not incidental. [`sample_indices`] skips the first page
 //! and the last two, because a title page and a reference list have systematically
 //! different geometry from the body — and because arXiv stamps the *first* page
 //! only, with a rotated line at x ≈ 10.9 pt that widens a naive content box by
 //! 19%.
 
-use crate::geom::{Boundary, Vec2};
+use crate::geom::{Boundary, LinearDir, Vec2};
 use crate::metadata::Margin;
 
 /// A text line's bounding box, plus its writing direction when the backend
@@ -210,6 +216,142 @@ pub fn sample_indices(pages_count: usize, sample: usize) -> Vec<usize> {
     (0..sample).map(|i| first + (i * span) / sample).collect()
 }
 
+/// Two text lines whose tops are within this many page points of each other
+/// are one *row*.
+///
+/// Rows, not lines, are what an overlap is counted in. A two-column page emits
+/// one fz_stext line per column at very nearly the same height, and those are
+/// one line of reading, not two; counting lines would halve the overlap on
+/// exactly the documents this was built for. The tolerance is deliberately
+/// small — it merges columns and superscripts, not consecutive lines, which
+/// are ~12 pt apart in a paper set in 10 pt type.
+pub const ROW_TOLERANCE_PT: f32 = 2.0;
+
+/// The top of the text row that is `count` rows away from `y` — upwards for
+/// [`LinearDir::Backward`], downwards for [`LinearDir::Forward`].
+///
+/// `y` itself is expected to *be* a row top (both call sites pass a cut that
+/// `find_cut` already snapped to one), so rows within `tol` of `y` are neither
+/// counted nor returned; the answer is always a different row.
+///
+/// Saturates rather than fails: asking for the 2nd row above the 1st row of a
+/// page gives the 1st row. The caller is responsible for the resulting
+/// distance being sane — see [`clamp_overlap`] — because a page with two rows
+/// on it would otherwise hand back an overlap of a whole screen.
+pub fn row_top(rows: &[Boundary], y: f32, count: usize, dir: LinearDir, tol: f32) -> Option<f32> {
+    if count == 0 {
+        return None;
+    }
+
+    let mut tops: Vec<f32> = rows.iter()
+                                 .filter(|r| is_sane(r))
+                                 .map(|r| r.min.y)
+                                 .filter(|t| match dir {
+                                     LinearDir::Backward => *t < y - tol,
+                                     LinearDir::Forward => *t > y + tol,
+                                 })
+                                 .collect();
+
+    tops.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    tops.dedup_by(|a, b| (*a - *b).abs() <= tol);
+
+    match dir {
+        LinearDir::Backward => {
+            let n = tops.len();
+            tops.get(n.saturating_sub(count)).copied().or_else(|| tops.first().copied())
+        },
+        LinearDir::Forward => {
+            tops.get(count - 1).copied().or_else(|| tops.last().copied())
+        },
+    }
+}
+
+/// An overlap may never eat more than half the screen, whatever the text says.
+///
+/// This is the only thing standing between a pathological page — two rows of
+/// display type, a title page, a figure caption alone under a plate — and a
+/// page turn that advances by almost nothing.
+pub fn clamp_overlap(overlap: i32, available_height: i32) -> i32 {
+    overlap.clamp(0, (available_height / 2).max(0))
+}
+
+/// Where the next screenful starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextScreen {
+    /// Stay on this page, `.0` scaled pixels below the top of its frame.
+    Same(i32),
+    /// The screenful ended at the page's bottom edge: hand over to the next
+    /// page, at its top.
+    NextPage,
+}
+
+/// The top offset of the next screenful, given where the current one was cut.
+///
+/// * `cut` — the bottom of the current screenful, in scaled pixels from the
+///   top of the last visible page's frame. `find_cut` has already snapped it
+///   to a row top, so the row it cuts through is *not* shown.
+/// * `overlap` — how far back up to start, already clamped.
+/// * `current` — the offset the current screenful started at within that same
+///   page, or 0 if the screenful ran on from an earlier page.
+///
+/// The `.max(current + 1)` is the load-bearing line: a page turn that does not
+/// change the offset reads, one frame later, as "No next page" and ends the
+/// book. Overlap must never be able to cause that, so progress wins over
+/// overlap whenever the two conflict.
+///
+/// A screenful ending exactly at the page's bottom edge hands over with no
+/// overlap at all. That is deliberate on both counts: there is no cut through
+/// text to give the eye an anchor over — the next screenful opens on a fresh
+/// page — and it leaves the last page's end-of-document path bit-identical to
+/// what it was before overlap existed.
+pub fn next_screen(cut: i32, pixmap_height: i32, overlap: i32, current: i32) -> NextScreen {
+    if cut >= pixmap_height {
+        return NextScreen::NextPage;
+    }
+
+    let target = (cut - overlap.max(0)).max(current + 1)
+                                       .min((pixmap_height - 1).max(0));
+    NextScreen::Same(target)
+}
+
+/// How tall the previous screenful should be so that it ends `overlap` pixels
+/// into the current one.
+///
+/// Going backwards, the overlap is spent at the *bottom* of the screen rather
+/// than the top, so it is not an offset to subtract but a smaller screen to
+/// fill — which is why the backward walk in `go_to_neighbor` accumulates page
+/// heights against this rather than against the real one.
+pub fn previous_span(available_height: i32, overlap: i32) -> i32 {
+    (available_height - overlap.max(0)).max(1)
+}
+
+/// Which cached page to drop, given the sorted cache keys and the span of
+/// pages the screen is currently showing.
+///
+/// The policy is upstream's, unchanged: evict from whichever side of the
+/// visible span holds more pages, so the two prefetched neighbours are what
+/// goes first and a page that is actually on screen goes last.
+///
+/// Extracted because overlap widens the visible span — an overlapped
+/// screenful can straddle one more page boundary than an aligned one — and
+/// "can eviction ever throw away a page the screen is showing?" stops being
+/// obvious at that point. It can, but only when the span alone exceeds the
+/// cap, which needs pages shorter than half a screen. See the test.
+pub fn eviction_candidate(keys: &[usize], first: usize, last: usize) -> Option<usize> {
+    if keys.is_empty() {
+        return None;
+    }
+
+    let left_count = keys.iter().filter(|k| **k < first).count();
+    let right_count = keys.iter().filter(|k| **k > last).count();
+
+    if left_count >= right_count {
+        keys.first().copied()
+    } else {
+        keys.last().copied()
+    }
+}
+
 fn is_sane(rect: &Boundary) -> bool {
     rect.min.x.is_finite() && rect.min.y.is_finite() &&
     rect.max.x.is_finite() && rect.max.y.is_finite() &&
@@ -241,7 +383,6 @@ fn percentile(values: &mut Vec<f32>, q: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bndr;
 
     fn line(x0: f32, y0: f32, x1: f32, y1: f32) -> TextLine {
         TextLine::new(bndr![x0, y0, x1, y1])
@@ -466,6 +607,145 @@ mod tests {
         assert_eq!(percentile(&mut v, 0.5), 2.0);
         let mut v = vec![10.0, 0.0];
         assert_eq!(percentile(&mut v, 0.10), 1.0);
+    }
+
+    /// Twenty rows of 10 pt type on a 14 pt baseline, starting at y = 100.
+    fn rows(n: usize) -> Vec<Boundary> {
+        (0..n).map(|i| {
+            let y = 100.0 + i as f32 * 14.0;
+            bndr![91.8, y, 520.2, y + 10.0]
+        }).collect()
+    }
+
+    #[test]
+    fn a_row_above_is_a_row_above() {
+        let rows = rows(20);
+        // The cut sits at the top of row 10 (y = 240): two rows back is row 8.
+        assert_eq!(row_top(&rows, 240.0, 1, LinearDir::Backward, ROW_TOLERANCE_PT), Some(226.0));
+        assert_eq!(row_top(&rows, 240.0, 2, LinearDir::Backward, ROW_TOLERANCE_PT), Some(212.0));
+        assert_eq!(row_top(&rows, 240.0, 1, LinearDir::Forward, ROW_TOLERANCE_PT), Some(254.0));
+        assert_eq!(row_top(&rows, 240.0, 2, LinearDir::Forward, ROW_TOLERANCE_PT), Some(268.0));
+    }
+
+    /// Forward and backward are exact inverses, which is what makes a
+    /// Next-then-Previous pair land back where it started.
+    #[test]
+    fn stepping_back_and_forward_is_symmetric() {
+        let rows = rows(20);
+        let up = row_top(&rows, 240.0, 2, LinearDir::Backward, ROW_TOLERANCE_PT).unwrap();
+        assert_eq!(row_top(&rows, up, 2, LinearDir::Forward, ROW_TOLERANCE_PT), Some(240.0));
+    }
+
+    /// The reason this counts rows and not lines: a two-column page emits two
+    /// lines per row, and an overlap of two lines would be one row of reading.
+    #[test]
+    fn the_two_columns_of_a_row_count_once() {
+        let mut two_col = Vec::new();
+        for i in 0..20 {
+            let y = 100.0 + i as f32 * 14.0;
+            two_col.push(bndr![54.0, y, 290.0, y + 10.0]);
+            // The right column's baseline is a hair off, as it is in practice.
+            two_col.push(bndr![307.0, y + 0.4, 543.0, y + 10.4]);
+        }
+        assert_eq!(row_top(&two_col, 240.0, 2, LinearDir::Backward, ROW_TOLERANCE_PT), Some(212.0));
+    }
+
+    #[test]
+    fn asking_for_more_rows_than_there_are_saturates() {
+        let three = rows(3);
+        assert_eq!(row_top(&three, 128.0, 9, LinearDir::Backward, ROW_TOLERANCE_PT), Some(100.0));
+        assert_eq!(row_top(&three, 100.0, 9, LinearDir::Forward, ROW_TOLERANCE_PT), Some(128.0));
+        assert!(row_top(&[], 100.0, 2, LinearDir::Backward, ROW_TOLERANCE_PT).is_none());
+        assert!(row_top(&rows(20), 240.0, 0, LinearDir::Backward, ROW_TOLERANCE_PT).is_none());
+        // Nothing above the first row, nothing below the last.
+        assert!(row_top(&three, 100.0, 1, LinearDir::Backward, ROW_TOLERANCE_PT).is_none());
+        assert!(row_top(&three, 128.0, 1, LinearDir::Forward, ROW_TOLERANCE_PT).is_none());
+    }
+
+    #[test]
+    fn an_overlap_never_eats_more_than_half_the_screen() {
+        assert_eq!(clamp_overlap(40, 1448), 40);
+        assert_eq!(clamp_overlap(900, 1448), 724);
+        assert_eq!(clamp_overlap(-5, 1448), 0);
+        assert_eq!(clamp_overlap(40, 0), 0);
+    }
+
+    #[test]
+    fn a_screenful_advances_by_its_height_less_the_overlap() {
+        // A page 4000 px tall, a screen of 1448, an overlap of 40.
+        assert_eq!(next_screen(1448, 4000, 40, 0), NextScreen::Same(1408));
+        assert_eq!(next_screen(2856, 4000, 40, 1408), NextScreen::Same(2816));
+        // With the overlap off, the old arithmetic exactly.
+        assert_eq!(next_screen(1448, 4000, 0, 0), NextScreen::Same(1448));
+    }
+
+    #[test]
+    fn a_screenful_that_ends_at_the_page_edge_hands_over() {
+        assert_eq!(next_screen(4000, 4000, 40, 2816), NextScreen::NextPage);
+        // Defensive: a cut past the edge is still a hand-over, not a negative
+        // offset into the next page.
+        assert_eq!(next_screen(4200, 4000, 40, 2816), NextScreen::NextPage);
+    }
+
+    /// The property that matters more than the overlap itself: every turn that
+    /// stays on the page moves forward. A turn that does not is read as the
+    /// end of the document.
+    #[test]
+    fn a_turn_always_advances() {
+        for cut in 1..600 {
+            for overlap in [0, 1, 40, 599, 100_000] {
+                for current in 0..cut {
+                    match next_screen(cut, 4000, overlap, current) {
+                        NextScreen::Same(off) => {
+                            assert!(off > current, "cut {} overlap {} current {} -> {}",
+                                    cut, overlap, current, off);
+                            assert!(off < 4000);
+                        },
+                        NextScreen::NextPage => panic!("handed over mid-page"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A page shorter than the overlap: the screenful is mostly the *next*
+    /// page, and the turn still has to advance.
+    #[test]
+    fn a_page_shorter_than_the_overlap_still_turns() {
+        assert_eq!(next_screen(10, 12, 40, 0), NextScreen::Same(1));
+        assert_eq!(next_screen(1, 2, 40, 0), NextScreen::Same(1));
+    }
+
+    #[test]
+    fn the_previous_screenful_is_shortened_by_the_overlap() {
+        assert_eq!(previous_span(1448, 40), 1408);
+        assert_eq!(previous_span(1448, 0), 1448);
+        // Never zero: a zero-height screen never terminates the backward walk.
+        assert_eq!(previous_span(40, 40), 1);
+        assert_eq!(previous_span(40, 4000), 1);
+    }
+
+    /// The cache holds three pages. An aligned screenful spans one or two; an
+    /// overlapped one can span one more. Eviction must take the prefetched
+    /// neighbours first in every case.
+    #[test]
+    fn eviction_takes_the_neighbours_before_the_screen() {
+        // Prefetch has just added 4 and 8 around a screen spanning 5..=7.
+        assert_eq!(eviction_candidate(&[4, 5, 6, 7, 8], 5, 7), Some(4));
+        assert_eq!(eviction_candidate(&[5, 6, 7, 8], 5, 7), Some(8));
+        // A screen on one page, both neighbours cached: symmetric, left first.
+        assert_eq!(eviction_candidate(&[4, 5, 6], 5, 5), Some(4));
+        assert_eq!(eviction_candidate(&[], 0, 0), None);
+    }
+
+    /// The honest limit, pinned rather than assumed away: once the screen
+    /// spans more pages than the cache holds, eviction has no choice but to
+    /// drop a visible one, and the next `update` rasterises it again. It takes
+    /// four pages on one screen, i.e. pages under half a screen tall, which
+    /// overlap alone cannot produce.
+    #[test]
+    fn a_screen_wider_than_the_cache_does_thrash() {
+        assert_eq!(eviction_candidate(&[5, 6, 7, 8], 5, 8), Some(5));
     }
 
     /// Fixture-backed tests over three real papers.
