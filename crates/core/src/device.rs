@@ -5,6 +5,9 @@ use crate::input::TouchProto;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum Model {
+    /// Not a Kobo. See `Device::new` for how this is selected, and PATCHES.md
+    /// for the audit of every `Device` method that has to answer for it.
+    KindlePaperwhite3,
     LibraColour,
     ClaraColour,
     ClaraBW,
@@ -44,6 +47,7 @@ pub enum Orientation {
 impl fmt::Display for Model {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
+            Model::KindlePaperwhite3 => write!(f, "Kindle Paperwhite 3"),
             Model::LibraColour   => write!(f, "Libra Colour"),
             Model::ClaraColour   => write!(f, "Clara Colour"),
             Model::ClaraBW       => write!(f, "Clara BW"),
@@ -91,8 +95,33 @@ pub enum FrontlightKind {
     Premixed,
 }
 
+/// The value of `PLATO_DEVICE` that selects the Kindle backend.
+///
+/// Detection is an **explicit opt-in**, checked before `PRODUCT`, and it is
+/// deliberately not a sniff of the running system. A Kobo exports `PRODUCT`
+/// from its own init; a Kindle exports nothing, so any heuristic ("does
+/// /dev/ntx_io exist", "is there an mxcfb") would be a guess that, if it ever
+/// misfired on a Kobo, would send Kobo hardware a 72-byte update struct. An env
+/// var cannot misfire, and it costs one line in the launcher script.
+pub const KINDLE_PW3_DEVICE: &str = "kindle-pw3";
+
 impl Device {
     pub fn new(product: &str, model_number: &str) -> Device {
+        Device::detect(&env::var("PLATO_DEVICE").unwrap_or_default(), product, model_number)
+    }
+
+    pub fn detect(plato_device: &str, product: &str, model_number: &str) -> Device {
+        if plato_device == KINDLE_PW3_DEVICE {
+            return Device {
+                model: Model::KindlePaperwhite3,
+                // cyttsp4_mt_b: protocol B is in the driver's own name, and
+                // KOReader drives the PW3 as plain protocol B on
+                // /dev/input/event1 with no coordinate transform.
+                proto: TouchProto::MultiB,
+                dims: (1072, 1448),
+                dpi: 300,
+            };
+        }
         match product {
             "kraken" => Device {
                 model: Model::Glo,
@@ -235,6 +264,10 @@ impl Device {
         }
     }
 
+    pub fn is_kindle(&self) -> bool {
+        matches!(self.model, Model::KindlePaperwhite3)
+    }
+
     pub fn color_samples(&self) -> usize {
         match self.model {
             Model::ClaraColour | Model::LibraColour => 3,
@@ -309,8 +342,15 @@ impl Device {
         }
     }
 
+    /// The Kobo generation ladder. A Kindle does not sit on it, so
+    /// `KindlePaperwhite3` answers **6** — the value that makes every site
+    /// outside `kobo1.rs`/`kobo2.rs` behave like a mark <= 6 Kobo, which is the
+    /// Carta/GloHD-era generation the PW3 is contemporary with. Every consulted
+    /// site is listed in PATCHES.md; none of them is reached with this model
+    /// except the cosmetic "Mark N" row in the system-info page.
     pub fn mark(&self) -> u8 {
         match self.model {
+            Model::KindlePaperwhite3 => 6,
             Model::LibraColour => 13,
             Model::ClaraBW |
             Model::ClaraColour => 12,
@@ -379,6 +419,24 @@ impl Device {
     // with the Kobo logo at the bottom.
     pub fn startup_rotation(&self) -> i8 {
         match self.model {
+            // The panel's only rotation; KindleFramebuffer refuses any other.
+            //
+            // 0 with the *default* swapping (1) and mirroring ((2, 1)) schemes
+            // is what makes the touch transform the identity, which is what
+            // KOReader records for the PW3: protocol B on /dev/input/event1,
+            // no coordinate transform. should_swap_axes(0) is false, so
+            // input.rs leaves ABS_MT_POSITION_X/Y alone, and
+            // should_mirror_axes(0) is (false, false).
+            //
+            // The cost is that orientation(0) reads as Landscape rather than
+            // Portrait, because Plato's model ties "portrait" to "the touch
+            // panel is landscape-native" -- true of every Kobo, false here. It
+            // is unobservable on this device: all three consumers of
+            // orientation() (app.rs:549, :744, :851) either need a gyroscope,
+            // which this model does not have, or merely guard a set_rotation()
+            // call that KindleFramebuffer refuses anyway. Touch correctness is
+            // the thing that would actually break, so it wins.
+            Model::KindlePaperwhite3 => 0,
             Model::LibraH2O => 0,
             Model::AuraH2OEd2V1 |
             Model::Forma | Model::Forma32GB |
@@ -437,7 +495,58 @@ lazy_static! {
 
 #[cfg(test)]
 mod tests {
-    use super::Device;
+    use super::{Device, Model, Orientation, FrontlightKind, KINDLE_PW3_DEVICE};
+    use crate::input::TouchProto;
+
+    #[test]
+    fn test_kindle_env_var_beats_product() {
+        // A Kobo PRODUCT alongside the Kindle opt-in: the opt-in wins, because
+        // it is checked before the match, so no Kobo string can shadow it.
+        let d = Device::detect(KINDLE_PW3_DEVICE, "alyssum", "371");
+        assert_eq!(d.model, Model::KindlePaperwhite3);
+        assert_eq!(d.dims, (1072, 1448));
+        assert_eq!(d.dpi, 300);
+        assert_eq!(d.proto, TouchProto::MultiB);
+        assert!(d.is_kindle());
+    }
+
+    #[test]
+    fn test_kindle_detection_never_misfires_on_kobo() {
+        for plato_device in ["", "kobo", "kindle", "kindle-pw4", "KINDLE-PW3"] {
+            let d = Device::detect(plato_device, "alyssum", "371");
+            assert_eq!(d.model, Model::GloHD, "PLATO_DEVICE={plato_device:?}");
+            assert!(!d.is_kindle());
+        }
+        // An unset PLATO_DEVICE with an unknown PRODUCT still falls through to
+        // the Kobo default, exactly as before.
+        assert_eq!(Device::detect("", "", "").model, Model::TouchAB);
+    }
+
+    #[test]
+    fn test_kindle_geometry_and_capabilities() {
+        let d = Device::detect(KINDLE_PW3_DEVICE, "", "");
+        // Portrait at the panel's only rotation, with no touch axis transform.
+        assert_eq!(d.startup_rotation(), 0);
+        // The identity touch transform: no axis swap, no mirroring. This is
+        // the assertion that matters -- see startup_rotation() for why
+        // orientation() reads Landscape here and why that is harmless.
+        assert!(!d.should_swap_axes(0));
+        assert_eq!(d.should_mirror_axes(0), (false, false));
+        assert_eq!(d.orientation(0), Orientation::Landscape);
+        assert_eq!(d.to_canonical(0), 0);
+        assert_eq!(d.from_canonical(0), 0);
+        assert_eq!(d.transformed_rotation(0), 0);
+        // The capability answers everything outside kobo1.rs routes on.
+        assert_eq!(d.mark(), 6);
+        assert_eq!(d.color_samples(), 1);
+        assert_eq!(d.frontlight_kind(), FrontlightKind::Standard);
+        assert!(!d.has_natural_light());
+        assert!(!d.has_lightsensor());
+        assert!(!d.has_gyroscope());
+        assert!(!d.has_page_turn_buttons());
+        assert!(!d.has_power_cover());
+        assert!(!d.has_removable_storage());
+    }
 
     #[test]
     fn test_device_canonical_rotation() {
