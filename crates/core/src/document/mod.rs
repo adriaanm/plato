@@ -1,8 +1,10 @@
+#[cfg(feature = "djvu")]
 pub mod djvu;
 pub mod pdf;
 pub mod epub;
 pub mod html;
 
+#[cfg(feature = "djvu")]
 mod djvulibre_sys;
 mod mupdf_sys;
 
@@ -22,6 +24,7 @@ use fxhash::FxHashMap;
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::{is_combining_mark};
 use serde::{Serialize, Deserialize};
+#[cfg(feature = "djvu")]
 use self::djvu::DjvuOpener;
 use self::pdf::PdfOpener;
 use self::epub::EpubDocument;
@@ -233,6 +236,7 @@ pub fn open<P: AsRef<Path>>(path: P) -> Option<Box<dyn Document>> {
                              .map_err(|e| eprintln!("{}: {:#}.", path.as_ref().display(), e))
                              .map(|d| Box::new(d) as Box<dyn Document>).ok()
             },
+            #[cfg(feature = "djvu")]
             "djvu" | "djv" => {
                 DjvuOpener::new().and_then(|o| {
                     o.open(path)

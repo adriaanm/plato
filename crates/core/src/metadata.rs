@@ -16,6 +16,7 @@ use crate::document::asciify;
 use crate::document::epub::EpubDocument;
 use crate::document::html::HtmlDocument;
 use crate::document::pdf::PdfOpener;
+#[cfg(feature = "djvu")]
 use crate::document::djvu::DjvuOpener;
 use crate::helpers::datetime_format;
 
@@ -802,6 +803,7 @@ pub fn extract_metadata_from_document(prefix: &Path, info: &mut Info) {
                 None => eprintln!("Can't open {}.", info.file.path.display()),
             }
         },
+        #[cfg(feature = "djvu")]
         "djvu" | "djv" => {
             match DjvuOpener::new().and_then(|o| o.open(path)) {
                 Some(doc) => {

@@ -7,6 +7,12 @@ edition = "2021"
 [lib]
 crate-type = ["rlib"]
 
+[features]
+default = []
+# DjVu support links djvulibre. Off by default in the ezkindle fork:
+# the port is EPUB-first (docs/plato-port.md), so djvulibre leaves the build.
+djvu = []
+
 [dependencies]
 bitflags = "2.10.0"
 downcast-rs = "2.0.2"
