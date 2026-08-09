@@ -49,8 +49,8 @@ Usage
     python3 xbuild.py host              # build the C prerequisites + emulator
     python3 xbuild.py host --run        # ... and launch the emulator
     python3 xbuild.py host --clean      # discard .xbuild/<profile>/ and rebuild
-    python3 xbuild.py kindle            # cross-build the static armv7 binary
-    python3 xbuild.py kindle -- --bin plato-harness
+    python3 xbuild.py kindle            # cross-build both static armv7 binaries
+    python3 xbuild.py kindle --package plato-harness    # just the harness
 """
 
 from __future__ import annotations
@@ -358,7 +358,10 @@ class Profile:
     brew_packages: tuple[str, ...] = ()
     pkgconfig_libs: tuple[str, ...] = ()
     sources: tuple[str, ...] = ()
-    cargo_package: str = "emulator"
+    # A profile may build more than one binary. The kindle profile builds two:
+    # the device binary and the headless render harness, which is the thing
+    # that can actually be run under qemu.
+    cargo_packages: tuple[str, ...] = ("emulator",)
     cargo_target: str = ""
     cargo_features: tuple[str, ...] = ()      # djvu deliberately absent
     extra_link_libs: tuple[str, ...] = ()
@@ -409,7 +412,7 @@ HOST = Profile(
     pkgconfig_libs=("sdl2", "freetype2", "harfbuzz", "libjpeg",
                     "libopenjp2", "jbig2dec", "gumbo", "zlib"),
     sources=("mupdf",),
-    cargo_package="emulator",
+    cargo_packages=("emulator",),
     # libmupdf.a's own undefined symbols.  Plato's #[link] attributes only
     # name mupdf / mupdf_wrapper / freetype / harfbuzz, so the rest of
     # MuPDF's dependency set has to be added on the link line.
@@ -429,7 +432,10 @@ KINDLE = Profile(
     # Order matters: each entry is built against the ones before it.
     sources=("zlib", "libpng", "libjpeg", "openjpeg", "jbig2dec",
              "freetype2", "harfbuzz", "gumbo", "mupdf"),
-    cargo_package="plato-harness",
+    # `plato` is the real device binary (phase 2's framebuffer/device backend);
+    # `plato-harness` is the headless EPUB -> PNG smoke test, and the only one
+    # of the two that runs under qemu-user. Both are gated on the ABI check.
+    cargo_packages=("plato", "plato-harness"),
     cargo_target=RUST_TARGET,
     # Nothing here: crates/core/build.rs already names the whole set for this
     # target, and naming them twice only makes the link line harder to read.
@@ -662,15 +668,15 @@ def build_sources(profile: Profile) -> None:
 
 def run_cargo(profile: Profile, args) -> None:
     env = cargo_env(profile)
+    packages = [a for pkg in profile.cargo_packages for a in ("-p", pkg)]
     if profile.cross:
         cargo, rustc = rustup_tools()
         env["RUSTC"] = rustc
         env["PATH"] = f"{Path(rustc).parent}:{env['PATH']}"
-        cmd = [cargo, "zigbuild", "-p", profile.cargo_package,
+        cmd = [cargo, "zigbuild", *packages,
                "--target", profile.cargo_target, "--release"]
     else:
-        cmd = ["cargo", "run" if args.run else "build",
-               "-p", profile.cargo_package]
+        cmd = ["cargo", "run" if args.run else "build", *packages]
     if profile.cargo_features:
         cmd += ["--features", ",".join(profile.cargo_features)]
     cmd += args.cargo
@@ -791,11 +797,12 @@ def build_kindle(profile: Profile, args) -> None:
     profile.link_search.append(profile.prefix / "lib")
     run_cargo(profile, args)
 
-    out = ROOT / "target" / profile.cargo_target / "release" / profile.cargo_package
-    if not out.exists():
-        die(f"expected a binary at {out}")
-    check_arm_abi(out)
-    log(f"{out}  ({out.stat().st_size // 1024} KiB)")
+    for pkg in profile.cargo_packages:
+        out = ROOT / "target" / profile.cargo_target / "release" / pkg
+        if not out.exists():
+            die(f"expected a binary at {out}")
+        check_arm_abi(out)
+        log(f"{out}  ({out.stat().st_size // 1024} KiB)")
 
 
 BUILDERS = {"host": build_host, "kindle": build_kindle}
@@ -806,9 +813,10 @@ def main() -> None:
     p.add_argument("profile", choices=sorted(PROFILES))
     p.add_argument("--run", action="store_true",
                    help="cargo run instead of cargo build (host only)")
-    p.add_argument("--package", metavar="NAME",
+    p.add_argument("--package", metavar="NAME", action="append",
                    help="cargo package to build instead of the profile's "
-                        "default (host: emulator, kindle: plato-harness)")
+                        "defaults (host: emulator; kindle: plato and "
+                        "plato-harness). Repeatable.")
     p.add_argument("--clean", action="store_true",
                    help="remove .xbuild/<profile>/ (keeping the verified tarballs)")
     p.add_argument("cargo", nargs="*",
@@ -817,7 +825,7 @@ def main() -> None:
 
     profile = PROFILES[args.profile]
     if args.package:
-        profile.cargo_package = args.package
+        profile.cargo_packages = tuple(args.package)
     if args.clean:
         shutil.rmtree(WORK / profile.name, ignore_errors=True)
 
