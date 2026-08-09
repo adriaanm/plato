@@ -1,0 +1,12 @@
+# Pinned toolchain for the ezkindle fork.
+#
+# NOTE: only rustup honours this file. This Mac currently has Homebrew's rustc,
+# which ignores it entirely -- the phase-0 emulator build used the Homebrew
+# toolchain regardless of what is written here. The pin becomes effective in
+# phase 1, when rustup + cargo-zigbuild arrive along with the cross target.
+# See PATCHES.md.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+# targets = ["armv7-unknown-linux-musleabi"]  # phase 1
+profile = "minimal"
