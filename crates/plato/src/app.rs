@@ -24,7 +24,7 @@ use plato_core::document::sys_info_as_html;
 use plato_core::input::{DeviceEvent, PowerSource, ButtonCode, ButtonStatus, VAL_RELEASE, VAL_PRESS};
 use plato_core::input::{raw_events, device_events, usb_events, display_rotate_event, button_scheme_event};
 use plato_core::gesture::{GestureEvent, gesture_events};
-use plato_core::helpers::{load_toml, save_toml, is_installed};
+use plato_core::helpers::{load_toml, save_toml, is_installed, suspend_outcome, SuspendOutcome};
 use plato_core::settings::{ButtonScheme, Settings, SETTINGS_PATH, RotationLock, IntermKind};
 use plato_core::frontlight::{Frontlight, StandardFrontlight, NaturalFrontlight, PremixedFrontlight, KindleFrontlight};
 use plato_core::lightsensor::{LightSensor, KoboLightSensor};
@@ -641,9 +641,35 @@ pub fn run() -> Result<(), Error> {
                 }
                 let before = Local::now();
                 println!("{}", before.format("Went to sleep on %B %-d, %Y at %H:%M:%S."));
-                Command::new("scripts/suspend.sh")
-                        .status()
-                        .ok();
+                let status = Command::new("scripts/suspend.sh").status();
+                let outcome = suspend_outcome(&status);
+                if outcome != SuspendOutcome::Slept {
+                    // We are still awake. Upstream re-schedules the suspend
+                    // task below unconditionally, relying on the wake event to
+                    // cancel it — with no sleep there is no wake, so that
+                    // becomes a retry every SUSPEND_WAIT_DELAY behind a
+                    // Sleeping screen that never lifts. Go back to being awake
+                    // instead, and say why: on this device the helper declines
+                    // whenever the daemon that owns suspend will not act.
+                    let msg = if outcome == SuspendOutcome::Refused {
+                        "Suspend was refused; staying awake."
+                    } else {
+                        "Can't run the suspend script."
+                    };
+                    println!("{}", before.format("Didn't sleep on %B %-d, %Y at %H:%M:%S."));
+                    if context.settings.auto_power_off > 0.0 {
+                        context.rtc.iter().for_each(|rtc| {
+                            rtc.disable_alarm()
+                               .map_err(|e| eprintln!("Can't disable alarm: {:#}.", e))
+                               .ok();
+                        });
+                    }
+                    resume(TaskId::Suspend, &mut tasks, view.as_mut(), &tx, &mut rq, &mut context);
+                    let notif = Notification::new(msg.to_string(), &tx, &mut rq, &mut context);
+                    view.children_mut().push(Box::new(notif) as Box<dyn View>);
+                    inactive_since = Instant::now();
+                    continue;
+                }
                 let after = Local::now();
                 println!("{}", after.format("Woke up on %B %-d, %Y at %H:%M:%S."));
                 Command::new("scripts/resume.sh")
