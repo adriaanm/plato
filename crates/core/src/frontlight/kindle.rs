@@ -6,10 +6,12 @@
 //!
 //! Plato's `Frontlight` trait speaks percentages, the sysfs node speaks raw
 //! steps in `0 ..= max_brightness`, so this is a scaling wrapper and nothing
-//! else. `max_brightness` is read once at construction rather than assumed:
-//! Amazon's own value on this generation is reported as 24 in some places and
-//! 25 in others, and a hardcoded ceiling would either clip the top of the range
-//! or write a value the driver rejects.
+//! else. `max_brightness` is read once at construction rather than assumed —
+//! and that was the right call: the PW3's real ceiling is **4095**, not the 24
+//! or 25 that the Kindle folklore quotes and not the 255 a sysfs backlight is
+//! usually assumed to have (Confirmed 2026-08-09,
+//! `device-facts/plato-phase3-probes.txt`). A hardcoded ceiling would have run
+//! the light at well under 1% of its range.
 //!
 //! Worth writing down even though it does not apply here: driving the frontlight
 //! **over lipc** (`lipc-set-prop com.lab126.powerd flIntensity`) has the quirk
@@ -29,8 +31,9 @@ const BRIGHTNESS: &str = "brightness";
 const MAX_BRIGHTNESS: &str = "max_brightness";
 
 /// Used only if `max_brightness` is unreadable — better a working light with a
-/// slightly wrong ceiling than no light at all.
-const FALLBACK_MAX_BRIGHTNESS: u32 = 24;
+/// wrong ceiling than no light at all. Set to the value Confirmed on the
+/// device, so the fallback is a fallback in name only on this hardware.
+const FALLBACK_MAX_BRIGHTNESS: u32 = 4095;
 
 pub struct KindleFrontlight {
     value: f32,
@@ -114,7 +117,7 @@ mod tests {
 
     #[test]
     fn scaling_hits_both_ends_exactly() {
-        for max in [1, 12, 24, 25, 100, 255] {
+        for max in [1, 12, 24, 25, 100, 255, 4095] {
             assert_eq!(scale_intensity(0.0, max), 0, "max={max}");
             assert_eq!(scale_intensity(100.0, max), max, "max={max}");
             assert_eq!(scale_intensity(50.0, 24), 12);
@@ -132,7 +135,7 @@ mod tests {
 
     #[test]
     fn scaling_is_monotone_and_round_trips_every_step() {
-        for max in [12, 24, 25] {
+        for max in [12, 24, 25, 4095] {
             let mut previous = 0;
             for pct in 0..=100 {
                 let raw = scale_intensity(pct as f32, max);
