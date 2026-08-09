@@ -89,9 +89,20 @@ struct HistoryItem {
 }
 
 fn build_context(fb: Box<dyn Framebuffer>) -> Result<Context, Error> {
-    let rtc = Rtc::new(RTC_DEVICE)
-                  .map_err(|e| eprintln!("Can't open RTC device: {:#}.", e))
-                  .ok();
+    // The Kindle has /dev/rtc0, but powerd owns it: alarms are set through its
+    // `rtcWakeup` lipc property (and only while it is in ReadyToSuspend), and
+    // powerd programs the chip through
+    // .../max77696-rtc.0/rtc_delta_alarm, not through the RTC ioctls. Writing
+    // an alarm here would silently fight powerd's own suspend policy, so the
+    // Kindle carries no `Rtc` at all — which also makes every auto-power-off
+    // branch in the suspend path a no-op until `rtcWakeup` is wired to it.
+    let rtc = if CURRENT_DEVICE.is_kindle() {
+        None
+    } else {
+        Rtc::new(RTC_DEVICE)
+            .map_err(|e| eprintln!("Can't open RTC device: {:#}.", e))
+            .ok()
+    };
     let path = Path::new(SETTINGS_PATH);
     let mut settings = if path.exists() {
         load_toml::<Settings, _>(path).context("can't load settings")?
