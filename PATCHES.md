@@ -22,6 +22,9 @@ every `thirdparty/*/build-kobo.sh` and `kobo.patch`, `build.sh`, `dist.sh`,
 | `rust-toolchain.toml` | Pin the Rust toolchain. **Effective as of phase 1** — see "The toolchain, and how it stays out of the way" below. |
 | `crates/harness/` | `plato-harness`: the permanent headless smoke test. Opens an EPUB, lays it out at 1072×1448 @ 300 dpi, writes a PNG, exits. It is the thing that gets run natively *and* under `qemu-arm` so the two renders can be diffed; phase 0's equivalent was a throwaway. Also a workspace member (one line in `Cargo.toml`). |
 | `csupport/c23_math_compat.c` | The four C23 libm functions musl does not ship. See below. |
+| `crates/core/src/document/layout.rs` | Page-layout analysis: content boxes and their aggregation. Pure functions over slices; no `Reader`, no MuPDF, no I/O. Phase A of the PDF work — see below. |
+| `crates/core/tests/pdf_layout.rs` | The same analysis through the real FFI, skipped unless `PLATO_TEST_PDF` names a PDF. |
+| `crates/core/test-data/{line-boxes.json,gen-line-boxes.py}` | Extracted fz_stext boxes from three real papers, and the script that extracts them. |
 
 ## Modified files
 
@@ -687,3 +690,123 @@ is entirely in shell that upstream's `Command::new("scripts/suspend.sh")`
 already calls. What was missing at first light was not code but the payload —
 the scripts did not exist, and Plato was started with a cwd that would not have
 found them anyway.
+
+## Phase A of the PDF work — automatic content-box cropping
+
+Design and measurements live in the `ezkindle` repo (`docs/plato-pdf.md`); this
+records only what diverges here. **Phase A is designed to be upstreamable**:
+automatic margin detection is a feature upstream plausibly wants, it reuses
+`CroppingMargins` unchanged, it is behind a setting, and the whole diff is
+additive. Nothing in it touches the EPUB path.
+
+The shape is the one the spike predicted: **one new pure module plus small,
+listed additions to four existing files.**
+
+### `crates/core/src/document/layout.rs` (new)
+
+`content_box`, `aggregate_box`, `crop_margin`, `sample_indices` — all pure
+functions over slices of `Boundary`, all unit-tested (22 tests, plus 3 more on
+committed fixtures). The two decisions that carry the design:
+
+- **Aggregate at the 10th/90th percentile per edge, never the union.** Per-page
+  cropping was measured to swing rendered body text by +112% between adjacent
+  pages of one paper, because a page whose content happens to occupy one column
+  crops to half the width and renders at twice the scale. One bleeding figure
+  drags a union out to the paper's edge; the percentile absorbs it. Two tests
+  assert exactly that contrast, and a third pins the caveat that a percentile
+  *interpolates*, so at a sample of ten one outlier still leaks a few points in
+  — which is why the sample defaults to 16 rather than something smaller.
+- **Drop rotated lines.** The arXiv stamp is a vertical `arXiv:NNNN.NNNNN` at
+  x = 10.9 pt on page 0, and the fixtures confirm it on all three papers: with
+  no filter their first page crops from 10.9 instead of from ~70.
+
+### `crates/core/test-data/line-boxes.json` (new, 144 KB)
+
+The fz_stext line and image boxes of `gepa.pdf`, `demo search predict.pdf` and
+`wikipedia assist.pdf`, produced by `gen-line-boxes.py`, which walks exactly the
+structures `PdfPage::lines()`/`images()` walk. **The PDFs are deliberately not
+committed** — they are megabytes each and not ours to redistribute, and the
+boxes are the entire input to everything in `layout.rs`. Same reasoning as the
+touch capture in phase 3, and the same result: the interesting logic gets a
+regression test that costs no dependency and no device.
+
+### Modified files
+
+- **`crates/core/src/document/mupdf_sys.rs`** — `FzTextLine::{wmode, dir}` and
+  `FzPoint::{x, y}` become `pub`. Four words; no layout change, `#[repr(C)]`
+  is unaffected.
+
+- **`crates/core/src/document/pdf.rs`** — `PdfPage::text_lines()`, a second
+  fz_stext walk that keeps each line's `dir` and drops its `TextLocation`.
+  A second walk rather than a wider `BoundedText`: `BoundedText` is every
+  backend's currency and only layout analysis wants a direction. Plus the two
+  trait overrides below.
+
+- **`crates/core/src/document/mod.rs`** — two additive `Document` methods,
+  **both with defaults**, so no backend but MuPDF changes at all:
+  `text_lines` (defaults to mapping `lines()` with no direction, which is
+  exactly what a backend that does not know it should say) and `ink_box`
+  (defaults to `None`). MuPDF answers `ink_box` with `PdfPage::boundary_box`,
+  which had been present and **never called** since it was written.
+
+- **`crates/core/src/settings/mod.rs`** — `ReaderSettings::auto_crop` (default
+  `true`) and `crop_sample_pages` (default 16). The struct already carries
+  `#[serde(default)]`, so an existing `Settings.toml` loads unchanged.
+
+- **`crates/core/src/view/reader/mod.rs`** — one free function
+  (`auto_crop_margins`) and one guarded block in `Reader::new`. It runs for
+  paginated documents only, and only when `cropping_margins` is `None` — a crop
+  dragged out in the margin cropper persists through the very same field, so
+  automatic detection can never overwrite one.
+
+### The one thing the design got wrong
+
+`docs/plato-pdf.md` §5 says to write the result through the existing
+`crop_margins` method, "so `page_offset` remapping and `cache.clear()` are
+inherited". **They cannot be.** `crop_margins` starts with
+`self.cache.get(&index).unwrap()`, and in `Reader::new` there is no `self` yet,
+no cache, and nothing rendered to remap an offset through — going that way is a
+panic, not an inheritance. The margins are written into `info.reader` before
+construction instead, where `load_pixmap` reads them on the first render; there
+is no cache to clear because none has been built. A stored `page_offset` is
+reset to zero, because it was measured against an uncropped frame that no
+longer exists.
+
+The `crop_margins` path remains exactly right for the case it was written for:
+a crop applied to a *running* reader, which is the manual cropper.
+
+### `crates/harness/` — it takes PDFs now
+
+`EpubDocument::new` becomes `plato_core::document::open`, which dispatches
+non-EPUB, non-HTML files to MuPDF. Every call the harness already made is on
+the `Document` trait, so that is the whole change — and it is what gives the
+PDF work a test bed with no fixtures to invent.
+
+One behavioural addition: a paginated document ignores `layout` and rasterises
+its page box in points, so a US Letter PDF came out 612x792, a third of the
+panel's pixels. Non-reflowable documents are now fit to the panel width, the
+same thing `Reader` does under `ZoomMode::FitToWidth`. **EPUB output is
+byte-identical**, so the phase-1 host-vs-ARM render comparison still means what
+it meant.
+
+### Results
+
+```
+python3 xbuild.py host --test --package plato-core     87 passed, 0 failed
+  (62 at the end of phase 3; +22 unit, +3 fixture-backed)
+PLATO_TEST_PDF=... (the same, +1 integration)          88 passed, 0 failed
+python3 xbuild.py kindle                               both binaries, ABI gate passed
+  plato          50 770 KiB    e_flags=0x5000200
+  plato-harness  48 169 KiB    e_flags=0x5000200
+```
+
+Run through the real FFI on four of the sample papers, the aggregate box
+reproduces the pymupdf reference numbers to within a point — e.g. `gepa.pdf`
+comes out `91.80 / 41.79 / 520.20 / 681.48` against the spike's
+`91.8 / 41.0 / 520.2 / 681.7`, across a MuPDF minor version. That agreement is
+what says the `dir` field is being read from the right offset.
+
+**Not measured, and it is the one open risk:** sampling 16 pages means 16
+fz_stext extractions at open, on a 1 GHz Cortex-A9. If that is seconds, Phase A
+needs lazy or background sampling and an uncropped first paint. Nothing was
+deployed to the device in this phase.
