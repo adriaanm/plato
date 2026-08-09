@@ -967,3 +967,71 @@ python3 xbuild.py host --test --package plato-core     107 passed, 0 failed
 python3 xbuild.py kindle                               both binaries, ABI gate passed
   plato          50 788 KiB    e_flags=0x5000200
 ```
+
+## A refused suspend is not a sleep
+
+`PLATO-POWERD-INTEGRATION`, second pass, after the first unplugged run on the
+PW3 (2026-08-09). **Upstreamable, and a bug fix rather than a feature**: it is
+additive, it changes nothing when `scripts/suspend.sh` succeeds, and the loop
+it fixes is reachable on any device whose suspend helper can fail.
+
+### The loop, and where it comes from
+
+Upstream's contract with `scripts/suspend.sh` is Kobo's: the script blocks in
+`echo mem > /sys/power/state`, which does not return until the device wakes.
+"The script returned" and "we slept" are therefore the same event, so the exit
+status carries no information and `Event::Suspend` ends with an unconditional
+
+```rust
+// If the wake is legitimate, the task will be cancelled by `resume`.
+schedule_task(TaskId::Suspend, Event::Suspend, SUSPEND_WAIT_DELAY, &tx, &mut tasks);
+```
+
+which is correct *given a sleep*: the wake button-press queued in the input fd
+while the loop was blocked, so it is handled next and cancels the re-armed task.
+
+On the Kindle powerd owns suspend and can decline — plugged in it ignores the
+request entirely — so the helper returns in milliseconds with nothing having
+happened. There is no wake press to cancel anything, and the re-armed task
+fires `Event::Suspend` again `SUSPEND_WAIT_DELAY` later. Measured on device:
+
+```
+suspend: entry            up=10678.34
+suspend: REFUSING …       up=10678.36     ← script exits, 10 s sleep of its own
+resume:  entry            up=10688.39     ← app.rs runs resume.sh unprompted
+suspend: entry            up=10703.45     ← +15 s, SUSPEND_WAIT_DELAY
+```
+
+forever, behind a Sleeping screen that never lifts, on a device the user
+believes is asleep. Nobody pressed anything; the whole cycle is `app.rs`.
+
+### The change
+
+- **`helpers::suspend_outcome`** (new, in `plato-core`) — a pure classifier
+  over `io::Result<ExitStatus>`: `Slept` (exit 0), `Refused` (any other exit,
+  including a signal), `NotRun` (the spawn itself failed). Pure so the decision
+  is testable with no device; four assertions plus the missing-helper case.
+- **`app.rs`'s `Event::Suspend` arm** — anything but `Slept` means we are still
+  awake, so it takes the wake path instead of the sleep path: it calls the
+  existing `resume(TaskId::Suspend, …)` helper (which lifts the Intermission,
+  restores the frontlight `PrepareSuspend` dimmed, and drops the pending task),
+  raises a `Notification` saying why, disables any alarm it just set, and does
+  **not** re-arm the suspend task. `resume.sh` is not run, because nothing
+  resumed.
+
+`NotRun` folds into the same path deliberately: a missing or non-executable
+helper is indistinguishable from a refusal from Plato's side, and both mean the
+device is awake. That also removes the silent version of this loop, where
+`scripts/suspend.sh` simply is not installed.
+
+The exit status becomes the device-side contract, and the ezkindle repo's
+`device/plato/scripts/suspend.sh` now honours it: `0` we slept, `1` we did not.
+
+### Results
+
+```
+python3 xbuild.py host --test --package plato-core     109 passed, 0 failed
+  (107 before; +2 for suspend_outcome)
+python3 xbuild.py kindle                               both binaries, ABI gate passed
+  plato          50 793 KiB    e_flags=0x5000200
+```
