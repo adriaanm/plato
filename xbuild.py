@@ -42,6 +42,7 @@ import subprocess
 import sys
 import tarfile
 import urllib.request
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -69,13 +70,15 @@ class Source:
     def tarball(self) -> Path:
         return CACHE / f"{self.name}-{self.version}{_suffix(self.url)}"
 
+    # (`tarball` is also where a .zip asset lands; _suffix keeps the name honest.)
+
     @property
     def src_dir(self) -> Path:
         return WORK / self.name
 
 
 def _suffix(url: str) -> str:
-    for s in (".tar.gz", ".tgz", ".tar.xz", ".tar.bz2"):
+    for s in (".tar.gz", ".tgz", ".tar.xz", ".tar.bz2", ".zip"):
         if url.endswith(s):
             return s
     return ".tar.gz"
@@ -195,6 +198,37 @@ SOURCES = {
     ),
 }
 
+# Data-only assets pulled out of upstream's own GitHub release zip.  Upstream
+# gets these via ./download.sh, which also serves prebuilt ARM shared objects
+# from the maintainer's server -- a path we never use.  Here the zip is
+# sha256-pinned and *only* the named data directories are extracted, so no
+# binary from it ever reaches the build.
+RELEASE_ZIP = Source(
+    name="plato-release",
+    version="0.9.45",
+    url="https://github.com/baskerville/plato/releases/download/0.9.45/plato-0.9.45.zip",
+    sha256="d89b828ff02ae2c835e14476be58b5475c612310a101dae00ad367935cece8cb",
+)
+RELEASE_ASSETS = ("hyphenation-patterns",)
+
+
+def fetch_release_assets() -> None:
+    """Unpack the hyphenation patterns; without them Plato does not hyphenate.
+
+    They are not in the git tree, and on a device-class 600px column their
+    absence is very visible -- which matters, because phase 0 is a judgement
+    about typography.
+    """
+    if all((ROOT / a).is_dir() for a in RELEASE_ASSETS):
+        return
+    fetch(RELEASE_ZIP)
+    log(f"extracting {', '.join(RELEASE_ASSETS)} from the upstream release zip")
+    with zipfile.ZipFile(RELEASE_ZIP.tarball) as zf:
+        for info in zf.infolist():
+            top = Path(info.filename).parts[0]
+            if top in RELEASE_ASSETS and not info.is_dir():
+                zf.extract(info, ROOT)
+
 
 # --------------------------------------------------------------------------
 # Plumbing
@@ -296,6 +330,7 @@ def build_host(profile: Profile, args) -> None:
     if platform.system() != "Darwin":
         die("the 'host' profile is macOS-only; add a branch here for Linux.")
     check_system_deps(profile)
+    fetch_release_assets()
     for name in profile.sources:
         source = SOURCES[name]
         fetch(source)

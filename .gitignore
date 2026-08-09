@@ -20,3 +20,5 @@
 /thirdparty/*/*
 !/thirdparty/*/*kobo*
 /.xbuild/
+/test-library/
+/hyphenation-patterns/
