@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use plato_core::anyhow::{Error, Context as ResultExt, format_err};
 use plato_core::chrono::Local;
-use plato_core::framebuffer::{Framebuffer, KoboFramebuffer1, KoboFramebuffer2, UpdateMode};
+use plato_core::framebuffer::{Framebuffer, KoboFramebuffer1, KoboFramebuffer2, KindleFramebuffer, UpdateMode};
 use plato_core::view::{View, Event, EntryId, EntryKind, ViewId, AppCmd, RenderData, RenderQueue, UpdateData};
 use plato_core::view::{handle_event, process_render_queue, wait_for_all};
 use plato_core::view::common::{locate, locate_by_id, transfer_notifications, overlapping_rectangle};
@@ -26,9 +26,9 @@ use plato_core::input::{raw_events, device_events, usb_events, display_rotate_ev
 use plato_core::gesture::{GestureEvent, gesture_events};
 use plato_core::helpers::{load_toml, save_toml};
 use plato_core::settings::{ButtonScheme, Settings, SETTINGS_PATH, RotationLock, IntermKind};
-use plato_core::frontlight::{Frontlight, StandardFrontlight, NaturalFrontlight, PremixedFrontlight};
+use plato_core::frontlight::{Frontlight, StandardFrontlight, NaturalFrontlight, PremixedFrontlight, KindleFrontlight};
 use plato_core::lightsensor::{LightSensor, KoboLightSensor};
-use plato_core::battery::{Battery, KoboBattery};
+use plato_core::battery::{Battery, KoboBattery, KindleBattery};
 use plato_core::geom::{Rectangle, DiagDir, Region};
 use plato_core::view::home::Home;
 use plato_core::view::reader::Reader;
@@ -44,6 +44,10 @@ use plato_core::context::Context;
 pub const APP_NAME: &str = "Plato";
 const FB_DEVICE: &str = "/dev/fb0";
 const RTC_DEVICE: &str = "/dev/rtc0";
+// The PW3's touch node is /dev/input/event1 (cyttsp4_mt_b), which the existing
+// fallback list already ends in -- Kobo's by-path entries simply do not exist on
+// a Kindle, so the loop falls through to it. Verified by reading the list, not
+// by probing: PLATO-DEVICE-PROBES confirms the node on device.
 const TOUCH_INPUTS: [&str; 5] = ["/dev/input/by-path/platform-2-0010-event",
                                  "/dev/input/by-path/platform-1-0038-event",
                                  "/dev/input/by-path/platform-1-0010-event",
@@ -108,7 +112,11 @@ fn build_context(fb: Box<dyn Framebuffer>) -> Result<Context, Error> {
 
     let fonts = Fonts::load().context("can't load fonts")?;
 
-    let battery = Box::new(KoboBattery::new().context("can't create battery")?) as Box<dyn Battery>;
+    let battery = if CURRENT_DEVICE.is_kindle() {
+        Box::new(KindleBattery::new().context("can't create battery")?) as Box<dyn Battery>
+    } else {
+        Box::new(KoboBattery::new().context("can't create battery")?) as Box<dyn Battery>
+    };
 
     let lightsensor = if CURRENT_DEVICE.has_lightsensor() {
         Box::new(KoboLightSensor::new().context("can't create light sensor")?) as Box<dyn LightSensor>
@@ -117,13 +125,21 @@ fn build_context(fb: Box<dyn Framebuffer>) -> Result<Context, Error> {
     };
 
     let levels = settings.frontlight_levels;
-    let frontlight = match CURRENT_DEVICE.frontlight_kind() {
-        FrontlightKind::Standard => Box::new(StandardFrontlight::new(levels.intensity)
-                                        .context("can't create standard frontlight")?) as Box<dyn Frontlight>,
-        FrontlightKind::Natural => Box::new(NaturalFrontlight::new(levels.intensity, levels.warmth)
-                                        .context("can't create natural frontlight")?) as Box<dyn Frontlight>,
-        FrontlightKind::Premixed => Box::new(PremixedFrontlight::new(levels.intensity, levels.warmth)
-                                        .context("can't create premixed frontlight")?) as Box<dyn Frontlight>,
+    // The Kindle is checked before frontlight_kind(), which would answer
+    // Standard and then reach for Kobo's /dev/ntx_io. LightSensor stays the
+    // existing null impl: has_lightsensor() is false for this model.
+    let frontlight = if CURRENT_DEVICE.is_kindle() {
+        Box::new(KindleFrontlight::new(levels.intensity)
+                     .context("can't create frontlight")?) as Box<dyn Frontlight>
+    } else {
+        match CURRENT_DEVICE.frontlight_kind() {
+            FrontlightKind::Standard => Box::new(StandardFrontlight::new(levels.intensity)
+                                            .context("can't create standard frontlight")?) as Box<dyn Frontlight>,
+            FrontlightKind::Natural => Box::new(NaturalFrontlight::new(levels.intensity, levels.warmth)
+                                            .context("can't create natural frontlight")?) as Box<dyn Frontlight>,
+            FrontlightKind::Premixed => Box::new(PremixedFrontlight::new(levels.intensity, levels.warmth)
+                                            .context("can't create premixed frontlight")?) as Box<dyn Frontlight>,
+        }
     };
 
     Ok(Context::new(fb, rtc, library, settings,
@@ -209,7 +225,13 @@ pub fn run() -> Result<(), Error> {
     let mut inactive_since = Instant::now();
     let mut exit_status = ExitStatus::Quit;
 
-    let mut fb: Box<dyn Framebuffer> = if CURRENT_DEVICE.mark() != 8 {
+    // The Kindle branch comes first, ahead of the Kobo mark ladder: mark() is
+    // 6 for the PW3, which would otherwise select KoboFramebuffer1 and send the
+    // lab126 EPDC a 68-byte update struct through the wrong ioctl number.
+    let mut fb: Box<dyn Framebuffer> = if CURRENT_DEVICE.is_kindle() {
+        Box::new(KindleFramebuffer::new(FB_DEVICE, CURRENT_DEVICE.startup_rotation())
+                     .context("can't create framebuffer")?)
+    } else if CURRENT_DEVICE.mark() != 8 {
         Box::new(KoboFramebuffer1::new(FB_DEVICE).context("can't create framebuffer")?)
     } else {
         Box::new(KoboFramebuffer2::new(FB_DEVICE).context("can't create framebuffer")?)
