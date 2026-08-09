@@ -22,7 +22,7 @@ every `thirdparty/*/build-kobo.sh` and `kobo.patch`, `build.sh`, `dist.sh`,
 | `rust-toolchain.toml` | Pin the Rust toolchain. **Effective as of phase 1** — see "The toolchain, and how it stays out of the way" below. |
 | `crates/harness/` | `plato-harness`: the permanent headless smoke test. Opens an EPUB, lays it out at 1072×1448 @ 300 dpi, writes a PNG, exits. It is the thing that gets run natively *and* under `qemu-arm` so the two renders can be diffed; phase 0's equivalent was a throwaway. Also a workspace member (one line in `Cargo.toml`). |
 | `csupport/c23_math_compat.c` | The four C23 libm functions musl does not ship. See below. |
-| `crates/core/src/document/layout.rs` | Page-layout analysis: content boxes and their aggregation. Pure functions over slices; no `Reader`, no MuPDF, no I/O. Phase A of the PDF work — see below. |
+| `crates/core/src/document/layout.rs` | Page-layout analysis: content boxes and their aggregation, the screenful arithmetic, and the column histogram and reading order. Pure functions over slices; no `Reader`, no MuPDF, no I/O. Phases A, B and C1 of the PDF work — see below. |
 | `crates/core/tests/pdf_layout.rs` | The same analysis through the real FFI, skipped unless `PLATO_TEST_PDF` names a PDF. |
 | `crates/core/test-data/{line-boxes.json,gen-line-boxes.py}` | Extracted fz_stext boxes from three real papers, and the script that extracts them. |
 
@@ -896,6 +896,164 @@ python3 xbuild.py kindle                               both binaries, ABI gate p
 **Open, and only the device can close it:** whether two rows is the right
 number, and whether repeating the same rows across a REAGL turn ghosts visibly.
 Nothing was deployed in this phase.
+
+## Phase C1 of the PDF work — column-wise navigation
+
+Design in `docs/plato-pdf.md` §5 Phase C. **This one is not upstreamable and
+was never expected to be**: column-aware navigation is a substantial
+behavioural change to Plato's reader, and upstream is one maintainer whose
+device is a Kobo. It is built to the shape the spike asked for so that rebasing
+stays cheap — all the analysis and all the arithmetic in `document/layout.rs`,
+pure, and a `Reader` diff that is a handful of named seams.
+
+It is also the point of the whole exercise: measured on ten real papers,
+reading a two-column paper one column at a time is worth **+105% rendered font
+size**, and six of the ten are two-column.
+
+### Detection: per page, then vote
+
+`layout::page_gutter` bins the x extent of the aggregate crop box 400 ways,
+adds one count per line box covering a bin, and calls a contiguous run below a
+fifth of that page's median coverage a gutter — if it is centred in the middle
+30% and at least `max(6 pt, 1%)` wide. `layout::column_vote` takes one such
+answer per sampled page and votes at 0.25, with the gutter x as the median over
+the pages that voted.
+
+**The summed histogram is not a shortcut, it is a different and wrong answer**,
+and it has a test of its own so it cannot be "simplified" back. Full-width
+elements — a title block, an abstract, a wide figure, a code listing — deposit
+ink in the gutter, and enough of them fill it in. `wikipedia assist` is the
+demonstration in the fixtures: ten of its sixteen sampled pages have an
+unmistakable gutter, and the summed histogram sees nothing at all.
+
+The fixture verdicts reproduce the spike's §4.3 table: 0% for `gepa`, 92% for
+`demo search predict` with its gutter at x = 299.2, 62% for `wikipedia assist`
+at 298.8. The last is 54% in the doc, which sampled up to 30 pages against this
+16; the verdicts and the medians agree, and the separation is still total.
+
+Verified through the real FFI on four PDFs, one of them from the sample the
+design was measured on: `2607.24504.pdf` 0% (single column, as measured), an
+ACM journal paper 0%, a textbook 0%, and an arXiv two-column paper at 12/12
+pages with its gutter at 306.8 pt.
+
+### It costs no extra sampling
+
+`analyse_layout` replaces `auto_crop_margins` as the entry point and answers
+both questions from **one** pass: the columns are detected over the crop box
+that pass just computed, from the lines it already extracted. Sampling is the
+expensive part — one fz_stext extraction per sampled page on a 1 GHz Cortex-A9,
+and still the one unmeasured risk at open — so detecting columns adds nothing
+to it.
+
+Per *page*, at render time, there is one extra extraction: the opt-out asks
+each page's own histogram whether it follows the document's layout. It is
+memoised per page for the session.
+
+### Storage
+
+Four additive `ReaderInfo` fields, all `Option`, all `skip_serializing_if`, so
+old `.reading-states` files load unchanged and new ones stay clean:
+`columns`, `column_split` (a fraction of the page width), `column_mode` (the
+override) and `current_column` (where the document was left).
+
+`columns: Some(1)` is a document that was measured and found to be single
+column. That is what stops the pass running on every open — "not measured" and
+"measured, one column" are different states, and conflating them is how a
+one-off analysis becomes a per-open cost.
+
+### The per-page opt-out
+
+A page whose own histogram shows no gutter is read full width. That is the
+§4.5 finding acted on: full-width content is 0–21% of a two-column paper, and
+a document-level split alone would slice a title page, a wide table or a plate
+down the middle. It needs no special case in the navigation, because such a
+page simply has *one* column and `layout::step_forward` is written over each
+page's own column count.
+
+A page is split at the **document's** gutter even though it votes with its own,
+because the gutter is stable to 0.0–4.4 pt within a paper and the median over
+the document is the better estimator. A page whose gutter is somewhere else
+entirely (more than 5% of the page width away) is not this layout and is read
+full width too.
+
+### Three things about the rendering the design did not anticipate
+
+- **One pixmap per page means one scale per page.** The two columns of a paper
+  are never exactly equal, so the scale has to fit the *wider* one or the other
+  runs off the panel — `layout::widest_column_margin`. The frame in the cache
+  is still the whole crop; narrowing to a column happens per chunk, so both
+  columns share one rasterisation.
+- **The narrower column is centred**, since it no longer fills the surface
+  width. A full-width page keeps the old arithmetic exactly.
+- **`find_cut` has to look inside the column.** Given the whole crop, a line in
+  the *other* column can be chosen as the cut, or block the choice. Same for
+  Phase B's overlap: it is measured against the column frame, so two rows are
+  two rows of the column being read.
+
+### Turning a column is a turn that changes nothing
+
+A turn from the bottom of one column to the top of the next changes neither the
+page nor — when that column filled less than a screen — the offset. Phase B
+already established that a turn which appears to change nothing is reported one
+frame later as the end of the document, so the guard in `go_to_neighbor` now
+watches the column as well. While there: a turn that fails no longer leaves
+behind the offset it had speculatively written.
+
+`vertical_scroll` moves through the same units, so dragging off the top of
+column 2 lands at the bottom of column 1 rather than on the previous page. The
+same `step_forward`/`step_backward` pair, so it cannot drift from the page
+turn's idea of the reading order.
+
+Column mode lives entirely inside fit-to-width plus screen scrolling. Fit to
+page, a custom zoom and page-at-a-time scrolling render exactly as they did
+before columns existed — a column is not a unit their navigation knows how to
+move through — and leaving screen scrolling clears the cache, because every
+pixmap in it was rasterised at a column's scale.
+
+### The override, and the one global switch
+
+`Columns` in the title menu, next to `Zoom Mode` and `Scroll Mode`: **Automatic
+(n columns) / Two / One**, stored in `ReaderInfo::column_mode`, per document.
+The detected verdict is named in the Automatic entry rather than hidden behind
+it, since the only reason to open that menu is to disagree with it. Forcing
+`Two` on a document with no detected gutter splits the crop down the middle.
+
+The only global setting is `auto-columns` (default true), which turns the
+*detection* off. Documents already measured keep their verdict — the same
+contract `auto-crop` has.
+
+### Memory, and the FFI that was not added
+
+Column mode raises the scale by ~2x, so the full-page pixmap by ~4x. Measured
+on the arXiv paper above: 4.19 px/pt against 2.11, a 2564x3318 pixmap of
+**8.5 MB** against 2.1 MB, and the cache holds three — so ~25 MB resident
+instead of ~6 MB. On 512 MB with the Amazon framework stopped (74 MB in use)
+that is comfortable, and it is the reason `CACHE_SIZE` was left at 3.
+
+The waste is real, though: everything outside the crop, and the whole of the
+other column, is rasterised and held. **Rendering only the region needed cannot
+be done with today's FFI** — `mp_new_pixmap_from_page` wraps
+`fz_new_pixmap_from_page`, which sizes the pixmap from the page's transformed
+bounds, so a translate in the matrix moves the content and not the allocation.
+It would take a new wrapper over `fz_new_pixmap_with_bbox` + `fz_run_page`,
+which is deliberately out of scope here; §7.2 of the design says the same.
+
+### Results
+
+```
+python3 xbuild.py host --test --package plato-core     127 passed, 0 failed
+  (109 after the powerd pass; +18, all in document/layout.rs)
+PLATO_TEST_PDF=... (+1 integration, the column vote through the FFI)
+python3 xbuild.py kindle                               both binaries, ABI gate passed
+  plato          50 830 KiB    e_flags=0x5000200
+  plato-harness  48 171 KiB    e_flags=0x5000200
+```
+
+**Open, and only the glass can close it:** whether reading down a column and
+jumping back up feels right; whether the column boundary is obvious enough
+without a rule; the turn latency at ~4.7 screenfuls per page, now with one
+extra fz_stext extraction per page for the opt-out; and the memory above, which
+is reasoned rather than measured. Nothing was deployed in this phase.
 
 ## Uninstalled apps, and spawns that are not fatal
 
