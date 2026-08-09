@@ -22,3 +22,4 @@
 /.xbuild/
 /test-library/
 /hyphenation-patterns/
+/__pycache__/
