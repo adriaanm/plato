@@ -10,9 +10,10 @@ use std::io::ErrorKind;
 use std::ffi::{CString, CStr};
 use std::os::unix::ffi::OsStrExt;
 use super::{Document, Location, TextLocation, BoundedText, TocEntry};
+use super::layout::TextLine;
 use super::{chapter, chapter_relative};
 use crate::metadata::TextAlign;
-use crate::geom::{Boundary, CycleDir};
+use crate::geom::{Boundary, CycleDir, Vec2};
 use crate::unit::pt_to_px;
 use crate::framebuffer::Pixmap;
 
@@ -259,9 +260,19 @@ impl Document for PdfDocument {
         self.page(index).and_then(|page| page.lines()).map(|lines| (lines, index))
     }
 
+    fn text_lines(&mut self, loc: Location) -> Option<(Vec<TextLine>, usize)> {
+        let index = self.resolve_location(loc)?;
+        self.page(index).and_then(|page| page.text_lines()).map(|lines| (lines, index))
+    }
+
     fn images(&mut self, loc: Location) -> Option<(Vec<Boundary>, usize)> {
         let index = self.resolve_location(loc)?;
         self.page(index).and_then(|page| page.images()).map(|images| (images, index))
+    }
+
+    fn ink_box(&mut self, loc: Location) -> Option<(Boundary, usize)> {
+        let index = self.resolve_location(loc)?;
+        self.page(index).and_then(|page| page.boundary_box()).map(|bnd| (bnd, index))
     }
 
     fn links(&mut self, loc: Location) -> Option<(Vec<BoundedText>, usize)> {
@@ -366,6 +377,45 @@ impl<'a> PdfPage<'a> {
                             location: TextLocation::Static(self.index, offset),
                         });
                         offset += 1;
+                        line = (*line).next;
+                    }
+                }
+
+                block = (*block).next;
+            }
+
+            fz_drop_stext_page(self.ctx.0, tp);
+            Some(lines)
+        }
+    }
+
+    /// The same walk as [`PdfPage::lines`], but keeping each line's writing
+    /// direction and dropping its text location.
+    ///
+    /// `lines` returns `BoundedText`, which every document backend produces and
+    /// which therefore has nowhere to put fz_stext's `dir`. Layout analysis is
+    /// the one caller that needs it -- a rotated line is an arXiv stamp or a
+    /// margin note, not part of the text block -- so it gets its own walk
+    /// rather than a wider `BoundedText`.
+    pub fn text_lines(&self) -> Option<Vec<TextLine>> {
+        unsafe {
+            let mut lines = Vec::new();
+            let tp = mp_new_stext_page_from_page(self.ctx.0, self.page, ptr::null());
+            if tp.is_null() {
+                return None;
+            }
+            let mut block = (*tp).first_block;
+
+            while !block.is_null() {
+                if (*block).kind == FZ_PAGE_BLOCK_TEXT {
+                    let text_block = (*block).u.text;
+                    let mut line = text_block.first_line;
+
+                    while !line.is_null() {
+                        // `wmode` is 1 for vertical writing, which `dir` also
+                        // describes; taking `dir` alone keeps one rule.
+                        let dir = Vec2::new((*line).dir.x as f32, (*line).dir.y as f32);
+                        lines.push(TextLine::with_dir((*line).bbox.into(), dir));
                         line = (*line).next;
                     }
                 }

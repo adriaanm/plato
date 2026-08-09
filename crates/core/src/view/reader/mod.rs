@@ -49,6 +49,7 @@ use crate::settings::{HYPHEN_PENALTY, STRETCH_TOLERANCE};
 use crate::frontlight::LightLevels;
 use crate::gesture::GestureEvent;
 use crate::document::{Document, open, Location, TextLocation, BoundedText, Neighbors, BYTES_PER_PAGE};
+use crate::document::layout;
 use crate::document::{TocEntry, SimpleTocEntry, TocLocation, toc_as_html, annotations_as_html, bookmarks_as_html};
 use crate::document::html::HtmlDocument;
 use crate::metadata::{Info, FileInfo, ReaderInfo, Annotation, TextAlign, ZoomMode, ScrollMode, PageScheme};
@@ -198,6 +199,70 @@ fn scaling_factor(rect: &Rectangle, cropping_margin: &Margin, screen_margin_widt
         ZoomMode::FitToWidth => width_ratio,
         ZoomMode::Custom(_) => unreachable!(),
     }
+}
+
+/// Detect a paginated document's content box and return it as cropping
+/// margins. `None` means "leave it uncropped", which is always correct.
+///
+/// The analysis itself is in `document::layout` and is pure; this function is
+/// only the part that has to talk to a document -- which pages to ask, what to
+/// do when a page declines to answer, and the fallback for a scan.
+///
+/// Two things it deliberately does not do. It does not average pages of
+/// different sizes together: a document whose plates are a different paper
+/// size from its body would otherwise get a crop that fits neither, so
+/// off-size pages are skipped and the reference size is the first sampled
+/// page's. And it does not fall back to ink bounding boxes unless the text
+/// layer has already failed on most of the sample -- `boundary_box` includes
+/// rules, page borders and scanner edge noise, so it is a worse estimator
+/// wherever stext works at all.
+fn auto_crop_margins(doc: &mut dyn Document, sample: usize) -> Option<Margin> {
+    let indices = layout::sample_indices(doc.pages_count(), sample);
+    let &first = indices.first()?;
+    let dims = doc.dims(first)?;
+    let same_size = |index: usize, doc: &mut dyn Document| {
+        doc.dims(index).map_or(false, |(w, h)| {
+            (w - dims.0).abs() < 1.0 && (h - dims.1).abs() < 1.0
+        })
+    };
+
+    let mut boxes = Vec::with_capacity(indices.len());
+
+    for &index in &indices {
+        if !same_size(index, doc) {
+            continue;
+        }
+        let lines = doc.text_lines(Location::Exact(index))
+                       .map(|(lines, _)| lines).unwrap_or_default();
+        let images = doc.images(Location::Exact(index))
+                        .map(|(images, _)| images).unwrap_or_default();
+        if let Some(bnd) = layout::content_box(&lines, &images) {
+            boxes.push(bnd);
+        }
+    }
+
+    // No text layer worth the name: a scan. Every method in `layout` is
+    // stext-based and degrades to nothing here, so fall back to the ink bbox,
+    // which MuPDF computes from the display list and which works on an image.
+    if boxes.len() < layout::MIN_USABLE_PAGES {
+        boxes.clear();
+        for &index in &indices {
+            if !same_size(index, doc) {
+                continue;
+            }
+            if let Some((bnd, _)) = doc.ink_box(Location::Exact(index)) {
+                if bnd.width() > 0.0 && bnd.height() > 0.0 {
+                    boxes.push(bnd);
+                }
+            }
+        }
+        if boxes.len() < layout::MIN_USABLE_PAGES {
+            return None;
+        }
+    }
+
+    let content = layout::aggregate_box(&boxes)?;
+    layout::crop_margin(&content, dims, layout::CROP_PADDING_PT)
 }
 
 fn build_pixmap(rect: &Rectangle, doc: &mut dyn Document, location: usize) -> (Pixmap, usize) {
@@ -357,6 +422,29 @@ impl Reader {
 
             let synthetic = doc.has_synthetic_page_numbers();
             let reflowable = doc.is_reflowable();
+
+            // Automatic cropping. Paginated documents only, and only when
+            // nothing is stored: a crop dragged out by hand in the margin
+            // cropper persists through the very same field, so this can never
+            // overwrite one. Turning `auto-crop` off later leaves the crops it
+            // already detected in place, which is the same contract the manual
+            // cropper has always had.
+            if !reflowable && settings.reader.auto_crop &&
+               info.reader.as_ref().is_some_and(|r| r.cropping_margins.is_none()) {
+                if let Some(margin) = auto_crop_margins(doc.as_mut(), settings.reader.crop_sample_pages) {
+                    if let Some(r) = info.reader.as_mut() {
+                        r.cropping_margins = Some(CroppingMargins::Any(margin));
+                    }
+                    // A stored `page_offset` was measured against the uncropped
+                    // frame and means something else under a crop. `Reader` has
+                    // no cache to remap it through yet -- that is what
+                    // `crop_margins` does for a crop applied to a *running*
+                    // reader -- so the honest thing is to start at the top of
+                    // the page rather than at a position computed from a frame
+                    // that no longer exists.
+                    view_port.page_offset = pt!(0, 0);
+                }
+            }
 
             println!("{}", info.file.path.display());
 

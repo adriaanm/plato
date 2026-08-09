@@ -31,6 +31,7 @@ use self::pdf::PdfOpener;
 use self::epub::EpubDocument;
 use self::html::HtmlDocument;
 use crate::geom::{Boundary, CycleDir};
+use self::layout::TextLine;
 use crate::metadata::{TextAlign, Annotation};
 use crate::framebuffer::Pixmap;
 use crate::settings::INTERNAL_CARD_ROOT;
@@ -104,6 +105,27 @@ pub trait Document: Send+Sync {
     fn lines(&mut self, loc: Location) -> Option<(Vec<BoundedText>, usize)>;
     fn links(&mut self, loc: Location) -> Option<(Vec<BoundedText>, usize)>;
     fn images(&mut self, loc: Location) -> Option<(Vec<Boundary>, usize)>;
+
+    /// Text lines with their writing direction, for `document::layout`.
+    ///
+    /// The default drops the direction, which is exactly what a backend that
+    /// does not know it should say; `layout::TextLine` then falls back to the
+    /// aspect ratio. Only the MuPDF backend overrides it.
+    fn text_lines(&mut self, loc: Location) -> Option<(Vec<TextLine>, usize)> {
+        self.lines(loc).map(|(lines, index)| {
+            (lines.into_iter().map(|l| TextLine::new(l.rect)).collect(), index)
+        })
+    }
+
+    /// The bounding box of everything a page draws, in page points, ignoring
+    /// the text layer entirely.
+    ///
+    /// This is the scanned-PDF path: a page with no stext has no lines to
+    /// measure, and its ink bbox is the only thing left. `None` means the
+    /// backend cannot answer, which is the default.
+    fn ink_box(&mut self, _loc: Location) -> Option<(Boundary, usize)> {
+        None
+    }
 
     fn pixmap(&mut self, loc: Location, scale: f32, samples: usize) -> Option<(Pixmap, usize)>;
     fn layout(&mut self, width: u32, height: u32, font_size: f32, dpi: u16);

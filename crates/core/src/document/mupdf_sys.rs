@@ -129,8 +129,8 @@ impl Default for FzRect {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct FzPoint {
-    x: libc::c_float,
-    y: libc::c_float,
+    pub x: libc::c_float,
+    pub y: libc::c_float,
 }
 
 #[repr(C)]
@@ -284,9 +284,14 @@ pub union FzTextBlockTextImage {
 
 #[repr(C)]
 pub struct FzTextLine {
-    wmode: u8,
+    /// 0 for horizontal writing, 1 for vertical.
+    pub wmode: u8,
     flags: u8,
-    dir: FzPoint,
+    /// The unit vector along the baseline: `(1, 0)` for ordinary left-to-right
+    /// text, `(0, ±1)` for a line rotated a quarter turn. Public so
+    /// `document::layout` can tell a rotated line from an upright one exactly,
+    /// rather than guessing from the aspect ratio.
+    pub dir: FzPoint,
     pub bbox: FzRect,
     pub first_char: *mut FzTextChar,
     last_char: *mut FzTextChar,

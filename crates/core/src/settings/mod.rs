@@ -379,6 +379,13 @@ pub struct ReaderSettings {
     pub max_margin_width: i32,
     pub line_height: f32,
     pub continuous_fit_to_width: bool,
+    /// Detect a paginated document's content box on first open and store it as
+    /// its cropping margins. Never overrides a crop that already exists,
+    /// whether it was detected or dragged out by hand.
+    pub auto_crop: bool,
+    /// How many body pages `auto_crop` samples. Each one costs an fz_stext
+    /// extraction at open, which is the setting's only real cost.
+    pub crop_sample_pages: usize,
     pub ignore_document_css: bool,
     pub dithered_kinds: FxHashSet<String>,
     pub paragraph_breaker: ParagraphBreakerSettings,
@@ -494,6 +501,8 @@ impl Default for ReaderSettings {
             max_margin_width: DEFAULT_MARGIN_WIDTH.saturating_add(2),
             line_height: DEFAULT_LINE_HEIGHT,
             continuous_fit_to_width: true,
+            auto_crop: true,
+            crop_sample_pages: 16,
             ignore_document_css: false,
             dithered_kinds: ["cbz", "png", "jpg", "jpeg"].iter().map(|k| k.to_string()).collect(),
             paragraph_breaker: ParagraphBreakerSettings::default(),
