@@ -23,6 +23,14 @@
 //! aggregate absorbs all of that; a union absorbs none of it and is also
 //! defeated by a single outlier page.
 //!
+//! The third step, and the one the panel notices, is **columns**: over that
+//! same crop box, an x-coverage histogram of each page's line boxes shows a
+//! two-column paper's gutter as a run of near-empty bins in the middle. That
+//! is [`page_gutter`], and the rule that makes it work is [`column_vote`] —
+//! detect **per page**, then vote across the document. Summing the pages into
+//! one histogram first is the obvious implementation and it is wrong; see
+//! [`page_gutter`].
+//!
 //! The second half of the module is the arithmetic of a *screenful* in
 //! continuous mode: where the next one starts, how tall the previous one is,
 //! and which cached page to drop. Same discipline — integers and slices in,
@@ -350,6 +358,274 @@ pub fn eviction_candidate(keys: &[usize], first: usize, last: usize) -> Option<u
     } else {
         keys.last().copied()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Columns
+// ---------------------------------------------------------------------------
+
+/// Bins in the per-page x-coverage histogram, across the aggregate crop box.
+///
+/// 400 over a ~430 pt text block is a bin per point, which is finer than any
+/// gutter and coarse enough that one stray rule does not fill one.
+pub const COLUMN_BINS: usize = 400;
+
+/// A bin is *empty* when it carries less than this fraction of the page's
+/// median bin coverage. Not zero: a footnote rule, a superscript or a stray
+/// in-line formula crosses the gutter on a page that is plainly two-column.
+pub const GUTTER_COVERAGE_RATIO: f32 = 0.20;
+
+/// A gutter's centre has to fall in the middle this much of the crop box.
+///
+/// This is what keeps the *outer* margins of a wide-margin layout — a journal
+/// style with notes in the outer column, a page whose text block is narrower
+/// than the aggregate box — from reading as a gutter.
+pub const GUTTER_CENTRE_SPAN: f32 = 0.30;
+
+/// A gutter is at least this wide, in page points…
+pub const GUTTER_MIN_WIDTH_PT: f32 = 6.0;
+/// …and at least this fraction of the crop box's width.
+pub const GUTTER_MIN_WIDTH_FRACTION: f32 = 0.01;
+
+/// A document is read in columns when at least this fraction of its sampled
+/// pages show a gutter.
+///
+/// Measured on ten papers: the two-column ones scored 40–92%, the
+/// single-column ones 0%, and nothing landed in between. A simple majority
+/// would have misclassified the two papers that are dense with full-width code
+/// listings and figures — they are genuinely two-column and score 43% and 40%.
+pub const COLUMN_VOTE_THRESHOLD: f32 = 0.25;
+
+/// How far a page's own gutter may sit from the document's before that page is
+/// read as something other than the document's two-column layout.
+pub const GUTTER_PAGE_TOLERANCE_FRACTION: f32 = 0.05;
+
+/// The x of the gutter running down this page, in page points, or `None` if it
+/// has none.
+///
+/// The method, from the measurement in ezkindle `docs/plato-pdf.md` §4.3: bin
+/// the x extent of the crop box, add one count to every bin each line's box
+/// covers, and look for a contiguous run of near-empty bins near the middle.
+///
+/// **Per page, and never over a summed histogram.** Summing the pages of a
+/// document first is the obvious implementation and it is wrong: full-width
+/// elements — the title block, the abstract, a wide figure, a code listing —
+/// deposit ink in the gutter, and enough of them fill it in completely. The
+/// spike tried it that way first and classified every paper single-column.
+/// [`column_vote`] is the other half of the rule: detect per page, then vote.
+///
+/// The lines are expected to be pre-filtered to the horizontal ones; a rotated
+/// arXiv stamp sits outside the crop box anyway, so it contributes nothing
+/// either way.
+pub fn page_gutter(lines: &[Boundary], bx: &Boundary) -> Option<f32> {
+    let width = bx.width();
+    if !(width > 0.0) || lines.is_empty() {
+        return None;
+    }
+
+    let mut hist = [0u32; COLUMN_BINS];
+    let bins = COLUMN_BINS as f32;
+
+    for rect in lines.iter().filter(|r| is_sane(r)) {
+        if rect.max.x <= bx.min.x || rect.min.x >= bx.max.x ||
+           rect.max.y <= bx.min.y || rect.min.y >= bx.max.y {
+            continue;
+        }
+        let from = rect.min.x.max(bx.min.x);
+        let to = rect.max.x.min(bx.max.x);
+        let first = (((from - bx.min.x) / width) * bins).floor() as isize;
+        let last = ((((to - bx.min.x) / width) * bins).ceil() as isize - 1).max(first);
+        for i in first.max(0) ..= last.min(COLUMN_BINS as isize - 1) {
+            hist[i as usize] += 1;
+        }
+    }
+
+    let median = {
+        let mut sorted = hist;
+        sorted.sort_unstable();
+        sorted[COLUMN_BINS / 2]
+    };
+
+    if median == 0 {
+        return None;
+    }
+
+    let threshold = GUTTER_COVERAGE_RATIO * median as f32;
+    let min_width = GUTTER_MIN_WIDTH_PT.max(GUTTER_MIN_WIDTH_FRACTION * width);
+    let (low, high) = (0.5 - GUTTER_CENTRE_SPAN / 2.0, 0.5 + GUTTER_CENTRE_SPAN / 2.0);
+
+    let mut best: Option<(f32, f32)> = None;
+    let mut i = 0;
+
+    while i < COLUMN_BINS {
+        if (hist[i] as f32) < threshold {
+            let start = i;
+            while i < COLUMN_BINS && (hist[i] as f32) < threshold {
+                i += 1;
+            }
+            let run = (i - start) as f32 / bins * width;
+            let centre = (start + i) as f32 / 2.0 / bins;
+            if run >= min_width && (low..=high).contains(&centre) &&
+               best.map_or(true, |(w, _)| run > w) {
+                best = Some((run, bx.min.x + centre * width));
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    best.map(|(_, x)| x)
+}
+
+/// The document-level verdict, over one [`page_gutter`] result per sampled page.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ColumnVote {
+    pub voted: usize,
+    pub sampled: usize,
+    /// The median gutter x over the pages that voted, in page points.
+    pub gutter: Option<f32>,
+}
+
+impl ColumnVote {
+    pub fn fraction(&self) -> f32 {
+        if self.sampled == 0 {
+            0.0
+        } else {
+            self.voted as f32 / self.sampled as f32
+        }
+    }
+
+    pub fn is_two_column(&self, threshold: f32) -> bool {
+        self.gutter.is_some() && self.fraction() >= threshold
+    }
+}
+
+/// Count the votes and take the median gutter x of the pages that cast one.
+///
+/// The median rather than the mean because the outlier is the thing being
+/// guarded against: measured within one document the gutter is stable to
+/// 0.0–4.4 pt, and 4.4 pt is ~10 px on the panel. One page whose only gutter
+/// is between a figure and its caption must not move it.
+pub fn column_vote(page_gutters: &[Option<f32>]) -> ColumnVote {
+    let mut voted: Vec<f32> = page_gutters.iter().filter_map(|g| *g).collect();
+    voted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let gutter = if voted.is_empty() {
+        None
+    } else if voted.len() % 2 == 1 {
+        Some(voted[voted.len() / 2])
+    } else {
+        Some((voted[voted.len() / 2 - 1] + voted[voted.len() / 2]) / 2.0)
+    };
+
+    ColumnVote { voted: voted.len(), sampled: page_gutters.len(), gutter }
+}
+
+/// Whether a page whose own gutter is `page` belongs to a document whose
+/// gutter is `document`.
+///
+/// A page with no gutter of its own is a title page, a full-width figure or a
+/// wide table, and it is read full width — that is the per-page opt-out, and
+/// on the sample it covers the 0–21% of content that is not in columns. A page
+/// whose gutter is somewhere else entirely is not this layout either.
+pub fn page_follows_document(page: Option<f32>, document: f32, page_width: f32) -> bool {
+    match page {
+        Some(x) => (x - document).abs() <= GUTTER_PAGE_TOLERANCE_FRACTION * page_width,
+        None => false,
+    }
+}
+
+/// The crop box in page points that `margin` describes — the inverse of
+/// [`crop_margin`], and what the histogram is run over.
+pub fn crop_box(margin: &Margin, dims: (f32, f32)) -> Boundary {
+    let (width, height) = dims;
+    Boundary::new(Vec2::new(margin.left * width, margin.top * height),
+                  Vec2::new((1.0 - margin.right) * width, (1.0 - margin.bottom) * height))
+}
+
+/// The margins of one column, given the document's crop and the split as a
+/// fraction of the page width.
+///
+/// A split that does not fall strictly inside the crop is not a split, and the
+/// answer is the whole crop — the page renders as it did before columns
+/// existed, which is always a correct outcome.
+pub fn column_margin(crop: &Margin, split: f32, column: u8) -> Margin {
+    if !(crop.left < split && split < 1.0 - crop.right) {
+        return crop.clone();
+    }
+    if column == 0 {
+        Margin::new(crop.top, 1.0 - split, crop.bottom, crop.left)
+    } else {
+        Margin::new(crop.top, crop.right, crop.bottom, split)
+    }
+}
+
+/// A margin whose *width* is that of the page's widest column.
+///
+/// The two columns of a paper are never exactly equal, and one pixmap is
+/// rasterised per page at one scale — so the scale has to be the one that fits
+/// the wider column, or the wider column overflows the panel. Only the width
+/// of the result is meaningful; it is fed to `scaling_factor` and nothing else.
+pub fn widest_column_margin(crop: &Margin, split: f32) -> Margin {
+    if !(crop.left < split && split < 1.0 - crop.right) {
+        return crop.clone();
+    }
+    let widest = (split - crop.left).max((1.0 - crop.right) - split);
+    Margin::new(crop.top, 1.0 - crop.left - widest, crop.bottom, crop.left)
+}
+
+/// Narrow a horizontal span to one column of it, in pixels.
+///
+/// Clamped so that neither column can come out empty: a split that has landed
+/// on or outside an edge yields the whole span, which renders the page as one
+/// column rather than as nothing.
+pub fn column_bounds(min_x: i32, max_x: i32, split_x: i32, column: u8) -> (i32, i32) {
+    if split_x <= min_x || split_x >= max_x {
+        return (min_x, max_x);
+    }
+    if column == 0 {
+        (min_x, split_x)
+    } else {
+        (split_x, max_x)
+    }
+}
+
+/// One step of the reading order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// Stay on this page, in this column.
+    Column(u8),
+    /// Hand over to the neighbouring page.
+    Page,
+}
+
+/// Down column 1 of page *p*, then column 2 of page *p*, then page *p+1*.
+///
+/// `columns` is the number of columns *this* page is read in, which is 1 for a
+/// page that opted out of the document's layout — so the order flows through a
+/// full-width title page or plate without a special case.
+pub fn step_forward(column: u8, columns: u8) -> Step {
+    if column + 1 < columns.max(1) {
+        Step::Column(column + 1)
+    } else {
+        Step::Page
+    }
+}
+
+/// The exact inverse of [`step_forward`]. Landing on the previous page means
+/// landing in its *last* column, which is why the caller has to resolve that
+/// page before it can name the column.
+pub fn step_backward(column: u8) -> Step {
+    if column > 0 {
+        Step::Column(column - 1)
+    } else {
+        Step::Page
+    }
+}
+
+/// The last column of a page read in `columns` columns.
+pub fn last_column(columns: u8) -> u8 {
+    columns.max(1) - 1
 }
 
 fn is_sane(rect: &Boundary) -> bool {
@@ -748,6 +1024,245 @@ mod tests {
         assert_eq!(eviction_candidate(&[5, 6, 7, 8], 5, 8), Some(5));
     }
 
+    /// A page of `n` rows in two columns, with a gutter from 290 to 310.
+    fn two_column_page(n: usize) -> Vec<Boundary> {
+        let mut rows = Vec::new();
+        for i in 0..n {
+            let y = 100.0 + i as f32 * 14.0;
+            rows.push(bndr![54.0, y, 290.0, y + 10.0]);
+            rows.push(bndr![310.0, y + 0.4, 543.0, y + 10.4]);
+        }
+        rows
+    }
+
+    /// The same page set in one measure.
+    fn one_column_page(n: usize) -> Vec<Boundary> {
+        (0..n).map(|i| {
+            let y = 100.0 + i as f32 * 14.0;
+            bndr![54.0, y, 543.0, y + 10.0]
+        }).collect()
+    }
+
+    fn crop() -> Boundary {
+        bndr![54.0, 47.0, 543.0, 717.0]
+    }
+
+    #[test]
+    fn a_two_column_page_has_a_gutter_and_a_one_column_page_has_none() {
+        let x = page_gutter(&two_column_page(40), &crop()).expect("no gutter found");
+        assert!((x - 300.0).abs() < 2.0, "gutter at {}", x);
+        assert!(page_gutter(&one_column_page(40), &crop()).is_none());
+        assert!(page_gutter(&[], &crop()).is_none());
+    }
+
+    /// A few full-width lines — a section heading that spans the measure, an
+    /// in-line equation — must not close the gutter. This is what the 20%
+    /// coverage ratio buys.
+    #[test]
+    fn a_handful_of_full_width_lines_does_not_close_the_gutter() {
+        let mut lines = two_column_page(40);
+        for i in 0..4 {
+            let y = 90.0 + i as f32 * 3.0;
+            lines.push(bndr![54.0, y, 543.0, y + 2.0]);
+        }
+        assert!(page_gutter(&lines, &crop()).is_some());
+    }
+
+    /// …and a page that is *mostly* full width has no gutter at all. That is
+    /// the per-page opt-out: a title page, a wide table, a plate.
+    #[test]
+    fn a_mostly_full_width_page_opts_out() {
+        let mut lines = two_column_page(4);
+        lines.extend(one_column_page(30));
+        assert!(page_gutter(&lines, &crop()).is_none());
+    }
+
+    /// A layout with a wide outer margin — the text block sits left of centre
+    /// inside a crop box widened by a marginal note — leaves a big empty run,
+    /// but not in the middle, and it is not a gutter.
+    #[test]
+    fn an_empty_outer_margin_is_not_a_gutter() {
+        let wide = bndr![54.0, 47.0, 543.0, 717.0];
+        let lines: Vec<Boundary> = (0..40).map(|i| {
+            let y = 100.0 + i as f32 * 14.0;
+            bndr![54.0, y, 380.0, y + 10.0]
+        }).collect();
+        assert!(page_gutter(&lines, &wide).is_none());
+    }
+
+    #[test]
+    fn a_hairline_gap_is_not_a_gutter() {
+        let mut rows = Vec::new();
+        for i in 0..40 {
+            let y = 100.0 + i as f32 * 14.0;
+            rows.push(bndr![54.0, y, 297.0, y + 10.0]);
+            rows.push(bndr![300.0, y, 543.0, y + 10.0]);
+        }
+        assert!(page_gutter(&rows, &crop()).is_none(), "3 pt of leading read as a gutter");
+    }
+
+    #[test]
+    fn lines_outside_the_crop_box_are_ignored() {
+        let mut lines = two_column_page(40);
+        // A running head above the box and a folio below it, both full width.
+        for y in [20.0f32, 760.0] {
+            for i in 0..30 {
+                lines.push(bndr![54.0, y + i as f32, 543.0, y + i as f32 + 0.5]);
+            }
+        }
+        assert!(page_gutter(&lines, &crop()).is_some());
+    }
+
+    #[test]
+    fn the_vote_is_a_fraction_and_a_median() {
+        let vote = column_vote(&[Some(299.0), None, Some(301.0), Some(300.0), None]);
+        assert_eq!(vote.voted, 3);
+        assert_eq!(vote.sampled, 5);
+        assert_eq!(vote.gutter, Some(300.0));
+        assert!((vote.fraction() - 0.6).abs() < 1e-6);
+        assert!(vote.is_two_column(COLUMN_VOTE_THRESHOLD));
+
+        // 43% and 40% are real two-column papers dense with figures; a simple
+        // majority would have refused both.
+        let sparse = column_vote(&[Some(299.0), None, None, None]);
+        assert!(sparse.is_two_column(COLUMN_VOTE_THRESHOLD));
+        assert!(!sparse.is_two_column(0.5));
+
+        let none = column_vote(&[None, None, None, None]);
+        assert_eq!(none.gutter, None);
+        assert!(!none.is_two_column(COLUMN_VOTE_THRESHOLD));
+        assert_eq!(column_vote(&[]).fraction(), 0.0);
+        assert!(!column_vote(&[]).is_two_column(0.0));
+    }
+
+    #[test]
+    fn a_page_follows_the_document_only_if_its_gutter_agrees() {
+        assert!(page_follows_document(Some(299.0), 300.0, 612.0));
+        assert!(page_follows_document(Some(286.0), 300.0, 612.0));
+        assert!(!page_follows_document(Some(200.0), 300.0, 612.0));
+        assert!(!page_follows_document(None, 300.0, 612.0));
+    }
+
+    #[test]
+    fn a_column_margin_keeps_the_outer_edge_and_moves_the_inner_one() {
+        let crop = Margin::new(0.06, 0.11, 0.09, 0.09);
+        let left = column_margin(&crop, 0.49, 0);
+        assert!((left.left - 0.09).abs() < 1e-6);
+        assert!((left.right - 0.51).abs() < 1e-6);
+        let right = column_margin(&crop, 0.49, 1);
+        assert!((right.left - 0.49).abs() < 1e-6);
+        assert!((right.right - 0.11).abs() < 1e-6);
+        // The two columns tile the crop exactly.
+        assert!(((1.0 - left.left - left.right) + (1.0 - right.left - right.right)
+                 - (1.0 - crop.left - crop.right)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_split_outside_the_crop_is_not_a_split() {
+        let crop = Margin::new(0.06, 0.11, 0.09, 0.09);
+        for split in [0.0, 0.09, 0.89, 1.0] {
+            assert_eq!(column_margin(&crop, split, 0).left, crop.left);
+            assert_eq!(column_margin(&crop, split, 1).right, crop.right);
+            assert_eq!(widest_column_margin(&crop, split).right, crop.right);
+        }
+    }
+
+    /// One pixmap per page, so one scale per page: it has to fit the wider of
+    /// the two columns or that column runs off the panel.
+    #[test]
+    fn the_scale_margin_is_the_widest_column() {
+        let crop = Margin::new(0.06, 0.11, 0.09, 0.09);
+        let m = widest_column_margin(&crop, 0.45);
+        // Columns are 0.36 and 0.44 of the page; the wider one wins.
+        assert!((1.0 - m.left - m.right - 0.44).abs() < 1e-6, "{:?}", m);
+    }
+
+    #[test]
+    fn a_crop_box_round_trips_through_its_margin() {
+        let dims = (612.0, 792.0);
+        let bx = bndr![54.0, 47.0, 543.0, 717.0];
+        let m = crop_margin(&bx, dims, 0.0).unwrap();
+        let back = crop_box(&m, dims);
+        assert!((back.min.x - bx.min.x).abs() < 0.01);
+        assert!((back.max.y - bx.max.y).abs() < 0.01);
+    }
+
+    #[test]
+    fn column_bounds_never_produce_an_empty_column() {
+        assert_eq!(column_bounds(100, 900, 500, 0), (100, 500));
+        assert_eq!(column_bounds(100, 900, 500, 1), (500, 900));
+        assert_eq!(column_bounds(100, 900, 100, 0), (100, 900));
+        assert_eq!(column_bounds(100, 900, 900, 1), (100, 900));
+        assert_eq!(column_bounds(100, 900, 20, 1), (100, 900));
+    }
+
+    /// `columns[page]` — a table with a full-width title page, two spreads of
+    /// two-column body, a full-width plate, and a two-column last page.
+    fn walk_forward(unit: (usize, u8), columns: &[u8]) -> Option<(usize, u8)> {
+        match step_forward(unit.1, columns[unit.0]) {
+            Step::Column(c) => Some((unit.0, c)),
+            Step::Page => (unit.0 + 1 < columns.len()).then(|| (unit.0 + 1, 0)),
+        }
+    }
+
+    fn walk_backward(unit: (usize, u8), columns: &[u8]) -> Option<(usize, u8)> {
+        match step_backward(unit.1) {
+            Step::Column(c) => Some((unit.0, c)),
+            Step::Page => (unit.0 > 0).then(|| (unit.0 - 1, last_column(columns[unit.0 - 1]))),
+        }
+    }
+
+    #[test]
+    fn the_reading_order_is_column_then_page() {
+        let columns = [1u8, 2, 2, 1, 2];
+        let mut unit = (0, 0);
+        let mut seen = vec![unit];
+        while let Some(next) = walk_forward(unit, &columns) {
+            seen.push(next);
+            unit = next;
+        }
+        assert_eq!(seen, vec![(0, 0),
+                              (1, 0), (1, 1),
+                              (2, 0), (2, 1),
+                              (3, 0),
+                              (4, 0), (4, 1)]);
+    }
+
+    /// Backward is the exact inverse, everywhere, including across an opt-out
+    /// page and at both ends of the document.
+    #[test]
+    fn backward_is_the_inverse_of_forward() {
+        for columns in [vec![1u8], vec![2], vec![1, 2, 2, 1, 2], vec![2, 1, 1, 2], vec![2; 6]] {
+            let mut unit = (0usize, 0u8);
+            assert!(walk_backward(unit, &columns).is_none(), "walked off the front");
+            loop {
+                match walk_forward(unit, &columns) {
+                    Some(next) => {
+                        assert_eq!(walk_backward(next, &columns), Some(unit),
+                                   "{:?}: {:?} -> {:?} did not come back", columns, unit, next);
+                        unit = next;
+                    },
+                    None => break,
+                }
+            }
+            assert_eq!(unit, (columns.len() - 1, last_column(*columns.last().unwrap())),
+                       "the walk did not end on the last column of the last page");
+        }
+    }
+
+    #[test]
+    fn a_page_with_no_columns_still_steps() {
+        assert_eq!(step_forward(0, 0), Step::Page);
+        assert_eq!(step_forward(0, 1), Step::Page);
+        assert_eq!(step_forward(0, 2), Step::Column(1));
+        assert_eq!(step_forward(1, 2), Step::Page);
+        assert_eq!(step_backward(0), Step::Page);
+        assert_eq!(step_backward(1), Step::Column(0));
+        assert_eq!(last_column(0), 0);
+        assert_eq!(last_column(1), 0);
+        assert_eq!(last_column(2), 1);
+    }
+
     /// Fixture-backed tests over three real papers.
     ///
     /// `test-data/line-boxes.json` holds the fz_stext line and image boxes
@@ -863,6 +1378,96 @@ mod tests {
                 assert!(filtered.min.x > 50.0,
                         "{}: the stamp survived the filter at {}", doc.name, filtered.min.x);
             }
+        }
+
+        /// The crop the Phase-A pipeline arrives at for one document, which is
+        /// what the column histogram is run over.
+        fn aggregate_of(doc: &Doc, sample: usize) -> (Vec<&Page>, Boundary) {
+            let wanted = sample_indices(doc.pages_count, sample);
+            let pages: Vec<&Page> = doc.pages.iter()
+                                       .filter(|p| wanted.contains(&p.index))
+                                       .collect();
+            let boxes: Vec<Boundary> = pages.iter()
+                .filter_map(|p| content_box(&p.text_lines(), &p.image_boxes()))
+                .collect();
+            (pages, aggregate_box(&boxes).unwrap())
+        }
+
+        /// The horizontal line boxes of one page, which is what the histogram
+        /// consumes. Rotated lines are dropped for the same reason as in
+        /// `content_box`, though the arXiv stamp is outside the crop box
+        /// anyway and could not vote.
+        fn line_rects(page: &Page) -> Vec<Boundary> {
+            page.text_lines().iter()
+                .filter(|l| l.is_horizontal())
+                .map(|l| l.rect)
+                .collect()
+        }
+
+        /// §4.3's table, as a regression test. The percentages differ a little
+        /// from the ones in `docs/plato-pdf.md` because the spike sampled up
+        /// to 30 pages and this samples 16 — the verdicts do not, and the
+        /// separation is still total: 0% against 92% and 62%.
+        #[test]
+        fn the_column_vote_reproduces_the_measurement() {
+            let fixture = load();
+            // name, voting fraction, gutter x.
+            let expected: [(&str, f32, Option<f32>); 3] = [
+                ("gepa", 0.00, None),
+                ("demo search predict", 0.92, Some(299.2)),
+                ("wikipedia assist", 0.62, Some(298.8)),
+            ];
+
+            for doc in &fixture.documents {
+                let (name, fraction, gutter) = *expected.iter()
+                    .find(|(n, _, _)| *n == doc.name)
+                    .unwrap_or_else(|| panic!("no expectation for {}", doc.name));
+
+                let (pages, agg) = aggregate_of(doc, fixture.sample);
+                let gutters: Vec<Option<f32>> = pages.iter()
+                    .map(|p| page_gutter(&line_rects(p), &agg))
+                    .collect();
+                let vote = column_vote(&gutters);
+
+                assert!((vote.fraction() - fraction).abs() < 0.02,
+                        "{}: voted {}/{} = {:.2}, expected {:.2}",
+                        name, vote.voted, vote.sampled, vote.fraction(), fraction);
+
+                match (vote.gutter, gutter) {
+                    (Some(got), Some(want)) => assert!((got - want).abs() < 0.5,
+                                                       "{}: gutter {} expected {}", name, got, want),
+                    (got, want) => assert_eq!(got.is_some(), want.is_some(), "{}", name),
+                }
+
+                assert_eq!(vote.is_two_column(COLUMN_VOTE_THRESHOLD), gutter.is_some(),
+                           "{}: verdict", name);
+            }
+        }
+
+        /// **The one non-obvious thing in the whole design**, pinned so it
+        /// cannot be "simplified" back: summing the sampled pages into one
+        /// histogram and looking for a gutter in that does not work.
+        ///
+        /// `wikipedia assist` is the demonstration. Ten of its sixteen sampled
+        /// pages have an unmistakable gutter; its full-width figures and
+        /// tables deposit enough ink in that gutter that the summed histogram
+        /// sees nothing at all, and the paper reads as single column.
+        #[test]
+        fn the_summed_histogram_misses_a_two_column_paper() {
+            let fixture = load();
+            let doc = fixture.documents.iter()
+                             .find(|d| d.name == "wikipedia assist").unwrap();
+            let (pages, agg) = aggregate_of(doc, fixture.sample);
+
+            let summed: Vec<Boundary> = pages.iter().flat_map(|p| line_rects(p)).collect();
+            assert!(page_gutter(&summed, &agg).is_none(),
+                    "the summed histogram found a gutter; the test no longer proves anything");
+
+            let gutters: Vec<Option<f32>> = pages.iter()
+                .map(|p| page_gutter(&line_rects(p), &agg))
+                .collect();
+            assert!(column_vote(&gutters).is_two_column(COLUMN_VOTE_THRESHOLD),
+                    "per-page then vote should still find it");
         }
 
         /// Every sampled body page of a real paper has enough text to measure.
