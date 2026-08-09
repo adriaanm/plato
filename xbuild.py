@@ -676,7 +676,8 @@ def run_cargo(profile: Profile, args) -> None:
         cmd = [cargo, "zigbuild", *packages,
                "--target", profile.cargo_target, "--release"]
     else:
-        cmd = ["cargo", "run" if args.run else "build", *packages]
+        verb = "run" if args.run else "test" if args.test else "build"
+        cmd = ["cargo", verb, *packages]
     if profile.cargo_features:
         cmd += ["--features", ",".join(profile.cargo_features)]
     cmd += args.cargo
@@ -813,6 +814,10 @@ def main() -> None:
     p.add_argument("profile", choices=sorted(PROFILES))
     p.add_argument("--run", action="store_true",
                    help="cargo run instead of cargo build (host only)")
+    p.add_argument("--test", action="store_true",
+                   help="cargo test instead of cargo build (host only). The "
+                        "unit tests need the same link paths as a build, so "
+                        "they have to go through this driver, not bare cargo.")
     p.add_argument("--package", metavar="NAME", action="append",
                    help="cargo package to build instead of the profile's "
                         "defaults (host: emulator; kindle: plato and "
