@@ -896,3 +896,74 @@ python3 xbuild.py kindle                               both binaries, ABI gate p
 **Open, and only the device can close it:** whether two rows is the right
 number, and whether repeating the same rows across a REAGL turn ghosts visibly.
 Nothing was deployed in this phase.
+
+## Uninstalled apps, and spawns that are not fatal
+
+`PLATO-HIDE-UNINSTALLED-APPS`. **Upstreamable, and arguably a bug fix rather
+than a feature**: it is additive, it changes nothing when the helpers are
+present, and the crash it fixes is reachable on any device whose payload lacks
+`ivy`.
+
+Observed live on the PW3: opening the built-in calculator with `ivy` absent
+from the payload **killed Plato** — "No such file or directory", os error 2,
+process gone.
+
+### Where the fatal escalation actually was
+
+One character, in `crates/plato/src/app.rs`:
+
+```rust
+AppCmd::Calculator => Box::new(Calculator::new(..)?),
+```
+
+`Event::Select(EntryId::Launch(..))` built its next view in a `match`, and that
+`?` propagated out of the event loop, out of `run`, out of `main`. Every other
+arm of that match is infallible, so the single fallible one was also the only
+one that could end the session. The emulator carried an identical copy.
+
+It now matches on the error and raises a `Notification`. Note the two
+`Can't execute command` lines that preceded the exit in the field report come
+from `document/mod.rs`'s `sys_info_as_html` (`scripts/ip.sh`,
+`/bin/ntx_hwconfig`) — already non-fatal, and unrelated to the crash.
+
+### The fix proper: probe before offering
+
+- **`helpers::is_installed`** — a regular file, present, with an execute bit.
+  Deliberately not a `PATH` search: every helper here is spawned by relative
+  path from Plato's working directory, so `PATH` would answer a question nobody
+  asked.
+- **`AppCmd::helper()` / `is_available()`** — maps an app to the program it
+  cannot run without. Only the calculator has one (`bin/ivy/ivy`, from
+  `calculator::helper_path`, the same path `Calculator::new` spawns);
+  everything else on the menu is built into the binary and is always available.
+- **`common::application_entries(predicate)`** — builds the Applications
+  submenu filtered on that. The predicate is a parameter, so the filtering is
+  tested with no filesystem. Filtering leaves separators behind, so
+  `tidy_separators` drops the ones that no longer separate anything, and an
+  Applications submenu with nothing left in it is not offered at all.
+
+### The other two spawn sites
+
+- **The share flow** (`app.rs`). Offered on plug-in, honoured by
+  `scripts/usb-enable.sh`, whose failure was swallowed by `.status().ok()` —
+  so answering "yes" with the script missing left the device on the share
+  intermission with nothing exported and no way out but unplugging the cable.
+  The dialog is now offered only when the script is installed, `context.shared`
+  is set only when the command actually ran, and a failure notifies.
+- **Library hooks** (`view/home/mod.rs`). Already declined to die, but reported
+  only to stderr, which nothing on this device can read. It notifies now, and
+  names the program.
+
+The remaining `Command::new` sites — `wifi-{enable,disable}.sh`,
+`suspend.sh`, `resume.sh`, `ip.sh`, `essid.sh`, `ntx_hwconfig` — are all
+`.status().ok()` or already `map_err`-logged, none is reachable from a menu
+entry, and none can take the process down. Left alone.
+
+### Results
+
+```
+python3 xbuild.py host --test --package plato-core     107 passed, 0 failed
+  (99 after Phase B; +5 menu filtering, +3 the helper probe)
+python3 xbuild.py kindle                               both binaries, ABI gate passed
+  plato          50 788 KiB    e_flags=0x5000200
+```
