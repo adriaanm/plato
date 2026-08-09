@@ -2,6 +2,7 @@
 pub mod djvu;
 pub mod pdf;
 pub mod epub;
+pub mod layout;
 pub mod html;
 
 #[cfg(feature = "djvu")]
