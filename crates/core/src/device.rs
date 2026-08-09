@@ -114,10 +114,13 @@ impl Device {
         if plato_device == KINDLE_PW3_DEVICE {
             return Device {
                 model: Model::KindlePaperwhite3,
-                // cyttsp4_mt_b: protocol B is in the driver's own name, and
-                // KOReader drives the PW3 as plain protocol B on
-                // /dev/input/event1 with no coordinate transform.
-                proto: TouchProto::MultiB,
+                // cyttsp4_mt on /dev/input/event1, protocol B tracked by slot.
+                // Confirmed on the device: the ABS bitmap is
+                // SLOT + POSITION_X + POSITION_Y + TRACKING_ID and nothing
+                // else, so none of the pressure-keyed modes can see a finger
+                // here. Coordinates are identity-mapped screen pixels, which
+                // is what the startup_rotation() choice below preserves.
+                proto: TouchProto::MultiSlot,
                 dims: (1072, 1448),
                 dpi: 300,
             };
@@ -506,8 +509,34 @@ mod tests {
         assert_eq!(d.model, Model::KindlePaperwhite3);
         assert_eq!(d.dims, (1072, 1448));
         assert_eq!(d.dpi, 300);
-        assert_eq!(d.proto, TouchProto::MultiB);
+        assert_eq!(d.proto, TouchProto::MultiSlot);
         assert!(d.is_kindle());
+    }
+
+    /// `TouchProto::MultiSlot` is new, and the one way it could hurt a Kobo is
+    /// by being wired to one. Pin every product's protocol.
+    #[test]
+    fn test_no_kobo_touch_protocol_changed() {
+        let expected = [
+            ("kraken", TouchProto::Single), ("pixie", TouchProto::Single),
+            ("dragon", TouchProto::Single), ("phoenix", TouchProto::MultiA),
+            ("dahlia", TouchProto::MultiA), ("alyssum", TouchProto::MultiA),
+            ("pika", TouchProto::MultiA), ("daylight", TouchProto::MultiA),
+            ("star", TouchProto::MultiA), ("snow", TouchProto::MultiB),
+            ("nova", TouchProto::MultiB), ("frost", TouchProto::MultiB),
+            ("storm", TouchProto::MultiB), ("luna", TouchProto::MultiA),
+            ("europa", TouchProto::MultiC), ("cadmus", TouchProto::MultiC),
+            ("io", TouchProto::MultiC), ("goldfinch", TouchProto::MultiB),
+            ("spaBW", TouchProto::MultiB), ("spaBWTPV", TouchProto::MultiB),
+            ("spaColour", TouchProto::MultiB),
+            ("monza", TouchProto::MultiB), ("condor", TouchProto::MultiC),
+            ("", TouchProto::Single),
+        ];
+        for (product, proto) in expected {
+            let d = Device::detect("", product, "");
+            assert_eq!(d.proto, proto, "PRODUCT={product:?}");
+            assert!(!d.is_kindle());
+        }
     }
 
     #[test]
