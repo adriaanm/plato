@@ -632,3 +632,58 @@ Every one of these is read-only, and each turns a *Likely* in this phase into a
    This is the safest possible first contact with the EPDC.
 9. **`/sys/devices/platform/falconblk`** — hibernation, per the phase-3 plan.
    Not needed by this phase; recorded so the one ssh session covers it.
+
+## Phase 5 — the powerd integration
+
+Design and evidence live in the `ezkindle` repo (`docs/plato-port.md`, section
+"powerd integration"). The device-side shell — `suspend.sh`, `resume.sh` and a
+`plato.sh` launcher speaking lipc to `com.lab126.powerd` — lives there too,
+under `device/plato/scripts/`, **not** in this fork: upstream's `scripts/*.sh`
+are Kobo's and stay untouched so a rebase never fights, and the Kindle hooks
+are deployment payload rather than app source.
+
+That leaves exactly two diffs here.
+
+### `crates/plato/src/app.rs` — the Kindle carries no `Rtc`
+
+```rust
+let rtc = if CURRENT_DEVICE.is_kindle() { None } else { Rtc::new(RTC_DEVICE)… };
+```
+
+`/dev/rtc0` exists on the PW3, and `rtc.rs` would happily drive it — which is
+the problem. powerd owns the wake alarm: it is set through the `rtcWakeup` lipc
+property (and only while powerd is in `readyToSuspend`), and powerd programs
+the chip through
+`/sys/devices/platform/imx-i2c.0/i2c-0/0-003c/max77696-rtc.0/rtc_delta_alarm`
+— confirmed from `/etc/kdb/system/daemon/powerd/SYS_RTC_WAKEUP` — not through
+the RTC ioctls `rtc.rs` uses. Two writers to one alarm register is a silent
+fight with the device's own suspend policy.
+
+With `rtc == None` every `auto_power_off` branch in `Event::Suspend` becomes a
+no-op (`context.rtc.iter()` yields nothing; the `and_then` short-circuits), so
+this removes a footgun rather than a feature — `auto-power-off` is 0.0 in the
+device's `Settings.toml`, and wiring it properly means teaching `suspend.sh` to
+set `rtcWakeup` during the `readyToSuspend` window. Not upstreamable as-is
+(upstream has no Kindle), but it is one `if` behind the existing `is_kindle()`
+predicate, so it rebases trivially.
+
+### `xbuild.py --test`
+
+`cargo test` needs the same `-L native=…` link paths as a build — bare
+`cargo test -p plato-core` fails at `ld: library 'mupdf' not found`. The driver
+already computes those paths per profile, so the test verb belongs to it.
+One-line change in `run_cargo` plus the flag. Host only; the cross profile
+still only knows how to `zigbuild`.
+
+### State
+
+`python3 xbuild.py host --test --package plato-core` → **62 passed, 0 failed**
+(unchanged from phase 3 — this phase adds no testable Rust). `python3
+xbuild.py kindle` builds `plato` (50 775 KiB) and `plato-harness`, both past
+the `e_flags=0x5000200` soft-float ABI gate.
+
+The binary is functionally unchanged for this phase's purpose: the powerd work
+is entirely in shell that upstream's `Command::new("scripts/suspend.sh")`
+already calls. What was missing at first light was not code but the payload —
+the scripts did not exist, and Plato was started with a cwd that would not have
+found them anyway.
