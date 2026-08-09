@@ -1,6 +1,7 @@
 mod linuxfb_sys;
 mod ion_sys;
 mod mxcfb_sys;
+mod kindle_mxcfb_sys;
 mod sunxi_sys;
 mod image;
 mod transform;
