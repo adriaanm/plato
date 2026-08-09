@@ -6,6 +6,7 @@ use std::time::SystemTime;
 use std::num::ParseIntError;
 use std::fs::{self, File, Metadata};
 use std::io::{self, BufReader, BufWriter};
+use std::process::ExitStatus;
 use std::path::{Path, PathBuf, Component};
 use fxhash::FxHashMap;
 use std::ops::{Deref, DerefMut};
@@ -125,6 +126,40 @@ pub fn is_runnable(meta: &Metadata) -> bool {
     #[cfg(not(unix))]
     {
         meta.is_file()
+    }
+}
+
+/// What `scripts/suspend.sh` actually did.
+///
+/// Upstream's contract with that script is Kobo's: it blocks in
+/// `echo mem > /sys/power/state`, which does not return until the device wakes,
+/// so "the script returned" and "we slept" are the same event and the exit
+/// status carries no information. That is not true everywhere. Where a
+/// *daemon* owns suspend, the script can be told no — and then the caller must
+/// not pretend a sleep happened, because the wake event it is waiting for will
+/// never arrive.
+///
+/// [`SuspendOutcome::NotRun`] is the same class of failure seen from the other
+/// side: the helper is missing or not executable, which on a device with no
+/// shell is indistinguishable from a refusal and must be handled the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspendOutcome {
+    /// The script ran, returned 0, and by contract that means we slept.
+    Slept,
+    /// The script ran and declined: a nonzero exit means "still awake".
+    Refused,
+    /// The script could not be run at all.
+    NotRun,
+}
+
+/// Classify the result of spawning the suspend helper. Pure, so the decision
+/// can be tested without a device — see the `Event::Suspend` arm in
+/// `crates/plato/src/app.rs`, which is where the loop would otherwise be.
+pub fn suspend_outcome(status: &io::Result<ExitStatus>) -> SuspendOutcome {
+    match status {
+        Ok(st) if st.success() => SuspendOutcome::Slept,
+        Ok(_) => SuspendOutcome::Refused,
+        Err(_) => SuspendOutcome::NotRun,
     }
 }
 
@@ -311,5 +346,32 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(is_installed(&path));
         fs::remove_file(&path).ok();
+    }
+
+    /// The three answers the suspend helper can give. The middle one is the
+    /// whole point: on a device where a daemon owns suspend, "I declined" has
+    /// to be distinguishable from "we slept and woke", or the caller schedules
+    /// a retry for a wake that is never coming.
+    #[cfg(unix)]
+    #[test]
+    fn a_zero_exit_means_we_slept_and_anything_else_does_not() {
+        use std::os::unix::process::ExitStatusExt;
+        // from_raw takes a wait(2) status: the exit code is the high byte.
+        let ok: io::Result<ExitStatus> = Ok(ExitStatus::from_raw(0));
+        let one: io::Result<ExitStatus> = Ok(ExitStatus::from_raw(1 << 8));
+        let big: io::Result<ExitStatus> = Ok(ExitStatus::from_raw(127 << 8));
+        // Killed by SIGKILL: no exit code at all, still not a sleep.
+        let killed: io::Result<ExitStatus> = Ok(ExitStatus::from_raw(9));
+        assert_eq!(suspend_outcome(&ok), SuspendOutcome::Slept);
+        assert_eq!(suspend_outcome(&one), SuspendOutcome::Refused);
+        assert_eq!(suspend_outcome(&big), SuspendOutcome::Refused);
+        assert_eq!(suspend_outcome(&killed), SuspendOutcome::Refused);
+    }
+
+    #[test]
+    fn a_helper_that_will_not_spawn_is_not_a_sleep_either() {
+        let missing: io::Result<ExitStatus> =
+            Err(io::Error::from(io::ErrorKind::NotFound));
+        assert_eq!(suspend_outcome(&missing), SuspendOutcome::NotRun);
     }
 }
