@@ -386,6 +386,14 @@ pub struct ReaderSettings {
     /// How many body pages `auto_crop` samples. Each one costs an fz_stext
     /// extraction at open, which is the setting's only real cost.
     pub crop_sample_pages: usize,
+    /// How many text rows a screenful repeats from the one before it, in
+    /// continuous mode. Zero restores the old behaviour of advancing by
+    /// exactly one screen.
+    ///
+    /// Rows, not pixels: the overlap is resolved against the page's own text
+    /// line boxes, so it is the same two lines at any zoom, and it lands on a
+    /// line boundary rather than through one.
+    pub scroll_overlap_lines: usize,
     pub ignore_document_css: bool,
     pub dithered_kinds: FxHashSet<String>,
     pub paragraph_breaker: ParagraphBreakerSettings,
@@ -503,6 +511,7 @@ impl Default for ReaderSettings {
             continuous_fit_to_width: true,
             auto_crop: true,
             crop_sample_pages: 16,
+            scroll_overlap_lines: 2,
             ignore_document_css: false,
             dithered_kinds: ["cbz", "png", "jpg", "jpeg"].iter().map(|k| k.to_string()).collect(),
             paragraph_breaker: ParagraphBreakerSettings::default(),

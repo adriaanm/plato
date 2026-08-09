@@ -61,6 +61,10 @@ use crate::color::{BLACK, WHITE};
 use crate::context::Context;
 
 const HISTORY_SIZE: usize = 32;
+/// How many rendered pages are kept. Three is enough for a screenful that
+/// straddles a page boundary plus the two prefetched neighbours; a screenful
+/// spanning more pages than this rasterises one of them again on every turn.
+const CACHE_SIZE: usize = 3;
 const RECT_DIST_JITTER: f32 = 24.0;
 const ANNOTATION_DRIFT: u8 =  0x44;
 const HIGHLIGHT_DRIFT: u8 =  0x22;
@@ -293,6 +297,36 @@ fn find_cut(frame: &Rectangle, y_pos: i32, scale: f32, dir: LinearDir, lines: &[
     })
 }
 
+/// How tall `count` text rows are, in scaled pixels, measured from `y_pos`
+/// away in `dir`.
+///
+/// This is the pixel value of "exactly two lines". It is deliberately built on
+/// the same view of the page `find_cut` takes — the same frame containment and
+/// the same "no line is taller than a tenth of the frame" filter — because the
+/// number is only useful if it lands on a boundary `find_cut` would also have
+/// chosen. A page that answers nothing (a plate, a scan) gives 0, which is an
+/// overlap of nothing and a page turn exactly as it was before.
+fn overlap_height(frame: &Rectangle, y_pos: i32, scale: f32, dir: LinearDir, lines: &[BoundedText], count: usize) -> i32 {
+    if count == 0 || scale <= 0.0 {
+        return 0;
+    }
+
+    let y_u = y_pos as f32 / scale;
+    let frame_u = frame.to_boundary() / scale;
+    let max_line_height = frame_u.height() / 10.0;
+
+    let rows: Vec<Boundary> = lines.iter()
+                                   .filter(|l| frame_u.contains(&l.rect) &&
+                                               l.rect.height() <= max_line_height)
+                                   .map(|l| l.rect)
+                                   .collect();
+
+    match layout::row_top(&rows, y_u, count, dir, layout::ROW_TOLERANCE_PT) {
+        Some(top) => ((top - y_u).abs() * scale).round() as i32,
+        None => 0,
+    }
+}
+
 fn word_separator(lang: &str) -> &'static str {
     let l = lang.to_ascii_lowercase();
     match l.as_str() {
@@ -422,6 +456,25 @@ impl Reader {
 
             let synthetic = doc.has_synthetic_page_numbers();
             let reflowable = doc.is_reflowable();
+
+            // A paginated document opens in continuous scroll unless it has
+            // been read before and left in something else. A PDF of a paper is
+            // taller than the screen at any readable zoom, so fit-to-page is
+            // the wrong default for it in a way it is not for a comic: the
+            // choice is between scrolling and unreadable type.
+            //
+            // "Left in something else" is any stored view state at all, which
+            // is why `quit` now writes `zoom_mode` for paginated documents even
+            // when it is the default -- otherwise a deliberate fit-to-page
+            // would be indistinguishable from a document opened for the first
+            // time, and would be overridden here on every open.
+            let stored_view = info.reader.as_ref()
+                                  .is_some_and(|r| r.zoom_mode.is_some() || r.scroll_mode.is_some());
+
+            if !reflowable && !stored_view && settings.reader.continuous_fit_to_width {
+                view_port.zoom_mode = ZoomMode::FitToWidth;
+                view_port.scroll_mode = ScrollMode::Screen;
+            }
 
             // Automatic cropping. Paginated documents only, and only when
             // nothing is stored: a crop dragged out by hand in the margin
@@ -832,6 +885,26 @@ impl Reader {
                                 let first_chunk = self.chunks.first().cloned().unwrap();
                                 let mut location = first_chunk.location;
                                 let available_height = self.rect.height() as i32 - 2 * self.view_port.margin_width;
+
+                                // The mirror image of the overlap on a Next
+                                // turn, and the exact inverse of it: the
+                                // previous screenful must *end* a couple of
+                                // rows into this one, so it is not an offset
+                                // to subtract but a shorter screen to fill.
+                                // The rows are the first ones on screen now,
+                                // hence Forward from the current top.
+                                self.load_pixmap(location);
+                                self.load_text(location);
+                                let overlap = {
+                                    let Resource { frame, scale, .. } = self.cache[&location];
+                                    let mut doc = self.doc.lock().unwrap();
+                                    let lines = doc.lines(Location::Exact(location))
+                                                   .map(|(lines, _)| lines).unwrap_or_default();
+                                    overlap_height(&frame, first_chunk.frame.min.y, scale, LinearDir::Forward,
+                                                   &lines, context.settings.reader.scroll_overlap_lines)
+                                };
+                                let span = layout::previous_span(available_height,
+                                               layout::clamp_overlap(overlap, available_height));
                                 let mut height = 0;
 
                                 loop {
@@ -842,7 +915,7 @@ impl Reader {
                                         frame.max.y = first_chunk.frame.min.y;
                                     }
                                     height += frame.height() as i32;
-                                    if height >= available_height {
+                                    if height >= span {
                                         break;
                                     }
                                     let mut doc = self.doc.lock().unwrap();
@@ -853,8 +926,8 @@ impl Reader {
                                     }
                                 }
 
-                                let mut next_top_offset = (height - available_height).max(0);
-                                if height > available_height {
+                                let mut next_top_offset = (height - span).max(0);
+                                if height > span {
                                     let Resource { frame, scale, .. } = self.cache[&location];
                                     let mut doc = self.doc.lock().unwrap();
                                     if let Some((lines, _)) = doc.lines(Location::Exact(location)) {
@@ -900,14 +973,35 @@ impl Reader {
                                 let &RenderChunk { location, frame, .. } = self.chunks.last().unwrap();
                                 self.load_pixmap(location);
                                 self.load_text(location);
-                                let pixmap_frame = self.cache[&location].frame;
-                                let next_top_offset = frame.max.y - pixmap_frame.min.y;
-                                if next_top_offset == pixmap_frame.height() as i32 {
-                                    self.view_port.page_offset.y = 0;
-                                    Location::Next(location)
-                                } else {
-                                    self.view_port.page_offset.y = next_top_offset;
-                                    Location::Exact(location)
+                                let Resource { frame: pixmap_frame, scale, .. } = self.cache[&location];
+                                let available_height = self.rect.height() as i32 - 2 * self.view_port.margin_width;
+
+                                // Start the next screenful a couple of text
+                                // rows *above* the cut, so the reader's eye
+                                // has an anchor it recognises. The rows come
+                                // out of the page that was cut, which is the
+                                // last one on screen.
+                                let overlap = {
+                                    let mut doc = self.doc.lock().unwrap();
+                                    let lines = doc.lines(Location::Exact(location))
+                                                   .map(|(lines, _)| lines).unwrap_or_default();
+                                    overlap_height(&pixmap_frame, frame.max.y, scale, LinearDir::Backward,
+                                                   &lines, context.settings.reader.scroll_overlap_lines)
+                                };
+                                let overlap = layout::clamp_overlap(overlap, available_height);
+
+                                let cut = frame.max.y - pixmap_frame.min.y;
+                                let current = if location == current_page { page_offset.y } else { 0 };
+
+                                match layout::next_screen(cut, pixmap_frame.height() as i32, overlap, current) {
+                                    layout::NextScreen::NextPage => {
+                                        self.view_port.page_offset.y = 0;
+                                        Location::Next(location)
+                                    },
+                                    layout::NextScreen::Same(next_top_offset) => {
+                                        self.view_port.page_offset.y = next_top_offset;
+                                        Location::Exact(location)
+                                    },
                                 }
                             },
                             ScrollMode::Page => {
@@ -1221,15 +1315,12 @@ impl Reader {
         let first_location = self.chunks.first().map(|c| c.location).unwrap();
         let last_location = self.chunks.last().map(|c| c.location).unwrap();
 
-        while self.cache.len() > 3 {
-            let left_count = self.cache.range(..first_location).count();
-            let right_count = self.cache.range(last_location+1..).count();
-            let extremum = if left_count >= right_count {
-                self.cache.keys().next().cloned().unwrap()
-            } else {
-                self.cache.keys().next_back().cloned().unwrap()
-            };
-            self.cache.remove(&extremum);
+        while self.cache.len() > CACHE_SIZE {
+            let keys: Vec<usize> = self.cache.keys().cloned().collect();
+            match layout::eviction_candidate(&keys, first_location, last_location) {
+                Some(extremum) => { self.cache.remove(&extremum); },
+                None => break,
+            }
         }
 
         self.update_annotations();
@@ -2721,7 +2812,17 @@ impl Reader {
             r.finished = self.finished;
             r.dithered = context.fb.dithered();
 
-            if self.view_port.zoom_mode == ZoomMode::FitToPage {
+            // A paginated document stores its view state whatever it is, a
+            // reflowable one only when it differs from the default. The
+            // asymmetry buys one thing: for a paginated document, "nothing
+            // stored" means "never opened", which is what `Reader::new` needs
+            // in order to default it to continuous scroll without overriding a
+            // deliberate fit-to-page on every subsequent open. For a reflowable
+            // document there is no such default to protect, and writing less
+            // keeps the .reading-states files as they were.
+            let store_view = !self.reflowable;
+
+            if self.view_port.zoom_mode == ZoomMode::FitToPage && !store_view {
                 r.zoom_mode = None;
                 r.page_offset = None;
             } else {
@@ -2729,7 +2830,7 @@ impl Reader {
                 r.page_offset = Some(self.view_port.page_offset);
             }
 
-            if self.view_port.zoom_mode == ZoomMode::FitToWidth {
+            if self.view_port.zoom_mode == ZoomMode::FitToWidth || store_view {
                 r.scroll_mode = Some(self.view_port.scroll_mode);
             } else {
                 r.scroll_mode = None;
