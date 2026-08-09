@@ -224,3 +224,255 @@ silently disagree.
   why `xbuild.py` builds MuPDF **1.27.0** from source rather than using
   Homebrew's. `fz_new_context_imp` checks that string at runtime.
 - The Kobo device model ladder, the framebuffer, input — all phase 2.
+
+## Phase 2: the Kindle backend
+
+`docs/plato-port.md`'s phase 2, written **blind** — the device was not in hand.
+Correctness comes from the reference material plus compile-time assertions and
+unit tests; nothing here has been observed on hardware yet, and
+`PLATO-DEVICE-PROBES` (phase 3) is the ticket that upgrades it.
+
+The shape of the diff is the one the port map predicted: **four new files that
+upstream has no counterpart for**, plus small, listed branches in four existing
+ones. `kobo1.rs` and `kobo2.rs` are not touched at all.
+
+### New files
+
+| File | Why |
+|---|---|
+| `crates/core/src/framebuffer/kindle_mxcfb_sys.rs` | The lab126 mxcfb dialect: `struct mxcfb_update_data` (72 bytes, with the `hist_*_waveform_mode` pair between `update_marker` and `temp`, and an alt buffer with no `virt_addr`), the ioctl numbers, the waveform constants and the EPDC flags. |
+| `crates/core/src/framebuffer/kindle.rs` | `KindleFramebuffer` and `refresh_policy`. |
+| `crates/core/src/battery/kindle.rs` | `KindleBattery`. |
+| `crates/core/src/frontlight/kindle.rs` | `KindleFrontlight`. |
+
+### The header vs. the delta table
+
+Both were read in full and cross-checked. **They agree on everything the port
+depends on** — struct layout, the three ioctl numbers, `TEMP_USE_AUTO`, and the
+whole REAGL renumbering. Two things the header says that the table does not, both
+recorded rather than acted on:
+
+- **`EPDC_FLAG_USE_DITHERING_Y4` is `0x8000` on lab126**, which is
+  `EPDC_FLAG_USE_REGAL` in Plato's NTX header, and `0x4000` is `_Y2` here where
+  it is `_Y4` there. Harmless for us — we set no dithering flag at all — but it
+  is exactly the kind of collision that makes sharing one constants module
+  between the two dialects a bad idea, and it is why they are separate files.
+- **`TEMP_USE_PAPYRUS` is also `0x1001`**, i.e. `TEMP_USE_AUTO` on the PW2+ *is*
+  the Touch/PW1 constant under a new name. KOReader sets it unconditionally on
+  the `refresh_k51` path for that reason, and so do we.
+
+The table's "PW3 wait ioctl is identical to Plato's `wait_for_update_v2`" is
+confirmed by the header: `_IOWR('F', 0x2F, struct mxcfb_update_marker_data)`,
+and that struct is byte-identical to Plato's `MxcfbUpdateMarkerData`.
+
+### The compile-time safety net
+
+`kindle_mxcfb_sys.rs` asserts, in `const` context, that the struct is 72 bytes,
+that every field is at the offset the header puts it at (so "72 bytes" cannot be
+satisfied by the *wrong* 72 bytes — the Rex variant appends the `hist_*` pair
+instead of inserting it, and is also 72), and that the three ioctl numbers come
+out as `0x4048462e`, `0xc008462f` and `0x40044637` — the values KOReader quotes.
+These fire on the host build and on the armv7 build alike.
+
+The `_IOC` encoding is **written out here rather than taken from `nix`**. `nix`'s
+`ioctl_*!` macros encode BSD-style on macOS, so asserting on their output would
+be asserting something different on the host than on the device — i.e. checking
+nothing where it matters. `KindleFramebuffer` therefore calls `libc::ioctl` with
+these constants directly, instead of going through `nix` as `kobo1.rs` does.
+That divergence is deliberate and is the whole point of the exercise.
+
+### The refresh policy
+
+`refresh_policy(mode, monochrome, inverted) -> RefreshPolicy` is a pure function,
+so the part that was written blind is the part that is unit-tested (seven tests).
+It is KOReader's `refresh_k51` + `mxc_update`, restricted to what the PW3
+branch of `framebuffer:init()` configures:
+
+| `UpdateMode` | waveform | update mode | fences |
+|---|---|---|---|
+| `Gui`      | `GC16_FAST` | `PARTIAL` | submission before |
+| `Partial`  | `REAGL`     | **`FULL`**, promoted | complete before, complete after |
+| `Full`     | `GC16`      | `FULL`    | submission + complete before, complete after |
+| `Fast`     | `DU`        | `PARTIAL` | — |
+| `FastMono` | `DU`        | `PARTIAL` | — (+ `FORCE_MONOCHROME`) |
+
+plus `hist_bw = DU`, `hist_gray = GC16_FAST`, except all-REAGL on a REAGL send
+and `hist_gray = GC16` on a GC16 send; `temp = TEMP_USE_AUTO`;
+`collision_test = 0`; never `EPDC_FLAG_TEST_COLLISION`; no hardware dithering;
+and updates with `w <= 1 || h <= 1` discarded before the ioctl.
+
+Three deliberate divergences from KOReader, all in the same direction — keep
+Plato's semantics where KOReader's would be a behaviour change:
+
+- **`FORCE_MONOCHROME` is not set on every DU update.** `refresh_k51` sets it
+  whenever `waveform_mode == DU`; Plato distinguishes `Fast` from `FastMono`, and
+  collapsing them would silently crush antialiasing on every fast update. So the
+  flag follows Plato's `FastMono` (and sticky `set_monochrome`), not the waveform.
+- **The "full-screen flashing UI" clause of the complete-before fence is not
+  reproduced.** It is unreachable here: Plato's only flashing intent is `Full`,
+  which is GC16, and the GC16 clause already covers it.
+- **Inversion is `EPDC_FLAG_ENABLE_INVERSION` only**, as on a Kobo of mark < 11.
+  KOReader instead swaps in `GL16_INV` / `GC16` as night waveforms. That is a
+  quality refinement on identical pixels; guessing at it blind buys nothing, and
+  the constant is in the sys module ready for phase 4 to try.
+
+### Rotation: refused, not faked
+
+`KindleFramebuffer::set_rotation` never writes `FBIOPUT_VSCREENINFO`, and returns
+`Err` for any rotation but the panel's own. KOReader treats every Kindle
+framebuffer as fixed-orientation, and Amazon's own reader does not write the
+rotate field either.
+
+`Err` rather than "`Ok` with unchanged dims" is the load-bearing choice, and it
+is correct because of how the callers are written: all six `set_rotation` sites
+in `app.rs` (plus the one in `view/rotation_values`) are guarded by
+`if let Ok(dims) = …` or `.ok()`, so an `Err` leaves `context.display` untouched
+— dims, rotation, and therefore the input-side axis transform stay consistent
+with the panel. Returning `Ok` would let a caller record a rotation the hardware
+does not have, and the touch mapping would silently follow it.
+
+Real software rotation is a self-contained later addition; nothing here blocks it.
+
+### The `mark()` / capability audit
+
+`Model::KindlePaperwhite3` answers **`mark() == 6`**. Every site that consults
+`mark()` or a capability predicate was read, and the choice checked against it:
+
+| Site | Consults | Reached on the PW3? | Why the value is right |
+|---|---|---|---|
+| `plato/src/app.rs:212` | `mark() != 8` | **No** — the `is_kindle()` branch is placed *before* it | This is the one that would matter: mark 6 selects `KoboFramebuffer1`, i.e. a 68-byte struct through ioctl `0x4044462e`. The Kindle branch comes first. |
+| `framebuffer/kobo1.rs` (×8) | `mark()`, `model`, `color_samples()` | No — `KoboFramebuffer1` is never constructed | Untouched by this phase, as required. |
+| `framebuffer/kobo2.rs:64` | `startup_rotation()` | No — `KoboFramebuffer2` is never constructed | — |
+| `frontlight/premixed.rs:49` | `mark() != 8` | No — `PremixedFrontlight` is never constructed | `frontlight_kind()` is `Standard`, *and* `app.rs` branches to `KindleFrontlight` before consulting it at all. |
+| `frontlight/natural.rs:40` | `model` | No — `NaturalFrontlight` is never constructed | Same. |
+| `input.rs:402` | `proto == Single && mark() == 3` | Yes, but short-circuits | The PW3 is `MultiB`. Any `mark()` other than 3 is safe; 6 is. |
+| `input.rs:503` | `transformed_gyroscope_rotation()` | No | `has_gyroscope()` is false. |
+| `input.rs:370-372` | `should_swap_axes()`, `should_mirror_axes()` | **Yes** | See below — this is the one that actually constrains the ladder. |
+| `document/mod.rs:485` | `mark()` | Yes | Cosmetic: the system-info page prints "Mark 6". |
+| `document/mod.rs:480`, `app.rs:327` | `model` | Yes | Prints "Kindle Paperwhite 3". |
+| `document/mod.rs:516` | `INTERNAL_CARD_ROOT` | Yes | Now `/mnt/us/books`; `statvfs` reports the userstore. |
+| `context.rs:56`, `app.rs:218` | `transformed_rotation()` | Yes | Default arm, identity. |
+| `app.rs:113`, `view/frontlight.rs:250,300`, `view/reader/mod.rs:2801` | `has_lightsensor()` | Yes | False → the existing null `LightSensor`, no auto-brightness UI. Correct: no ALS on a PW3. |
+| `view/frontlight.rs:51,92,213,342,369` | `has_natural_light()` | Yes | False → intensity slider only, no warmth. Correct: one white channel. |
+| `view/common.rs:115` | `has_page_turn_buttons()` | Yes | False. Correct. |
+| `view/common.rs:124`, `app.rs:220,988` | `has_gyroscope()` | Yes | False. `app.rs:220` and `:988` then compare rotations that are already equal, so no `set_rotation` call is even attempted at startup or exit. |
+| `battery/kobo.rs:40` | `has_power_cover()` | No — `KoboBattery` is never constructed | — |
+| `view/{intermission,home/shelf,home/book,reader,dictionary}`, `document/pdf.rs` | `color_samples()` | Yes | 1 → grayscale pixmaps. Correct for this panel. |
+| `view/{calculator,home,reader}` | `mirroring_scheme()` (only `dir`) | Yes | Default `(2, 1)`. Used to turn a corner tap into a rotation request, which `set_rotation` refuses. |
+| `has_removable_storage()` | — | — | No consumer anywhere in `crates/`; false regardless. |
+
+**The one that constrains the ladder is `input.rs:370-372`.** Plato swaps
+`ABS_MT_POSITION_X`/`_Y` whenever `should_swap_axes(rotation)`, because every
+Kobo's touch panel is landscape-native while its display is portrait. The PW3's
+is portrait-native — KOReader applies *no* coordinate transform. So the Kindle
+takes `startup_rotation() == 0` with the **default** swapping (1) and mirroring
+((2, 1)) schemes, which makes `should_swap_axes(0)` false and
+`should_mirror_axes(0)` `(false, false)`: the identity.
+
+The price is that `orientation(0)` reads as `Landscape`. That is a real
+mismatch with a 1072×1448 portrait panel, and it is accepted because it is
+**unobservable here**: all three consumers of `orientation()` either require a
+gyroscope this model does not have (`app.rs:549`) or merely guard a
+`set_rotation()` call that `KindleFramebuffer` refuses (`app.rs:744`, `:851`).
+Touch correctness is the thing that would actually break, so it wins. Recorded
+rather than hidden, because a future software-rotation implementation has to
+revisit exactly this.
+
+### Modified files
+
+- **`crates/core/src/device.rs`** — `Model::KindlePaperwhite3`, an
+  `is_kindle()` predicate, and arms in `mark()` and `startup_rotation()`.
+  Detection is `Device::new` → `Device::detect`, which checks
+  **`PLATO_DEVICE=kindle-pw3` before the `PRODUCT` match**. An env var rather
+  than a sniff: a Kobo exports `PRODUCT` from its own init and a Kindle exports
+  nothing, so any heuristic would be a guess that, if it ever misfired on a
+  Kobo, would send Kobo hardware a 72-byte update struct. Split into
+  `new`/`detect` so precedence is unit-testable without touching the process
+  environment.
+
+- **`crates/core/src/framebuffer/mod.rs`** — two `mod` lines and one `pub use`.
+
+- **`crates/core/src/{battery,frontlight}/mod.rs`** — one `mod` and one
+  `pub use` each.
+
+- **`crates/core/src/settings/mod.rs`** — `DEFAULT_FONT_PATH`,
+  `INTERNAL_CARD_ROOT` and `EXTERNAL_CARD_ROOT` become `lazy_static`
+  `&'static str` instead of `const &str`, chosen per device.
+  **The Kobo values are byte-identical**; the Kindle gets `/mnt/us/fonts`,
+  `/mnt/us/books` and `/mnt/us`. `&'static str` rather than a function is the
+  smallest mechanism that leaves every use site alone apart from a `*` deref
+  (three sites, one of them in `document/mod.rs`), and nothing downstream learns
+  that these are now computed. The two `/mnt/onboard/.kobo/{dropbox,kepub}`
+  library defaults are deliberately left hardcoded — they are Kobo-specific
+  services, not storage roots, and rewriting them would be a behaviour change
+  rather than a path change.
+
+- **`crates/plato/src/app.rs`** — three `is_kindle()` branches (framebuffer,
+  battery, frontlight), each placed *before* the Kobo selection it would
+  otherwise fall into, plus imports. `LightSensor` is untouched: the existing
+  `has_lightsensor()` guard already yields the null impl.
+
+  Input: `/dev/input/event1` is the PW3's `cyttsp4_mt_b` node and the existing
+  `TOUCH_INPUTS` fallback list already ends in it — Kobo's `by-path` entries do
+  not exist on a Kindle, so the loop falls through. No change needed, only a
+  comment. `POWER_INPUTS` carries a marked `TODO(PLATO-DEVICE-PROBES)`: all
+  three entries are Kobo PMIC nodes, KOReader's Kindle frontend names no power
+  input path either (it takes the button through `powerd` over lipc), so there
+  is nothing to copy and nothing is invented. Missing it costs nothing at first
+  light — the button still suspends via Amazon's `powerd`, Plato just does not
+  see the event.
+
+- **`xbuild.py`** — `Profile.cargo_package` becomes `cargo_packages`, and the
+  kindle profile now builds **`plato` (the real device binary) *and*
+  `plato-harness`**, both through the ABI gate. `--package` is repeatable. The
+  SDL emulator stays host-only and is untouched.
+
+### Results
+
+```
+cargo test -p plato-core                        46 passed, 0 failed
+python3 xbuild.py kindle                        both binaries, ABI gate passed
+  target/armv7-unknown-linux-musleabi/release/plato          50 757 KiB
+  target/armv7-unknown-linux-musleabi/release/plato-harness  48 037 KiB
+  e_flags=0x5000200 (soft-float) on both
+```
+
+The size is MuPDF's embedded fonts, as in phase 1, and is the same ~43 MB that
+was already noted as trimmable.
+
+### What phase 3 must confirm before first light
+
+Every one of these is read-only, and each turns a *Likely* in this phase into a
+*Confirmed* (or into a two-line fix):
+
+1. **`FBIOGET_VSCREENINFO` / `FBIOGET_FSCREENINFO`** — `bits_per_pixel` (8
+   expected), `xres`/`yres` (1072×1448), and `line_length` (1088 expected, i.e.
+   *not* `xres`). The code already trusts `line_length` and picks its accessors
+   from `bits_per_pixel`, so this confirms rather than configures — except that
+   a `bits_per_pixel` that is not a multiple of 8 is a hard error today.
+2. **`var_info.rotate`** as read at startup. `KindleFramebuffer` is constructed
+   with `startup_rotation()` (0) and refuses anything else; if the panel reports
+   something other than 0, the constant in `device.rs` is what changes.
+3. **Touch: `evtest`/`getevent` on `/dev/input/event1`.** The open question from
+   `docs/plato-port.md`: does `cyttsp4_mt_b` interleave slots without re-sending
+   `ABS_MT_TRACKING_ID` each packet? Plato's protocol-B handling keys on the
+   tracking ID alone and ignores `ABS_MT_SLOT`. If slots are interleaved, `input.rs`
+   needs slot state — the only change in this whole port that is not yet written.
+4. **Touch orientation.** Confirm X runs along 1072 and Y along 1448, with no
+   mirroring, i.e. that the identity transform chosen above is right.
+5. **`/dev/input/event1` is actually the touch node**, and what the other
+   `/dev/input/event*` nodes are (`/proc/bus/input/devices`) — specifically
+   which one, if any, carries the power button.
+6. **`ls /sys/class/power_supply/`** — the node name, and whether it has both
+   `capacity` and `status`. `KindleBattery` globs and sorts, so it survives any
+   single node; what it cannot survive is the wario tree
+   (`/sys/devices/system/wario_battery/…/battery_capacity`) being the only
+   source, which is the documented fallback in that file.
+7. **`cat /sys/class/backlight/max77696-bl/max_brightness`** — and that the node
+   exists at all under that name. The scaling reads it at init and falls back to
+   24 with a warning.
+8. **`MXCFB_GET_WAVEFORM_TYPE` / `MXCFB_GET_TEMPERATURE`** — cheap, read-only,
+   and they prove the ioctl numbering is right *before* anything writes a frame.
+   This is the safest possible first contact with the EPDC.
+9. **`/sys/devices/platform/falconblk`** — hibernation, per the phase-3 plan.
+   Not needed by this phase; recorded so the one ssh session covers it.
