@@ -1,7 +1,7 @@
-//! Headless EPUB → PNG renderer: the ezkindle fork's smoke test.
+//! Headless document → PNG renderer: the ezkindle fork's smoke test.
 //!
 //! ```text
-//! plato-harness <book.epub> <out.png> [page] [font-size-pt]
+//! plato-harness <book.epub|paper.pdf> <out.png> [page] [font-size-pt]
 //! ```
 //!
 //! Everything is fixed at the Paperwhite 3's real panel geometry (1072x1448
@@ -18,8 +18,7 @@ use std::path::Path;
 use std::process;
 
 use anyhow::{Context, Error, format_err};
-use plato_core::document::{Document, Location};
-use plato_core::document::epub::EpubDocument;
+use plato_core::document::{Location, open};
 use plato_core::framebuffer::Framebuffer;
 
 /// The PW3 panel, from ezkindle `docs/plato-port.md`.
@@ -40,7 +39,7 @@ fn run() -> Result<(), Error> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         return Err(format_err!(
-            "usage: {} <book.epub> <out.png> [page] [font-size-pt]",
+            "usage: {} <book.epub|paper.pdf> <out.png> [page] [font-size-pt]",
             args.first().map(String::as_str).unwrap_or("plato-harness")));
     }
     let input = &args[1];
@@ -56,14 +55,20 @@ fn run() -> Result<(), Error> {
                    will not match.");
     }
 
-    let mut doc = EpubDocument::new(input)
-        .with_context(|| format!("can't open {}", input))?;
+    // `document::open` sniffs the file kind and dispatches: EPUB and HTML to
+    // their own backends, everything else -- PDF included -- to MuPDF via
+    // `PdfOpener`. Every call below is on the `Document` trait, so nothing
+    // else in the harness has to know which one it got.
+    let mut doc = open(input)
+        .ok_or_else(|| format_err!("can't open {}", input))?;
     doc.layout(WIDTH, HEIGHT, font_size, DPI);
 
     // `Location::Exact` takes a byte *offset* for a reflowable document, not
     // a page index -- Exact(0), Exact(3) and Exact(40) all land on the first
     // page, which makes for a very convincing smoke test that renders the
-    // same image every time. Step with `Next` instead.
+    // same image every time. Step with `Next` instead. (For a paginated
+    // document -- a PDF -- `Exact` *is* the page index, and `Next` steps it
+    // just the same, so one loop serves both.)
     let mut offset = doc.resolve_location(Location::Exact(0))
         .ok_or_else(|| format_err!("the document has no first page"))?;
     for n in 0..page {
@@ -71,7 +76,21 @@ fn run() -> Result<(), Error> {
             .ok_or_else(|| format_err!("the document ends after page {}", n))?;
     }
 
-    let (pixmap, _) = doc.pixmap(Location::Exact(offset), 1.0, SAMPLES)
+    // A reflowable document has already been laid out at the panel's geometry,
+    // so it renders at scale 1.0. A paginated one -- a PDF -- ignores `layout`
+    // and rasterises its own page box in points, which for US Letter is
+    // 612x792: a third of the panel's pixels. Fit it to the panel width, which
+    // is what `Reader` does for `ZoomMode::FitToWidth`, so the harness output
+    // is at device geometry for both kinds.
+    let scale = if doc.is_reflowable() {
+        1.0
+    } else {
+        let (w, _) = doc.dims(offset)
+            .ok_or_else(|| format_err!("no dimensions for page {}", offset))?;
+        WIDTH as f32 / w
+    };
+
+    let (pixmap, _) = doc.pixmap(Location::Exact(offset), scale, SAMPLES)
         .ok_or_else(|| format_err!("no page at offset {}", offset))?;
     pixmap.save(output)?;
 
