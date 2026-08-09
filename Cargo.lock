@@ -1138,6 +1138,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "plato-harness"
+version = "0.9.45"
+dependencies = [
+ "anyhow",
+ "plato-core",
+]
+
+[[package]]
 name = "png"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

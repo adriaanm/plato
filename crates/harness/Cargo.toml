@@ -1,0 +1,22 @@
+[package]
+name = "plato-harness"
+version = "0.9.45"
+edition = "2021"
+publish = false
+
+# The permanent headless smoke test for the ezkindle fork: no SDL, no
+# framebuffer, no device. It lays an EPUB out at real Paperwhite 3 geometry
+# and writes a PNG, which is the smallest thing that exercises the whole C
+# stack (freetype, harfbuzz, gumbo, MuPDF) plus Plato's layout engine.
+#
+# It exists so that a cross-compiled binary can be proved to *work* under
+# qemu-arm, not merely to link -- and so the ARM render can be diffed against
+# the host render byte for byte.
+
+[[bin]]
+name = "plato-harness"
+path = "src/main.rs"
+
+[dependencies]
+plato-core = { path = "../core" }
+anyhow = "1.0.100"

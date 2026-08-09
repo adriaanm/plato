@@ -4,6 +4,7 @@ members = [
   "crates/core",
   "crates/plato",
   "crates/emulator",
+  "crates/harness",
   "crates/importer",
   "crates/fetcher",
 ]
