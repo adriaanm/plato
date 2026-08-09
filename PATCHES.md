@@ -440,7 +440,163 @@ python3 xbuild.py kindle                        both binaries, ABI gate passed
 The size is MuPDF's embedded fonts, as in phase 1, and is the same ~43 MB that
 was already noted as trimmable.
 
+## Phase 3: what the device said, and the two things it changed
+
+`PLATO-DEVICE-PROBES` ran 2026-08-09 (raw output in ezkindle
+`device-facts/plato-phase3-probes.txt`, plus a 583-event touch capture in
+`device-facts/touch-capture-event1.raw`). Seven of the nine checklist items
+below came back as written. Two did not, and this is what they cost.
+
+### Touch: `TouchProto::MultiSlot`, a genuinely new protocol mode
+
+Files: `crates/core/src/input.rs`, `crates/core/src/device.rs`,
+`crates/core/test-data/touch-capture-event1.raw` (new).
+
+The panel is `cyttsp4_mt` on `/dev/input/event1` and its ABS bitmap is exactly
+`ABS_MT_SLOT(47)`, `ABS_MT_POSITION_X(53)`, `ABS_MT_POSITION_Y(54)`,
+`ABS_MT_TRACKING_ID(57)` — **no `ABS_MT_PRESSURE`, no plain `ABS_X`/`ABS_Y`**.
+
+Every one of Plato's existing multi-touch modes keys a contact on a pressure-ish
+axis and ignores `ABS_MT_SLOT` outright: `MultiA` on `ABS_MT_TOUCH_MAJOR`,
+`MultiB` and `MultiC` on `ABS_MT_PRESSURE` (they differ only in whether a
+release is inferred from pressure or from a contact vanishing between packets).
+On this panel that axis never arrives, so **every existing path sees a screen
+nobody ever touches.** Phase 2's `MultiB` guess, made from the driver's module
+name, was wrong in the way that produces silence rather than an error.
+
+**The name.** `MultiC` was the obvious candidate and it is taken: it means
+"pressure indicates release", i.e. the `MultiB` codes minus the release sweep,
+and it is live on four Kobos (Elipsa, Sage, Libra 2, Elipsa 2E). Renumbering
+the letters would touch Kobo rows for no gain, and reusing the name would make
+`europa` and the PW3 mean different things by the same word. The new variant is
+therefore `MultiSlot` — named for the mechanism rather than the next free
+letter, because that mechanism is the whole distinction: it is the only mode
+that reads `ABS_MT_SLOT` at all.
+
+**The semantics** are the kernel's protocol B verbatim
+(`Documentation/input/multi-touch-protocol.txt`): the driver keeps per-slot
+state and sends **only what changed**; `ABS_MT_SLOT` selects the current slot;
+`ABS_MT_TRACKING_ID >= 0` opens a contact and `-1` closes it; positions update
+the current slot; **state persists across `SYN_REPORT`**. Finger identity, as
+`gesture.rs` consumes it, is the slot's current tracking id. Pressure appears
+nowhere.
+
+**The shape of the patch** is chosen so no other device can be affected. The
+state machine is a separate `MultiSlotTracker`, and `parse_device_events` holds
+it in an `Option` that is `Some` for `MultiSlot` and `None` for everything else:
+
+```rust
+let mut slots = (proto == TouchProto::MultiSlot).then(MultiSlotTracker::new);
+```
+
+Two `if let Some(slots)` arms (one in `EV_ABS`, one at `SYN_REPORT`) short-
+circuit ahead of the existing code. On any Kobo `slots` is `None`, so the code
+that runs is byte-for-byte what ran before — and `device.rs` now pins every
+Kobo product's protocol in a test, so the new variant cannot drift onto
+hardware it was not written for.
+
+Splitting the tracker out is also what makes it testable: the device holds
+`EVIOCGRAB` on its touch node whenever KOReader runs, so live capture is
+expensive, and this is a state machine that deserves to be pinned rather than
+eyeballed.
+
+Three details the live capture settled, all of which the tracker handles:
+
+- **A lone finger never sends `ABS_MT_SLOT`.** Slot 0 is implicit, so the
+  tracker starts on slot 0 rather than waiting to be told.
+- **`ABS_MT_TRACKING_ID` is sent on change only** — once at contact start, then
+  not again until the `-1`. A parser needing it per packet sees one frame of a
+  swipe and then nothing.
+- **A lift can arrive as a bare `SLOT n` + `TRACKING_ID -1`**, with no
+  coordinates, in either slot order. The `Up` therefore carries the slot's last
+  known position, and pending `Up`s are emitted in slot order regardless of the
+  order they arrived in, so the output is deterministic.
+
+Also ignored: `BTN_TOOL_FINGER(325)` and `BTN_TOOL_DOUBLETAP(333)`, which this
+driver sends and which would otherwise surface as `ButtonCode::Raw` presses on
+every tap. Gated on `MultiSlot`, so no Kobo's button stream changes. `BTN_TOUCH`
+was already ignored upstream.
+
+**Tests** (13 new): eleven synthetic streams — implicit slot 0; interleaved
+slots with the id sent only on change; a conservative driver that re-sends
+nothing after contact start; a bare `SLOT/-1` lift; both fingers lifting in one
+packet in reverse order; a contact that opens and closes inside one frame
+(still a tap); a new tracking id with no intervening `-1` (an implicit lift);
+an out-of-range slot; an idle frame emitting nothing; mirroring — plus a replay
+of the 583-event live capture asserting the 14 contacts actually performed: 8
+corner taps in TL/TR/BR/BL order twice, 2 two-finger taps (detected as
+overlapping strokes), 2 rightward swipes, every coordinate on-panel, and **no
+phantom fingers left open at end of stream**.
+
+The capture is committed at `crates/core/test-data/touch-capture-event1.raw`:
+9 KB, and device-anonymous (coordinates and timestamps only — and the clock is
+wrong anyway, this device has never had a network).
+
+### `vinfo.rotate == 3`, and why nothing had to change
+
+File: `crates/core/src/framebuffer/kindle.rs`.
+
+The panel reports `rotate = 3` with `xres`/`yres` already `1072`/`1448`, and the
+capture shows touch coordinates that are portrait-native screen pixels with no
+transform (the top-left corner tap reads `(64, 62)`).
+
+Checklist item 2 above said "if the panel reports something other than 0, the
+constant in `device.rs` is what changes". **That would have been wrong**, and
+recording why is the point of this section. Plato's rotation is not a hardware
+register; it is the value `Device::should_swap_axes` and `should_mirror_axes`
+consume to transform touch input. `should_swap_axes(3)` is true under the
+default swapping scheme, so recording a 3 would swap `ABS_MT_POSITION_X`/`_Y`
+and mirror both axes — breaking touch on a panel whose coordinates are already
+correct. lab126's `rotate` describes the EPDC's own scanout in its own
+numbering, and it does not map onto Plato's `0..4` at all. KOReader, which
+drives this panel correctly, likewise never reads the field.
+
+So the invariant is unchanged and now explicit: **`dims()` is `xres`/`yres` =
+1072×1448, input coordinates pass through untransformed, and the rotation Plato
+records for this panel is `startup_rotation() == 0` everywhere** — in the
+framebuffer (constructed with it, `set_rotation` refuses to move off it), in
+`Device` (identity swap and mirroring at 0), and in `input.rs` (which derives
+its transform from exactly those two calls). Self-consistent by construction;
+no code change was required.
+
+What *was* added is a guard on the assumption that would actually hurt if it
+broke. `check_geometry(xres, yres, rotate)` refuses a panel reporting landscape
+geometry — that, not the rotate value, is what would silently render sideways
+and misplace every touch. Two tests: any `rotate` is accepted with portrait
+dims, transposed dims are an error.
+
+One stale comment corrected while here: `set_rotation`'s doc claimed the Kindle
+takes `swapping_scheme() == 0`. It takes the default, **1**. With 0,
+`should_swap_axes(0)` would be true and the axes would swap — the exact
+opposite of what the comment existed to justify. The code was always right; the
+comment was not.
+
+### Frontlight: 4095, and a fallback that was quietly wrong
+
+File: `crates/core/src/frontlight/kindle.rs`.
+
+`max_brightness` reads **4095** — not the 24/25 the Kindle folklore quotes, and
+not the 255 a sysfs backlight is usually assumed to have. `KindleFrontlight`
+already read the file at construction, so the scaling itself needed no change,
+which is the outcome that design was for.
+
+But the fallback constant used when the file is unreadable was `24`, and 24 out
+of 4095 is under 1% — a "working light with a slightly wrong ceiling" would in
+fact have been a light that appears broken. It is now 4095, and 4095 is in both
+scaling test tables (the round trip through a percentage still hits every one
+of the 4096 raw steps exactly).
+
+### Ready for phase 4
+
+Every item on the phase-3 checklist is closed: seven confirmed as written, two
+turned into the code above. The device binary builds and passes the ABI gate,
+and `cargo test -p plato-core` is at **62 passed, 0 failed** (46 at the end of
+phase 2). Nothing on the input, rotation or frontlight paths is a guess any
+more — the remaining unknowns are all things only a running binary can answer.
+
 ### What phase 3 must confirm before first light
+
+*Kept as written at the end of phase 2 — the answers are above.*
 
 Every one of these is read-only, and each turns a *Likely* in this phase into a
 *Confirmed* (or into a two-line fix):
