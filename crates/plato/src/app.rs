@@ -24,7 +24,7 @@ use plato_core::document::sys_info_as_html;
 use plato_core::input::{DeviceEvent, PowerSource, ButtonCode, ButtonStatus, VAL_RELEASE, VAL_PRESS};
 use plato_core::input::{raw_events, device_events, usb_events, display_rotate_event, button_scheme_event};
 use plato_core::gesture::{GestureEvent, gesture_events};
-use plato_core::helpers::{load_toml, save_toml};
+use plato_core::helpers::{load_toml, save_toml, is_installed};
 use plato_core::settings::{ButtonScheme, Settings, SETTINGS_PATH, RotationLock, IntermKind};
 use plato_core::frontlight::{Frontlight, StandardFrontlight, NaturalFrontlight, PremixedFrontlight, KindleFrontlight};
 use plato_core::lightsensor::{LightSensor, KoboLightSensor};
@@ -44,6 +44,11 @@ use plato_core::context::Context;
 pub const APP_NAME: &str = "Plato";
 const FB_DEVICE: &str = "/dev/fb0";
 const RTC_DEVICE: &str = "/dev/rtc0";
+// The two halves of the USB mass-storage flow. Named because the share is
+// offered only when the enable side is actually installed -- a "yes" that
+// cannot be honoured strands the device in the share intermission.
+const USB_ENABLE: &str = "scripts/usb-enable.sh";
+const USB_DISABLE: &str = "scripts/usb-disable.sh";
 // The PW3's touch node is /dev/input/event1 (cyttsp4_mt_b), which the existing
 // fallback list already ends in -- Kobo's by-path entries simply do not exist on
 // a Kindle, so the loop falls through to it. Verified by reading the list, not
@@ -477,7 +482,15 @@ pub fn run() -> Result<(), Error> {
                                     resume(TaskId::Suspend, &mut tasks, view.as_mut(), &tx, &mut rq, &mut context);
                                 }
 
-                                if context.settings.auto_share {
+                                // Only offer to share storage if the script
+                                // that does it exists. Without it the answer
+                                // "yes" leads to the share intermission with
+                                // nothing shared and no way out but unplugging
+                                // the cable -- the same trap as a menu entry
+                                // for a program that is not installed.
+                                if !is_installed(USB_ENABLE) {
+                                    eprintln!("Not offering to share storage: {} is missing.", USB_ENABLE);
+                                } else if context.settings.auto_share {
                                     tx.send(Event::PrepareShare).ok();
                                 } else {
                                     let dialog = Dialog::new(ViewId::ShareDialog,
@@ -501,7 +514,9 @@ pub fn run() -> Result<(), Error> {
 
                         if context.shared {
                             context.shared = false;
-                            Command::new("scripts/usb-disable.sh").status().ok();
+                            Command::new(USB_DISABLE).status()
+                                    .map_err(|e| eprintln!("Can't run {}: {:#}.", USB_DISABLE, e))
+                                    .ok();
                             env::set_current_dir(&current_dir)
                                 .map_err(|e| eprintln!("Can't set current directory to {}: {:#}.", current_dir.display(), e))
                                 .ok();
@@ -707,8 +722,15 @@ pub fn run() -> Result<(), Error> {
                     continue;
                 }
 
-                context.shared = true;
-                Command::new("scripts/usb-enable.sh").status().ok();
+                match Command::new(USB_ENABLE).status() {
+                    Ok(_) => context.shared = true,
+                    Err(e) => {
+                        // Say so rather than sitting on the intermission
+                        // screen pretending the volume is exported.
+                        eprintln!("Can't run {}: {:#}.", USB_ENABLE, e);
+                        tx.send(Event::Notify("Can't share storage.".to_string())).ok();
+                    },
+                }
             },
             Event::Gesture(ge) => {
                 match ge {
@@ -826,29 +848,52 @@ pub fn run() -> Result<(), Error> {
             Event::Select(EntryId::Launch(app_cmd)) => {
                 view.children_mut().retain(|child| !child.is::<Menu>());
                 let monochrome = context.fb.monochrome();
-                let mut next_view: Box<dyn View> = match app_cmd {
+                // An app that fails to start is a notification, never an exit.
+                // `Calculator::new` spawns `ivy`, and this arm used to end in
+                // `?`: with `ivy` missing from the payload, opening the
+                // calculator took the whole process down with "No such file or
+                // directory" -- on a device where Plato is the only thing
+                // running and there is nothing to restart it with. The menu no
+                // longer offers an app whose helper is absent; this is the
+                // backstop for whatever gets past that.
+                let next_view: Option<Box<dyn View>> = match app_cmd {
                     AppCmd::Sketch => {
                         context.fb.set_monochrome(true);
-                        Box::new(Sketch::new(context.fb.rect(), &mut rq, &mut context))
+                        Some(Box::new(Sketch::new(context.fb.rect(), &mut rq, &mut context)) as Box<dyn View>)
                     },
-                    AppCmd::Calculator => Box::new(Calculator::new(context.fb.rect(), &tx, &mut rq, &mut context)?),
-                    AppCmd::Dictionary { ref query, ref language } => Box::new(DictionaryApp::new(context.fb.rect(), query,
-                                                                                                  language, &tx, &mut rq, &mut context)),
+                    AppCmd::Calculator => {
+                        match Calculator::new(context.fb.rect(), &tx, &mut rq, &mut context) {
+                            Ok(calculator) => Some(Box::new(calculator) as Box<dyn View>),
+                            Err(e) => {
+                                eprintln!("Can't launch the calculator: {:#}.", e);
+                                tx.send(Event::Notify("Can't launch the calculator.".to_string())).ok();
+                                None
+                            },
+                        }
+                    },
+                    AppCmd::Dictionary { ref query, ref language } => Some(Box::new(DictionaryApp::new(context.fb.rect(), query,
+                                                                                                       language, &tx, &mut rq, &mut context)) as Box<dyn View>),
                     AppCmd::TouchEvents => {
-                        Box::new(TouchEvents::new(context.fb.rect(), &mut rq, &mut context))
+                        Some(Box::new(TouchEvents::new(context.fb.rect(), &mut rq, &mut context)) as Box<dyn View>)
                     },
                     AppCmd::RotationValues => {
-                        Box::new(RotationValues::new(context.fb.rect(), &mut rq, &mut context))
+                        Some(Box::new(RotationValues::new(context.fb.rect(), &mut rq, &mut context)) as Box<dyn View>)
                     },
                 };
-                transfer_notifications(view.as_mut(), next_view.as_mut(), &mut rq, &mut context);
-                history.push(HistoryItem {
-                    view,
-                    rotation: context.display.rotation,
-                    monochrome,
-                    dithered: context.fb.dithered(),
-                });
-                view = next_view;
+
+                if let Some(mut next_view) = next_view {
+                    transfer_notifications(view.as_mut(), next_view.as_mut(), &mut rq, &mut context);
+                    history.push(HistoryItem {
+                        view,
+                        rotation: context.display.rotation,
+                        monochrome,
+                        dithered: context.fb.dithered(),
+                    });
+                    view = next_view;
+                } else if context.fb.monochrome() != monochrome {
+                    // Nothing was pushed, so nothing will pop and restore it.
+                    context.fb.set_monochrome(monochrome);
+                }
             },
             Event::Back => {
                 if let Some(item) = history.pop() {

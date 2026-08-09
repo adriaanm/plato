@@ -1303,7 +1303,13 @@ impl Home {
                                                 Fetcher { path: hook.path.clone(), full_path: save_path, process,
                                                           sort_method, first_column, second_column });
             },
-            Err(e) => eprintln!("Can't spawn child: {:#}.", e),
+            Err(e) => {
+                // Already non-fatal, but silent: a hook whose program is not
+                // installed used to fail only into a log that nothing on the
+                // device can read.
+                eprintln!("Can't spawn {}: {:#}.", hook.program.display(), e);
+                hub.send(Event::Notify(format!("Can't run {}.", hook.program.display()))).ok();
+            },
         }
     }
 

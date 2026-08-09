@@ -434,26 +434,37 @@ fn main() -> Result<(), Error> {
                 },
                 Event::Select(EntryId::Launch(app_cmd)) => {
                     view.children_mut().retain(|child| !child.is::<Menu>());
-                    let mut next_view: Box<dyn View> = match app_cmd {
+                    // Same contract as the device binary: an app that cannot
+                    // start is a notification, not an exit.
+                    let next_view: Option<Box<dyn View>> = match app_cmd {
                         AppCmd::Sketch => {
-                            Box::new(Sketch::new(context.fb.rect(), &mut rq, &mut context))
+                            Some(Box::new(Sketch::new(context.fb.rect(), &mut rq, &mut context)) as Box<dyn View>)
                         },
                         AppCmd::Calculator => {
-                            Box::new(Calculator::new(context.fb.rect(), &tx, &mut rq, &mut context)?)
+                            match Calculator::new(context.fb.rect(), &tx, &mut rq, &mut context) {
+                                Ok(calculator) => Some(Box::new(calculator) as Box<dyn View>),
+                                Err(e) => {
+                                    eprintln!("Can't launch the calculator: {:#}.", e);
+                                    tx.send(Event::Notify("Can't launch the calculator.".to_string())).ok();
+                                    None
+                                },
+                            }
                         },
                         AppCmd::Dictionary { ref query, ref language } => {
-                            Box::new(Dictionary::new(context.fb.rect(), query, language, &tx, &mut rq, &mut context))
+                            Some(Box::new(Dictionary::new(context.fb.rect(), query, language, &tx, &mut rq, &mut context)) as Box<dyn View>)
                         },
                         AppCmd::TouchEvents => {
-                            Box::new(TouchEvents::new(context.fb.rect(), &mut rq, &mut context))
+                            Some(Box::new(TouchEvents::new(context.fb.rect(), &mut rq, &mut context)) as Box<dyn View>)
                         },
                         AppCmd::RotationValues => {
-                            Box::new(RotationValues::new(context.fb.rect(), &mut rq, &mut context))
+                            Some(Box::new(RotationValues::new(context.fb.rect(), &mut rq, &mut context)) as Box<dyn View>)
                         },
                     };
-                    transfer_notifications(view.as_mut(), next_view.as_mut(), &mut rq, &mut context);
-                    history.push(view as Box<dyn View>);
-                    view = next_view;
+                    if let Some(mut next_view) = next_view {
+                        transfer_notifications(view.as_mut(), next_view.as_mut(), &mut rq, &mut context);
+                        history.push(view as Box<dyn View>);
+                        view = next_view;
+                    }
                 },
                 Event::Back => {
                     if let Some(v) = history.pop() {
