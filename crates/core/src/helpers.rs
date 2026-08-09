@@ -100,6 +100,34 @@ pub fn save_toml<T, P: AsRef<Path>>(data: &T, path: P) -> Result<(), Error> wher
        .map_err(Into::into)
 }
 
+/// Whether an external program Plato shells out to is actually installed.
+///
+/// The point is to be able to ask *before* offering the user something that
+/// spawns it: a menu entry for a program that is not there is a trap, and on a
+/// device with no shell it is an unrecoverable one.
+///
+/// The test is deliberately the same one the spawn will make — a regular file,
+/// present, with an execute bit — and it is deliberately not a `PATH` search,
+/// because every caller here spawns by relative path from Plato's own working
+/// directory, so `PATH` would answer a question nobody asked. Symlinks are
+/// followed, so a dangling one reads as missing, which is what it is.
+pub fn is_installed<P: AsRef<Path>>(path: P) -> bool {
+    fs::metadata(path).map(|m| is_runnable(&m)).unwrap_or(false)
+}
+
+/// The half of [`is_installed`] that does not touch the filesystem.
+pub fn is_runnable(meta: &Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
+    }
+}
+
 pub trait Fingerprint {
     fn fingerprint(&self, epoch: SystemTime) -> io::Result<Fp>;
 }
@@ -255,5 +283,33 @@ mod tests {
         assert_eq!(decode_entities("a &#x003E; b"), "a > b");
         assert_eq!(decode_entities("a &#38; b"), "a & b");
         assert_eq!(decode_entities("a &lt; b &gt; c"), "a < b > c");
+    }
+
+    /// A missing helper is the case that mattered: launching the calculator
+    /// with `ivy` absent from the payload took the whole process down.
+    #[test]
+    fn an_absent_helper_is_not_installed() {
+        assert!(!is_installed("bin/there-is-no-such-program"));
+        assert!(!is_installed(""));
+    }
+
+    #[test]
+    fn a_directory_is_not_a_helper() {
+        // Executable, in the sense the mode bits mean for a directory, and
+        // still not something that can be spawned.
+        assert!(!is_installed(std::env::temp_dir()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_is_a_helper_only_once_it_is_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("plato-helper-probe-{}", std::process::id()));
+        fs::write(&path, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!is_installed(&path), "a non-executable file is not runnable");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_installed(&path));
+        fs::remove_file(&path).ok();
     }
 }

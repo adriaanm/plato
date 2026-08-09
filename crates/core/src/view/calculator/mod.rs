@@ -3,7 +3,7 @@ mod bottom_bar;
 mod code_area;
 
 use std::thread;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::collections::VecDeque;
 use std::io::Write;
 use std::io::{BufRead, BufReader};
@@ -33,6 +33,14 @@ use crate::context::Context;
 const APP_DIR: &str = "bin/ivy";
 const APP_NAME: &str = "ivy";
 const LIB_NAME: &str = "lib.ivy";
+
+/// The interpreter this view is a front end for.
+///
+/// Exposed so the menu can ask whether it is installed before offering to
+/// launch it. Same path `Calculator::new` spawns, by construction.
+pub fn helper_path() -> PathBuf {
+    Path::new(APP_DIR).join(APP_NAME)
+}
 
 pub struct Calculator {
     id: Id,

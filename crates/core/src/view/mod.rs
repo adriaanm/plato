@@ -378,6 +378,28 @@ pub enum AppCmd {
     RotationValues,
 }
 
+impl AppCmd {
+    /// The external program this app cannot run without, if it has one.
+    ///
+    /// Everything else on the Applications menu is built into the binary and
+    /// is therefore always available.
+    pub fn helper(&self) -> Option<PathBuf> {
+        match self {
+            AppCmd::Calculator => Some(calculator::helper_path()),
+            _ => None,
+        }
+    }
+
+    /// Whether launching this app can be expected to work.
+    ///
+    /// Asked when the menu is built rather than when the entry is tapped: an
+    /// app that cannot start should not be offered in the first place. See
+    /// `common::application_entries`.
+    pub fn is_available(&self) -> bool {
+        self.helper().map_or(true, crate::helpers::is_installed)
+    }
+}
+
 #[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
 pub enum ViewId {
     Home,

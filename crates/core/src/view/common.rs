@@ -60,6 +60,58 @@ pub fn transfer_notifications(view1: &mut dyn View, view2: &mut dyn View, rq: &m
     }
 }
 
+/// The Applications submenu, minus every app whose external helper is not
+/// installed.
+///
+/// Offering an app that cannot start is worse than not offering it: launching
+/// the calculator on a device with no `ivy` in the payload used to take the
+/// whole process down, and on a device with no shell there is nothing to
+/// restart it with. The spawn is now non-fatal too, but that is the backstop —
+/// this is the fix.
+///
+/// The predicate is a parameter so the filtering can be tested without a
+/// filesystem; production passes [`AppCmd::is_available`].
+pub fn application_entries(is_available: impl Fn(&AppCmd) -> bool) -> Vec<EntryKind> {
+    let apps = [("Dictionary", AppCmd::Dictionary { query: String::new(), language: String::new() }),
+                ("Calculator", AppCmd::Calculator),
+                ("Sketch", AppCmd::Sketch)];
+    let tools = [("Touch Events", AppCmd::TouchEvents),
+                 ("Rotation Values", AppCmd::RotationValues)];
+
+    let entry = |(label, cmd): &(&str, AppCmd)| {
+        EntryKind::Command(label.to_string(), EntryId::Launch(cmd.clone()))
+    };
+
+    let mut entries: Vec<EntryKind> = apps.iter().filter(|(_, cmd)| is_available(cmd))
+                                          .map(entry).collect();
+    entries.push(EntryKind::Separator);
+    entries.extend(tools.iter().filter(|(_, cmd)| is_available(cmd)).map(entry));
+    tidy_separators(entries)
+}
+
+/// Drop separators that no longer separate anything: leading, trailing, or
+/// doubled.
+///
+/// Filtering a menu leaves them behind, and a menu that opens on a horizontal
+/// rule looks like a bug in the menu rather than a missing program.
+fn tidy_separators(entries: Vec<EntryKind>) -> Vec<EntryKind> {
+    let mut tidy: Vec<EntryKind> = Vec::with_capacity(entries.len());
+
+    for entry in entries {
+        let is_separator = matches!(entry, EntryKind::Separator);
+        if is_separator && matches!(tidy.last(), None | Some(EntryKind::Separator)) {
+            continue;
+        }
+        tidy.push(entry);
+    }
+
+    if matches!(tidy.last(), Some(EntryKind::Separator)) {
+        tidy.pop();
+    }
+
+    tidy
+}
+
 pub fn toggle_main_menu(view: &mut dyn View, rect: Rectangle, enable: Option<bool>, rq: &mut RenderQueue, context: &mut Context) {
     if let Some(index) = locate_by_id(view, ViewId::MainMenu) {
         if let Some(true) = enable {
@@ -79,17 +131,7 @@ pub fn toggle_main_menu(view: &mut dyn View, rect: Rectangle, enable: Option<boo
                                    n == rotation)
         ).collect::<Vec<EntryKind>>();
 
-        let apps = vec![EntryKind::Command("Dictionary".to_string(),
-                                           EntryId::Launch(AppCmd::Dictionary { query: "".to_string(), language: "".to_string() })),
-                        EntryKind::Command("Calculator".to_string(),
-                                           EntryId::Launch(AppCmd::Calculator)),
-                        EntryKind::Command("Sketch".to_string(),
-                                           EntryId::Launch(AppCmd::Sketch)),
-                        EntryKind::Separator,
-                        EntryKind::Command("Touch Events".to_string(),
-                                           EntryId::Launch(AppCmd::TouchEvents)),
-                        EntryKind::Command("Rotation Values".to_string(),
-                                           EntryId::Launch(AppCmd::RotationValues))];
+        let apps = application_entries(AppCmd::is_available);
         let mut entries = vec![EntryKind::Command("About".to_string(),
                                                   EntryId::About),
                                EntryKind::Command("System Info".to_string(),
@@ -105,9 +147,14 @@ pub fn toggle_main_menu(view: &mut dyn View, rect: Rectangle, enable: Option<boo
                                EntryKind::SubMenu("Rotate".to_string(), rotate),
                                EntryKind::Command("Take Screenshot".to_string(),
                                                   EntryId::TakeScreenshot),
-                               EntryKind::Separator,
-                               EntryKind::SubMenu("Applications".to_string(), apps),
                                EntryKind::Separator];
+
+        // An Applications submenu with nothing runnable in it would be a
+        // submenu that opens on an empty list.
+        if !apps.is_empty() {
+            entries.push(EntryKind::SubMenu("Applications".to_string(), apps));
+            entries.push(EntryKind::Separator);
+        }
 
         entries.push(EntryKind::Command("Reboot".to_string(), EntryId::Reboot));
         entries.push(EntryKind::Command("Quit".to_string(), EntryId::Quit));
@@ -239,5 +286,71 @@ pub fn toggle_keyboard_layout_menu(view: &mut dyn View, rect: Rectangle, enable:
         let keyboard_layout_menu = Menu::new(rect, ViewId::KeyboardLayoutMenu, MenuKind::Contextual, entries, context);
         rq.add(RenderData::new(keyboard_layout_menu.id(), *keyboard_layout_menu.rect(), UpdateMode::Gui));
         view.children_mut().push(Box::new(keyboard_layout_menu) as Box<dyn View>);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn labels(entries: &[EntryKind]) -> Vec<String> {
+        entries.iter().map(|e| match e {
+            EntryKind::Command(label, _) => label.clone(),
+            EntryKind::Separator => "---".to_string(),
+            _ => "?".to_string(),
+        }).collect()
+    }
+
+    #[test]
+    fn every_app_is_offered_when_every_helper_is_installed() {
+        assert_eq!(labels(&application_entries(|_| true)),
+                   ["Dictionary", "Calculator", "Sketch", "---",
+                    "Touch Events", "Rotation Values"]);
+    }
+
+    /// The case that started this: `ivy` is not in the payload.
+    #[test]
+    fn an_app_with_a_missing_helper_is_not_offered() {
+        let entries = application_entries(|cmd| *cmd != AppCmd::Calculator);
+        assert_eq!(labels(&entries),
+                   ["Dictionary", "Sketch", "---", "Touch Events", "Rotation Values"]);
+    }
+
+    /// Filtering must not leave the rule it was separating from behind.
+    #[test]
+    fn a_menu_never_opens_or_ends_on_a_separator() {
+        let only_tools = application_entries(|cmd| matches!(cmd, AppCmd::TouchEvents |
+                                                                 AppCmd::RotationValues));
+        assert_eq!(labels(&only_tools), ["Touch Events", "Rotation Values"]);
+
+        let only_apps = application_entries(|cmd| matches!(cmd, AppCmd::Sketch));
+        assert_eq!(labels(&only_apps), ["Sketch"]);
+
+        assert!(application_entries(|_| false).is_empty());
+    }
+
+    #[test]
+    fn separators_are_tidied_wherever_they_end_up() {
+        let cmd = |label: &str| EntryKind::Command(label.to_string(), EntryId::About);
+        let messy = vec![EntryKind::Separator, EntryKind::Separator, cmd("a"),
+                         EntryKind::Separator, EntryKind::Separator, cmd("b"),
+                         EntryKind::Separator];
+        assert_eq!(labels(&tidy_separators(messy)), ["a", "---", "b"]);
+        assert!(tidy_separators(vec![EntryKind::Separator]).is_empty());
+        assert!(tidy_separators(Vec::new()).is_empty());
+    }
+
+    /// The mapping the probe rests on. Only the calculator shells out; every
+    /// other app is built into the binary and can never be missing.
+    #[test]
+    fn only_the_calculator_needs_a_helper() {
+        assert_eq!(AppCmd::Calculator.helper(), Some(PathBuf::from("bin/ivy/ivy")));
+        assert!(AppCmd::Sketch.helper().is_none());
+        assert!(AppCmd::TouchEvents.helper().is_none());
+        assert!(AppCmd::RotationValues.helper().is_none());
+        assert!(AppCmd::Dictionary { query: String::new(), language: String::new() }.helper().is_none());
+        // Built-in apps are available whatever the filesystem says.
+        assert!(AppCmd::Sketch.is_available());
     }
 }
