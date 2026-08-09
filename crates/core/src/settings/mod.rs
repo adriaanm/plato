@@ -6,6 +6,7 @@ use std::fmt::{self, Debug};
 use std::path::PathBuf;
 use std::collections::{BTreeMap, HashMap};
 use fxhash::FxHashSet;
+use lazy_static::lazy_static;
 use serde::{Serialize, Deserialize};
 use crate::metadata::{SortMethod, TextAlign};
 use crate::frontlight::LightLevels;
@@ -16,9 +17,43 @@ use crate::unit::mm_to_px;
 pub use self::preset::{LightPreset, guess_frontlight};
 
 pub const SETTINGS_PATH: &str = "Settings.toml";
-pub const DEFAULT_FONT_PATH: &str = "/mnt/onboard/fonts";
-pub const INTERNAL_CARD_ROOT: &str = "/mnt/onboard";
-pub const EXTERNAL_CARD_ROOT: &str = "/mnt/sd";
+
+// The three storage roots are per-device, because the Kindle userstore is
+// mounted somewhere else entirely. They stay `&'static str`, so every existing
+// use site is unchanged apart from a deref; the Kobo values are byte-identical
+// to the constants they replace.
+//
+// A `&'static str` behind lazy_static rather than a function is the smallest
+// mechanism that works here: `PathBuf::from(*INTERNAL_CARD_ROOT)` and
+// `statvfs(*INTERNAL_CARD_ROOT)` both still take a plain string, and nothing
+// downstream learns that these are now computed.
+lazy_static! {
+    pub static ref DEFAULT_FONT_PATH: &'static str = if CURRENT_DEVICE.is_kindle() {
+        "/mnt/us/fonts"
+    } else {
+        "/mnt/onboard/fonts"
+    };
+
+    /// The library root. On the PW3 this is the userstore — `/mnt/us` is
+    /// `/Volumes/Kindle` seen from the Mac — with books in a subdirectory of
+    /// their own, so Plato's library index never has to walk past Amazon's
+    /// `documents/`, `system/` and the KOReader install.
+    pub static ref INTERNAL_CARD_ROOT: &'static str = if CURRENT_DEVICE.is_kindle() {
+        "/mnt/us/books"
+    } else {
+        "/mnt/onboard"
+    };
+
+    /// The PW3 has no removable storage at all (`has_removable_storage()` is
+    /// false for it). The second library therefore points at the userstore
+    /// root, which is a useful thing to browse rather than a path that will
+    /// never exist.
+    pub static ref EXTERNAL_CARD_ROOT: &'static str = if CURRENT_DEVICE.is_kindle() {
+        "/mnt/us"
+    } else {
+        "/mnt/sd"
+    };
+}
 pub const LOGO_SPECIAL_PATH: &str = "logo:";
 pub const COVER_SPECIAL_PATH: &str = "cover:";
 // Default font size in points.
@@ -496,7 +531,7 @@ impl Default for Settings {
             libraries: vec![
                 LibrarySettings {
                     name: "On Board".to_string(),
-                    path: PathBuf::from(INTERNAL_CARD_ROOT),
+                    path: PathBuf::from(*INTERNAL_CARD_ROOT),
                     hooks: vec![
                         Hook {
                             path: PathBuf::from("Articles"),
@@ -510,7 +545,7 @@ impl Default for Settings {
                 },
                 LibrarySettings {
                     name: "Removable".to_string(),
-                    path: PathBuf::from(EXTERNAL_CARD_ROOT),
+                    path: PathBuf::from(*EXTERNAL_CARD_ROOT),
                     .. Default::default()
                 },
                 LibrarySettings {

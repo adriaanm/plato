@@ -513,7 +513,7 @@ pub fn sys_info_as_html() -> String {
         buf.push_str("\t\t\t</tr>\n");
     }
 
-    if let Ok(info) = statvfs::statvfs(INTERNAL_CARD_ROOT) {
+    if let Ok(info) = statvfs::statvfs(*INTERNAL_CARD_ROOT) {
         let fbs = info.fragment_size() as u64;
         let free = info.blocks_free() as u64 * fbs;
         let total = info.blocks() as u64 * fbs;
