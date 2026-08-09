@@ -810,3 +810,89 @@ what says the `dir` field is being read from the right offset.
 fz_stext extractions at open, on a 1 GHz Cortex-A9. If that is seconds, Phase A
 needs lazy or background sampling and an uncropped first paint. Nothing was
 deployed to the device in this phase.
+
+## Phase B of the PDF work — overlap on turn
+
+Design in `docs/plato-pdf.md` §5 Phase B. **Also upstreamable**: it is one new
+setting, defaulted so that turning it to `0` restores today's arithmetic
+exactly, and it touches nothing a reflowable document goes through.
+
+Three changes, all in fit-to-width + screen-scroll mode.
+
+### The overlap itself
+
+A screenful repeats the last `scroll-overlap-lines` (default 2) text rows of
+the one before it. At the ~4.7 screenfuls per page a two-column paper takes at
+a readable zoom (`docs/plato-pdf.md` §4.4) the eye loses its place on every
+turn without an anchor.
+
+It is expressed in **rows**, resolved through the page's own fz_stext line
+boxes, not as a pixel constant — that is the difference between "about two
+lines" and exactly two, and it means the overlap is the same two lines at any
+zoom. `overlap_height` in `reader/mod.rs` deliberately takes the same view of
+the page `find_cut` takes (same frame containment, same "no line is taller than
+a tenth of the frame" filter), because the number is only useful if it lands on
+a boundary `find_cut` would also have chosen. A page that answers nothing — a
+plate, a scan with no text layer — yields an overlap of zero and a turn
+identical to the old one.
+
+Rows, not lines, because a two-column page emits one fz_stext line per column
+at nearly the same height; counting lines would halve the overlap on exactly
+the documents this is for.
+
+Backwards it is not an offset to subtract but a **shorter screen to fill**: the
+previous screenful has to *end* two rows into the current one, so the backward
+walk in `go_to_neighbor` accumulates page heights against `previous_span`
+instead of the real screen height. Same function, `Forward` from the current
+top rather than `Backward` from the cut, and the two are exact inverses — which
+is what makes Next-then-Previous land back where it started.
+
+### Continuous scroll by default for paginated documents
+
+`Reader::new` opens a non-reflowable document in `FitToWidth` + `ScrollMode::
+Screen` unless stored state says otherwise. Fit-to-page is the wrong default
+for a paper: on this panel it is the difference between scrolling and
+unreadable type. `continuous-fit-to-width = false` restores the old behaviour,
+and reflowable documents are untouched.
+
+### The persistence gates, relaxed
+
+That default needs "nothing stored" to mean "never opened". `quit` therefore
+writes a **paginated** document's `zoom_mode`, `scroll_mode` and `page_offset`
+whatever they are; previously `zoom_mode` was dropped when it was fit-to-page
+and `scroll_mode` unless zoom was fit-to-width, which would have made a
+deliberate fit-to-page indistinguishable from a first open — and overridden on
+every subsequent one. Reflowable documents keep the old, sparser save path
+byte-for-byte. Old `.reading-states` files load unchanged; a PDF in one simply
+picks up the new default once.
+
+### The cache cap, and why it was extracted
+
+`update`'s eviction loop (cap 3) is unchanged in behaviour but now calls
+`layout::eviction_candidate`. An overlapped screenful can straddle one more
+page boundary than an aligned one, so "can eviction throw away a page that is
+on screen?" stops being obvious. It can — but only once the screen spans more
+pages than the cache holds, which needs pages under half a screen tall, and the
+overlap is clamped to half a screen precisely so it cannot produce that on its
+own. Both the policy and its limit are now pinned by tests instead of argued
+about.
+
+The other invariant worth naming: **a page turn that does not move
+`page_offset` is read one frame later as "No next page" and ends the
+document.** `next_screen` clamps to `current + 1` so an overlap can never cause
+one, and a test walks every combination of cut, overlap and starting offset in
+a range to prove it.
+
+### Results
+
+```
+python3 xbuild.py host --test --package plato-core     99 passed, 0 failed
+  (87 at the end of phase A; +12, all in document/layout.rs)
+python3 xbuild.py kindle                               both binaries, ABI gate passed
+  plato          50 784 KiB    e_flags=0x5000200
+  plato-harness  48 170 KiB    e_flags=0x5000200
+```
+
+**Open, and only the device can close it:** whether two rows is the right
+number, and whether repeating the same rows across a REAGL turn ghosts visibly.
+Nothing was deployed in this phase.
