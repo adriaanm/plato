@@ -1,4 +1,4 @@
-# Running the emulator on macOS (ezkindle fork, phase 0)
+# Running the emulator on macOS (platokin fork, phase 0)
 
 Upstream's `doc/BUILD.md` documents the Linux path only ("install MuPDF 1.27.0,
 DjVuLibre, FreeType, HarfBuzz" and then `./run-emulator.sh`). This is the macOS

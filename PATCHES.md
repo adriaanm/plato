@@ -1,9 +1,9 @@
-# PATCHES.md — the `ezkindle` fork's divergence from upstream Plato
+# PATCHES.md — the `platokin` fork's divergence from upstream Plato
 
-Branch `ezkindle`, forked from `baskerville/plato@7da89f2` (2026-08-09).
+Branch `platokin`, forked from `baskerville/plato@7da89f2` (2026-08-09).
 
 This fork exists to port Plato to a jailbroken **Kindle Paperwhite 3** — see
-`docs/plato-port.md` in the `ezkindle` repo. It is meant to stay **rebasable on
+`docs/plato-port.md` in the `platokin` repo. It is meant to stay **rebasable on
 upstream master**, so every divergence is listed here with its rationale, and
 each one is either (a) plausibly mergeable upstream or (b) confined to files
 upstream does not have.
@@ -212,7 +212,7 @@ prebuilt binaries from the maintainer's server. Neither path is used here.
 
 `check_arm_abi()` runs on every ARM binary before the build is allowed to
 succeed: ELF magic, `e_machine == ARM`, and `EF_ARM_ABI_FLOAT_HARD` clear. It
-is the same check as `scripts/check-arm-abi.py` in the ezkindle repo,
+is the same check as `scripts/check-arm-abi.py` in the platokin repo,
 reimplemented here so the fork has no path dependency on a sibling checkout —
 and if that checkout *is* next door, xbuild runs it too, so the two can never
 silently disagree.
@@ -445,7 +445,7 @@ was already noted as trimmable.
 
 ## Phase 3: what the device said, and the two things it changed
 
-`PLATO-DEVICE-PROBES` ran 2026-08-09 (raw output in ezkindle
+`PLATO-DEVICE-PROBES` ran 2026-08-09 (raw output in platokin
 `device-facts/plato-phase3-probes.txt`, plus a 583-event touch capture in
 `device-facts/touch-capture-event1.raw`). Seven of the nine checklist items
 below came back as written. Two did not, and this is what they cost.
@@ -638,7 +638,7 @@ Every one of these is read-only, and each turns a *Likely* in this phase into a
 
 ## Phase 5 — the powerd integration
 
-Design and evidence live in the `ezkindle` repo (`docs/plato-port.md`, section
+Design and evidence live in the `platokin` repo (`docs/plato-port.md`, section
 "powerd integration"). The device-side shell — `suspend.sh`, `resume.sh` and a
 `plato.sh` launcher speaking lipc to `com.lab126.powerd` — lives there too,
 under `device/plato/scripts/`, **not** in this fork: upstream's `scripts/*.sh`
@@ -693,7 +693,7 @@ found them anyway.
 
 ## Phase A of the PDF work — automatic content-box cropping
 
-Design and measurements live in the `ezkindle` repo (`docs/plato-pdf.md`); this
+Design and measurements live in the `platokin` repo (`docs/plato-pdf.md`); this
 records only what diverges here. **Phase A is designed to be upstreamable**:
 automatic margin detection is a feature upstream plausibly wants, it reuses
 `CroppingMargins` unchanged, it is behind a setting, and the whole diff is
@@ -1182,7 +1182,7 @@ helper is indistinguishable from a refusal from Plato's side, and both mean the
 device is awake. That also removes the silent version of this loop, where
 `scripts/suspend.sh` simply is not installed.
 
-The exit status becomes the device-side contract, and the ezkindle repo's
+The exit status becomes the device-side contract, and the platokin repo's
 `device/plato/scripts/suspend.sh` now honours it: `0` we slept, `1` we did not.
 
 ### Results
