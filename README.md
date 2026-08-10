@@ -1,5 +1,31 @@
 ![Logo](artworks/plato-logo.svg)
 
+> ## This fork: Plato on the Kindle Paperwhite 3
+>
+> This is a fork of [baskerville/plato](https://github.com/baskerville/plato)
+> focused on running Plato on a jailbroken **Kindle Paperwhite 3** (`muscat`,
+> i.MX6SL "Wario", firmware 5.16.2.1.1, kernel `3.0.35-lab126`, 1072×1448
+> @ 300 dpi, armv7 **soft-float** ABI, glibc 2.20). What it adds, each piece
+> recorded in [PATCHES.md](PATCHES.md):
+>
+> - A Kindle backend: the lab126 `mxcfb` ioctl dialect (72-byte
+>   `mxcfb_update_data`, REAGL waveforms), `cyttsp4_mt` multi-touch
+>   (`TouchProto::MultiSlot`), `max77696` battery and frontlight, selected via
+>   `PLATO_DEVICE=kindle-pw3`.
+> - A self-contained cross-build (`xbuild.py`) using `zig cc` +
+>   `cargo-zigbuild` — no vendor toolchain, sha256-pinned third-party sources,
+>   an ABI gate that rejects hard-float output.
+> - PDF reading tuned for academic papers: automatic content-box cropping,
+>   continuous scroll with an overlap anchor on page turns, and automatic
+>   two-column detection with column-wise navigation.
+> - Robustness fixes that are not Kindle-specific: a missing external helper
+>   can no longer crash the app, and a refused suspend no longer loops.
+>
+> **We're happy to upstream any of this if there's interest** — the build
+> hygiene, the PDF features and the robustness fixes were written to be
+> upstreamable; the Kindle backend is cleanly additive. Open an issue or PR
+> conversation on this fork.
+
 *Plato* is a document reader for *Kobo*'s e-readers.
 
 Documentation: [GUIDE](doc/GUIDE.md), [MANUAL](doc/MANUAL.md) and [BUILD](doc/BUILD.md).
