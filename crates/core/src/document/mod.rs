@@ -491,6 +491,21 @@ const HWINFO_KEYS: [&str; 19] = ["CPU", "PCB", "DisplayPanel", "DisplayCtrl", "D
                                  "TouchCtrl", "TouchType", "Battery", "IFlash", "RamSize", "RamType",
                                  "LightSensor", "HallSensor", "RSensor", "Wifi"];
 
+/// One line of output from a device script, or nothing.
+///
+/// "Nothing" covers every uninteresting case at once -- no such script (the
+/// emulator has none of these), a non-zero exit, empty output -- and the caller
+/// turns it into an omitted row rather than a blank or an error.
+fn script_output(script: &str) -> Option<String> {
+    let output = Command::new(script).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
 pub fn sys_info_as_html() -> String {
     let mut buf = "<html>\n\t<head>\n\t\t<title>System Info</title>\n\t\t\
                    <link rel=\"stylesheet\" type=\"text/css\" \
@@ -522,19 +537,36 @@ pub fn sys_info_as_html() -> String {
 
     buf.push_str("\t\t\t<tr class=\"sep\"></tr>\n");
 
-    let output = Command::new("scripts/ip.sh")
-                         .output()
-                         .map_err(|e| eprintln!("Can't execute command: {:#}.", e))
-                         .ok();
+    // The network block.  Every value comes from a device script, and a script
+    // that is absent or silent simply drops its row -- which is what happens on
+    // the emulator, and what happens on hardware when the radio is off.
+    //
+    // More than the address on purpose: reading an address off a notification
+    // that shows for a few seconds is how a `.190` gets remembered as `.180`.
+    // The gateway earns its place separately -- a missing default route is this
+    // device's characteristic WiFi failure, where it is associated, addressed,
+    // and can still reach nothing.
+    let network = [("Network", "scripts/essid.sh"),
+                   ("IP address", "scripts/ip.sh"),
+                   ("Gateway", "scripts/gateway.sh"),
+                   ("Interface", "scripts/iface.sh"),
+                   ("Signal", "scripts/signal.sh")];
 
-    if let Some(stdout) = output.filter(|output| output.status.success())
-                                .and_then(|output| String::from_utf8(output.stdout).ok())
-                                .filter(|stdout| !stdout.is_empty()) {
+    for (name, script) in network.iter() {
+        let value = match script_output(script) {
+            Some(value) => value,
+            None => continue,
+        };
+        // The only value that is not already self-describing.
+        let value = if *name == "Signal" { format!("{} dBm", value) } else { value };
+
         buf.push_str("\t\t\t<tr>\n");
-        buf.push_str("\t\t\t\t<td>IP Address</td>\n");
-        buf.push_str(&format!("\t\t\t\t<td>{}</td>\n", stdout));
+        buf.push_str(&format!("\t\t\t\t<td>{}</td>\n", name));
+        buf.push_str(&format!("\t\t\t\t<td>{}</td>\n", value));
         buf.push_str("\t\t\t</tr>\n");
     }
+
+    buf.push_str("\t\t\t<tr class=\"sep\"></tr>\n");
 
     if let Ok(info) = statvfs::statvfs(*INTERNAL_CARD_ROOT) {
         let fbs = info.fragment_size() as u64;
