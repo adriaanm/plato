@@ -250,7 +250,14 @@ fn known_hubs(config: &Config) -> Vec<SocketAddr> {
         // first address is a coin flip.  They are tried in order and the
         // winner is cached, so this costs something once and nothing after.
         match text.to_socket_addrs() {
-            Ok(addresses) => addresses.for_each(&mut push),
+            Ok(addresses) => {
+                // IPv4 first.  This reader has no IPv6 route, so every AAAA
+                // answer is an immediate EAFNOSUPPORT -- harmless, but it puts
+                // dead candidates ahead of live ones in the log and in the
+                // order things are tried.
+                let (v4, v6): (Vec<_>, Vec<_>) = addresses.partition(SocketAddr::is_ipv4);
+                v4.into_iter().chain(v6).for_each(&mut push);
+            },
             Err(e) => eprintln!("hub = {}: {}", config.hub, e),
         }
     }

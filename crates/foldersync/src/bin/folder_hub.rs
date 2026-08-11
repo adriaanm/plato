@@ -54,6 +54,20 @@ fn main() {
         },
     };
 
+    // List the root before announcing anything.  On macOS a launchd agent
+    // reading a TCC-protected directory (~/Documents, ~/Desktop, ~/Downloads)
+    // does not fail -- it *blocks*, and the only symptom is that every request
+    // times out with the server apparently healthy.  Doing the read here means
+    // a log that stops before "serving" names the problem.
+    match fs::read_dir(&config.root) {
+        Ok(listing) => println!("{} entries in {}",
+                                listing.count(), config.root.display()),
+        Err(e) => {
+            eprintln!("can't read {}: {}", config.root.display(), e);
+            process::exit(1);
+        },
+    }
+
     println!("serving {} on port {}, discovery on {}",
              config.root.display(), config.port, config.disco_port);
 

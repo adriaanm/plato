@@ -71,6 +71,14 @@ notes and whatever else accumulates. Subdirectories are mirrored.
 There is no write path. A request is served only if its canonicalized path is
 still inside `--root`, which also covers symlinks pointing out of the folder.
 
+**On macOS, do not serve a folder under `~/Documents`, `~/Desktop` or
+`~/Downloads`.** Those are TCC-protected, and a background job reading one does
+not fail — it *blocks*, waiting for a consent dialog nobody will ever see. The
+hub then looks perfectly healthy: it binds, it answers unauthenticated requests
+instantly with 403, and every real request times out. The startup listing exists
+to make that visible — a log that stops before `serving` is this and nothing
+else.
+
 `--token` is a shared secret checked on both the discovery probe and every HTTP
 request. A bad token is answered with silence on UDP and `403` on TCP. It is a
 LAN convenience, not a security boundary — the traffic is plaintext.
