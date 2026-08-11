@@ -1,0 +1,20 @@
+[package]
+name = "foldersync"
+version = "0.1.0"
+edition = "2021"
+description = "Mirror a folder from a computer on the LAN into a Plato library, as a fetcher hook"
+
+# Deliberately dependency-free: std only, on both ends.  See README.md --
+# the device this was written for runs Linux 3.0.35 with a 2023 clock and an
+# empty CA store, so the fewer moving parts in the transport the better.
+[dependencies]
+
+# The device side: spawned by Plato when the user enters the hooked directory.
+[[bin]]
+name = "folder_fetcher"
+path = "src/bin/folder_fetcher.rs"
+
+# The computer side: serves a folder read-only and answers discovery probes.
+[[bin]]
+name = "folder_hub"
+path = "src/bin/folder_hub.rs"
