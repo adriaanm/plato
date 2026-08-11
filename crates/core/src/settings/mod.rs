@@ -158,8 +158,42 @@ pub struct Settings {
     pub dictionary: DictionarySettings,
     pub sketch: SketchSettings,
     pub calculator: CalculatorSettings,
+    pub sync: SyncSettings,
     pub battery: BatterySettings,
     pub frontlight_levels: LightLevels,
+}
+
+/// The folder-sync application: mirror a folder from a computer on the LAN
+/// into the library.  See `crates/foldersync`.
+///
+/// Deliberately *not* a `Hook`: a hook fires on navigation, which makes every
+/// glance at a directory start a network operation, and leaving the directory
+/// -- opening a document, say -- kills the transfer.  Syncing is something you
+/// ask for, so it lives on the Applications menu instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct SyncSettings {
+    /// The fetcher program, relative to Plato's working directory.
+    pub program: PathBuf,
+    /// Where fetched documents land, relative to the library root.
+    pub path: PathBuf,
+}
+
+impl Default for SyncSettings {
+    fn default() -> Self {
+        SyncSettings {
+            program: PathBuf::from("bin/folder_fetcher/folder_fetcher"),
+            path: PathBuf::default(),
+        }
+    }
+}
+
+impl SyncSettings {
+    /// Whether to offer the app at all.  Asked when the menu is built, so a
+    /// reader with no fetcher installed never sees an entry that cannot work.
+    pub fn is_available(&self) -> bool {
+        crate::helpers::is_installed(&self.program)
+    }
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -607,6 +641,7 @@ impl Default for Settings {
             dictionary: DictionarySettings::default(),
             sketch: SketchSettings::default(),
             calculator: CalculatorSettings::default(),
+            sync: SyncSettings::default(),
             battery: BatterySettings::default(),
             frontlight_levels: LightLevels::default(),
             frontlight_presets: Vec::new(),

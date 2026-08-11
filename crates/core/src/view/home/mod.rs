@@ -22,7 +22,7 @@ use crate::library::Library;
 use crate::framebuffer::{Framebuffer, UpdateMode};
 use crate::metadata::{Info, Metadata, SortMethod, BookQuery, SimpleStatus, sort};
 use crate::view::{View, Event, Hub, Bus, RenderQueue, RenderData};
-use crate::view::{Id, ID_FEEDER, ViewId, EntryId, EntryKind};
+use crate::view::{Id, ID_FEEDER, ViewId, EntryId, EntryKind, AppCmd};
 use crate::view::{SMALL_BAR_HEIGHT, BIG_BAR_HEIGHT, THICKNESS_MEDIUM};
 use crate::settings::{Hook, LibraryMode, FirstColumn, SecondColumn};
 use crate::view::common::{toggle_main_menu, toggle_battery_menu, toggle_clock_menu};
@@ -72,6 +72,10 @@ pub struct Home {
 struct Fetcher {
     path: PathBuf,
     full_path: PathBuf,
+    /// Started by the user from the Applications menu rather than by walking
+    /// into a hooked directory, and therefore not the business of navigation:
+    /// `terminate_fetchers` leaves these alone.
+    manual: bool,
     process: Child,
     sort_method: Option<SortMethod>,
     first_column: Option<FirstColumn>,
@@ -1249,6 +1253,9 @@ impl Home {
 
     fn terminate_fetchers(&mut self, path: &Path, update: bool, hub: &Hub, context: &mut Context) {
         self.background_fetchers.retain(|id, fetcher| {
+            if fetcher.manual {
+                return true;
+            }
             if fetcher.full_path == path {
                 unsafe { libc::kill(*id as libc::pid_t, libc::SIGTERM) };
                 fetcher.process.wait().ok();
@@ -1300,7 +1307,8 @@ impl Home {
                     hub.send(Event::Select(EntryId::SecondColumn(second_column))).ok();
                 }
                 self.background_fetchers.insert(process.id(),
-                                                Fetcher { path: hook.path.clone(), full_path: save_path, process,
+                                                Fetcher { path: hook.path.clone(), full_path: save_path,
+                                                          manual: false, process,
                                                           sort_method, first_column, second_column });
             },
             Err(e) => {
@@ -1309,6 +1317,43 @@ impl Home {
                 // device can read.
                 eprintln!("Can't spawn {}: {:#}.", hook.program.display(), e);
                 hub.send(Event::Notify(format!("Can't run {}.", hook.program.display()))).ok();
+            },
+        }
+    }
+
+    /// Start the folder-sync app.  Same program and same protocol as a hook
+    /// fetcher -- only the trigger differs, and that is the whole point: this
+    /// one runs because the user asked, and keeps running while they navigate.
+    fn start_sync(&mut self, hub: &Hub, context: &mut Context) {
+        let settings = context.settings.sync.clone();
+        let save_path = context.library.home.join(&settings.path);
+
+        if self.background_fetchers.values().any(|fetcher| fetcher.manual) {
+            hub.send(Event::Notify("Already syncing.".to_string())).ok();
+            return;
+        }
+
+        if let Err(e) = fs::create_dir_all(&save_path) {
+            eprintln!("Can't create {}: {:#}.", save_path.display(), e);
+            hub.send(Event::Notify(format!("Can't create {}.", settings.path.display()))).ok();
+            return;
+        }
+
+        let library_path = context.library.home.clone();
+        match self.spawn_child(&library_path, &save_path, &settings.program,
+                               context.settings.wifi, context.online, hub) {
+            Ok(process) => {
+                self.background_fetchers.insert(process.id(),
+                                                Fetcher { path: settings.path.clone(),
+                                                          full_path: save_path,
+                                                          manual: true, process,
+                                                          sort_method: None,
+                                                          first_column: None,
+                                                          second_column: None });
+            },
+            Err(e) => {
+                eprintln!("Can't spawn {}: {:#}.", settings.program.display(), e);
+                hub.send(Event::Notify(format!("Can't run {}.", settings.program.display()))).ok();
             },
         }
     }
@@ -1712,6 +1757,10 @@ impl View for Home {
             },
             Event::Device(DeviceEvent::Button { code: ButtonCode::Forward, status: ButtonStatus::Pressed, .. }) => {
                 self.go_to_neighbor(CycleDir::Next, hub, rq, context);
+                true
+            },
+            Event::Select(EntryId::Launch(AppCmd::Sync)) => {
+                self.start_sync(hub, context);
                 true
             },
             Event::Device(DeviceEvent::NetUp) => {

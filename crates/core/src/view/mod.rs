@@ -376,6 +376,10 @@ pub enum AppCmd {
     },
     TouchEvents,
     RotationValues,
+    /// Mirror a folder from a computer on the LAN into the library.  Unlike
+    /// the others this opens no view: it starts a background fetcher and
+    /// reports through notifications.
+    Sync,
 }
 
 impl AppCmd {

@@ -74,7 +74,8 @@ pub fn transfer_notifications(view1: &mut dyn View, view2: &mut dyn View, rq: &m
 pub fn application_entries(is_available: impl Fn(&AppCmd) -> bool) -> Vec<EntryKind> {
     let apps = [("Dictionary", AppCmd::Dictionary { query: String::new(), language: String::new() }),
                 ("Calculator", AppCmd::Calculator),
-                ("Sketch", AppCmd::Sketch)];
+                ("Sketch", AppCmd::Sketch),
+                ("Sync", AppCmd::Sync)];
     let tools = [("Touch Events", AppCmd::TouchEvents),
                  ("Rotation Values", AppCmd::RotationValues)];
 
@@ -131,7 +132,12 @@ pub fn toggle_main_menu(view: &mut dyn View, rect: Rectangle, enable: Option<boo
                                    n == rotation)
         ).collect::<Vec<EntryKind>>();
 
-        let apps = application_entries(AppCmd::is_available);
+        // Sync's availability depends on settings, not just on the binary, so
+        // it cannot be answered by `AppCmd::is_available` alone.
+        let apps = application_entries(|cmd| match cmd {
+            AppCmd::Sync => context.settings.sync.is_available(),
+            cmd => cmd.is_available(),
+        });
         let mut entries = vec![EntryKind::Command("About".to_string(),
                                                   EntryId::About),
                                EntryKind::Command("System Info".to_string(),
@@ -305,7 +311,7 @@ mod tests {
     #[test]
     fn every_app_is_offered_when_every_helper_is_installed() {
         assert_eq!(labels(&application_entries(|_| true)),
-                   ["Dictionary", "Calculator", "Sketch", "---",
+                   ["Dictionary", "Calculator", "Sketch", "Sync", "---",
                     "Touch Events", "Rotation Values"]);
     }
 
@@ -314,7 +320,8 @@ mod tests {
     fn an_app_with_a_missing_helper_is_not_offered() {
         let entries = application_entries(|cmd| *cmd != AppCmd::Calculator);
         assert_eq!(labels(&entries),
-                   ["Dictionary", "Sketch", "---", "Touch Events", "Rotation Values"]);
+                   ["Dictionary", "Sketch", "Sync", "---",
+                    "Touch Events", "Rotation Values"]);
     }
 
     /// Filtering must not leave the rule it was separating from behind.

@@ -459,6 +459,16 @@ fn main() -> Result<(), Error> {
                         AppCmd::RotationValues => {
                             Some(Box::new(RotationValues::new(context.fb.rect(), &mut rq, &mut context)) as Box<dyn View>)
                         },
+                        // Opens no view; Home owns the fetcher.  See app.rs.
+                        AppCmd::Sync => {
+                            if view.is::<Home>() {
+                                view.handle_event(&Event::Select(EntryId::Launch(AppCmd::Sync)),
+                                                  &tx, &mut bus, &mut rq, &mut context);
+                            } else {
+                                tx.send(Event::Notify("Sync from the Home view.".to_string())).ok();
+                            }
+                            None
+                        },
                     };
                     if let Some(mut next_view) = next_view {
                         transfer_notifications(view.as_mut(), next_view.as_mut(), &mut rq, &mut context);

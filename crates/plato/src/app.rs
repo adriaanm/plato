@@ -943,6 +943,20 @@ pub fn run() -> Result<(), Error> {
                     AppCmd::RotationValues => {
                         Some(Box::new(RotationValues::new(context.fb.rect(), &mut rq, &mut context)) as Box<dyn View>)
                     },
+                    // Sync opens no view.  It starts a background fetcher that
+                    // Home owns -- Home is what knows the library, receives the
+                    // fetcher's addDocument events and forwards NetUp to it --
+                    // and reports through notifications, so the reader stays
+                    // where it is.
+                    AppCmd::Sync => {
+                        if view.is::<Home>() {
+                            view.handle_event(&Event::Select(EntryId::Launch(AppCmd::Sync)),
+                                              &tx, &mut bus, &mut rq, &mut context);
+                        } else {
+                            tx.send(Event::Notify("Sync from the Home view.".to_string())).ok();
+                        }
+                        None
+                    },
                 };
 
                 if let Some(mut next_view) = next_view {
