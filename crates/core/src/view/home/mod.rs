@@ -76,6 +76,11 @@ struct Fetcher {
     /// into a hooked directory, and therefore not the business of navigation:
     /// `terminate_fetchers` leaves these alone.
     manual: bool,
+    /// Whether WiFi was already on when this started.  If it was not, the
+    /// radio was turned on for this sync and goes off again when it ends --
+    /// WiFi exists here to serve a sync and nothing else.  If the user had it
+    /// on already, their choice is left alone.
+    wifi_before: bool,
     process: Child,
     sort_method: Option<SortMethod>,
     first_column: Option<FirstColumn>,
@@ -1308,7 +1313,7 @@ impl Home {
                 }
                 self.background_fetchers.insert(process.id(),
                                                 Fetcher { path: hook.path.clone(), full_path: save_path,
-                                                          manual: false, process,
+                                                          manual: false, wifi_before: true, process,
                                                           sort_method, first_column, second_column });
             },
             Err(e) => {
@@ -1346,7 +1351,9 @@ impl Home {
                 self.background_fetchers.insert(process.id(),
                                                 Fetcher { path: settings.path.clone(),
                                                           full_path: save_path,
-                                                          manual: true, process,
+                                                          manual: true,
+                                                          wifi_before: context.settings.wifi,
+                                                          process,
                                                           sort_method: None,
                                                           first_column: None,
                                                           second_column: None });
@@ -1791,13 +1798,24 @@ impl View for Home {
                 true
             },
             Event::CheckFetcher(id) => {
-                if let Some(fetcher) = self.background_fetchers.get_mut(&id) {
+                // REMOVED from the map, not just inspected.  Upstream relies on
+                // `terminate_fetchers` to reap on navigation, which never fires
+                // for a manual sync -- so a finished one stayed in the map
+                // forever and every later attempt answered "Already syncing."
+                if let Some(mut fetcher) = self.background_fetchers.remove(&id) {
                     if let Ok(exit_status) = fetcher.process.wait() {
                         if !exit_status.success() {
                             let msg = format!("{}: abnormal process termination.", fetcher.path.display());
                             let notif = Notification::new(msg, hub, rq, context);
                             self.children.push(Box::new(notif) as Box<dyn View>);
                         }
+                    }
+
+                    // The radio goes back to how we found it.  Only when this
+                    // sync is what turned it on: a user who enabled WiFi
+                    // themselves did not ask us to undo that.
+                    if fetcher.manual && !fetcher.wifi_before && context.settings.wifi {
+                        hub.send(Event::SetWifi(false)).ok();
                     }
                 }
                 true

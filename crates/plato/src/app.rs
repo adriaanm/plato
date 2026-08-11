@@ -669,6 +669,21 @@ pub fn run() -> Result<(), Error> {
             Event::PrepareSuspend => {
                 tasks.retain(|task| task.id != TaskId::PrepareSuspend);
                 wait_for_all(&mut updating, &mut context);
+                // Kindle fork: WiFi exists here only to serve a sync, and a
+                // sync asks for it itself. So this turns the radio off and
+                // LEAVES it off -- clearing settings.wifi is what stops the
+                // resume path bringing it straight back up, and it happens
+                // before the settings are written so the decision survives.
+                // Synchronous on purpose, unlike every other WiFi call: we are
+                // about to suspend, and a thread would simply be frozen too.
+                if context.settings.wifi {
+                    Command::new("scripts/wifi-disable.sh")
+                            .status()
+                            .ok();
+                    context.settings.wifi = false;
+                    context.online = false;
+                }
+
                 let path = Path::new(SETTINGS_PATH);
                 save_toml(&context.settings, path).map_err(|e| eprintln!("Can't save settings: {:#}.", e)).ok();
                 context.library.flush();
@@ -677,12 +692,6 @@ pub fn run() -> Result<(), Error> {
                     context.settings.frontlight_levels = context.frontlight.levels();
                     context.frontlight.set_intensity(0.0);
                     context.frontlight.set_warmth(0.0);
-                }
-                if context.settings.wifi {
-                    Command::new("scripts/wifi-disable.sh")
-                            .status()
-                            .ok();
-                    context.online = false;
                 }
                 // https://github.com/koreader/koreader/commit/71afe36
                 schedule_task(TaskId::Suspend, Event::Suspend,
@@ -778,6 +787,21 @@ pub fn run() -> Result<(), Error> {
                     }
                     view = item.view;
                 }
+                // Kindle fork: WiFi exists here only to serve a sync, and a
+                // sync asks for it itself. So this turns the radio off and
+                // LEAVES it off -- clearing settings.wifi is what stops the
+                // resume path bringing it straight back up, and it happens
+                // before the settings are written so the decision survives.
+                // Synchronous on purpose, unlike every other WiFi call: we are
+                // about to suspend, and a thread would simply be frozen too.
+                if context.settings.wifi {
+                    Command::new("scripts/wifi-disable.sh")
+                            .status()
+                            .ok();
+                    context.settings.wifi = false;
+                    context.online = false;
+                }
+
                 let path = Path::new(SETTINGS_PATH);
                 save_toml(&context.settings, path)
                          .map_err(|e| eprintln!("Can't save settings: {:#}.", e)).ok();
@@ -787,12 +811,6 @@ pub fn run() -> Result<(), Error> {
                     context.settings.frontlight_levels = context.frontlight.levels();
                     context.frontlight.set_intensity(0.0);
                     context.frontlight.set_warmth(0.0);
-                }
-                if context.settings.wifi {
-                    Command::new("scripts/wifi-disable.sh")
-                            .status()
-                            .ok();
-                    context.online = false;
                 }
 
                 let interm = Intermission::new(context.fb.rect(), IntermKind::Share, &context);
