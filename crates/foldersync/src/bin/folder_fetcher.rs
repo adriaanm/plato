@@ -29,7 +29,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, BufRead, Write};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::sync::mpsc;
@@ -44,12 +44,13 @@ const CONFIG_NAME: &str = "folder_fetcher.conf";
 const CACHE_NAME: &str = ".last-hub";
 
 struct Config {
-    /// A hub address to try before broadcasting, as `host:port`.
+    /// The hub, as `host` or `host:port`.  A name is resolved every run, so
+    /// prefer one: addresses move, names do not.
     ///
     /// Discovery is the convenience, not the contract: plenty of access points
     /// decline to forward broadcast between clients, and on one of those the
     /// probe leaves the reader and is never seen again while ordinary unicast
-    /// works perfectly.  Naming the address makes the sync work anyway.
+    /// works perfectly.  Naming the hub makes the sync work anyway.
     hub: String,
     disco_port: u16,
     token: String,
@@ -60,6 +61,9 @@ struct Config {
     /// How long to wait for `network up` after asking for WiFi.
     wifi_wait: u64,
     timeout: u64,
+    /// Budget per *candidate* address.  Deliberately short: these are guesses,
+    /// and a name can resolve to several dead ones before the live one.
+    probe_timeout: u64,
 }
 
 impl Default for Config {
@@ -71,6 +75,7 @@ impl Default for Config {
             set_time: true,
             wifi_wait: 60,
             timeout: 20,
+            probe_timeout: 4,
         }
     }
 }
@@ -198,7 +203,7 @@ fn reach_hub(config: &Config, timeout: Duration) -> io::Result<(SocketAddr, Stri
         // Short connect budget: these are guesses, and a wrong one must not
         // spend the whole timeout before the probe gets its turn.
         match http_get_string(address, "/manifest", &config.token,
-                              Duration::from_secs(4)) {
+                              Duration::from_secs(config.probe_timeout)) {
             Ok(manifest) => return Ok((address, manifest)),
             Err(e) => {
                 eprintln!("{} did not answer: {}", address, e);
@@ -240,9 +245,13 @@ fn known_hubs(config: &Config) -> Vec<SocketAddr> {
         } else {
             format!("{}:{}", config.hub, DEFAULT_HTTP_PORT)
         };
-        match text.parse() {
-            Ok(address) => push(address),
-            Err(..) => eprintln!("hub = {}: not an address", config.hub),
+        // Resolved every run, and *every* answer is kept: a home router hands
+        // out a name's stale leases alongside its live one, so taking only the
+        // first address is a coin flip.  They are tried in order and the
+        // winner is cached, so this costs something once and nothing after.
+        match text.to_socket_addrs() {
+            Ok(addresses) => addresses.for_each(&mut push),
+            Err(e) => eprintln!("hub = {}: {}", config.hub, e),
         }
     }
 
@@ -411,6 +420,7 @@ fn load_config() -> Config {
             "set_time" => config.set_time = value == "true",
             "wifi_wait" => if let Ok(v) = value.parse() { config.wifi_wait = v },
             "timeout" => if let Ok(v) = value.parse() { config.timeout = v },
+            "probe_timeout" => if let Ok(v) = value.parse() { config.probe_timeout = v },
             other => eprintln!("{}: unknown key {}", CONFIG_NAME, other),
         }
     }

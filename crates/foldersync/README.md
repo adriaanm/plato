@@ -103,7 +103,11 @@ Optional `folder_fetcher.conf`, read from the binary's own directory:
 `.last-hub` is written alongside it and holds the last address that worked.
 Delete it to force a fresh discovery.
 
-**Set `hub` if discovery does not find the computer.** Known addresses — the
+**Set `hub` if discovery does not find the computer.** Prefer a *name* —
+addresses move, names do not, and the name is resolved on every run. Every
+address the name resolves to is tried, in order: a home router will happily
+serve a name's stale leases alongside its live one, so taking only the first
+answer is a coin flip. Known addresses — the
 cached one, then `hub` — are tried before any broadcast goes out, so on a stable
 network the sync starts instantly and on an access point that declines to
 forward broadcast between clients it works at all. That case is real and was
