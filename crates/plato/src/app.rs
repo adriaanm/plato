@@ -184,9 +184,11 @@ fn resume(id: TaskId, tasks: &mut Vec<Task>, view: &mut dyn View, hub: &Sender<E
             context.frontlight.set_intensity(levels.intensity);
         }
         if context.settings.wifi {
-            Command::new("scripts/wifi-enable.sh")
-                    .status()
-                    .ok();
+            // Kindle fork: report the link back, as at startup and in set_wifi.
+            if Command::new("scripts/wifi-enable.sh")
+                       .status().map(|s| s.success()).unwrap_or(false) {
+                hub.send(Event::Device(DeviceEvent::NetUp)).ok();
+            }
         }
     }
     if id == TaskId::Suspend || id == TaskId::PrepareSuspend {
@@ -213,15 +215,36 @@ fn power_off(view: &mut dyn View, history: &mut Vec<HistoryItem>, updating: &mut
     context.fb.update(interm.rect(), UpdateMode::Full).ok();
 }
 
-fn set_wifi(enable: bool, context: &mut Context) {
+// Kindle fork: the enable path reports back.
+//
+// Upstream relies on a DeviceEvent::NetUp arriving on its own once the link
+// comes up. That event is parsed out of /tmp/nickel-hardware-status (Kobo's
+// nickel writes it), which does not exist here -- parse_usb_events() opens it,
+// fails, and the thread exits, so on the Kindle NetUp is NEVER emitted. Without
+// this, enabling WiFi would set context.online = false forever and show no
+// notification, i.e. look like nothing happened.
+//
+// So: run the script, and synthesise NetUp ourselves when it succeeds. The
+// script blocks until associated + addressed (2 s typical, 13 s worst measured),
+// which is why its exit status is worth waiting for. On failure we roll the
+// setting back rather than leave the UI claiming WiFi is on.
+fn set_wifi(enable: bool, hub: &Sender<Event>, context: &mut Context) {
     if context.settings.wifi == enable {
         return;
     }
     context.settings.wifi = enable;
     if context.settings.wifi {
-        Command::new("scripts/wifi-enable.sh")
-                .status()
-                .ok();
+        let ok = Command::new("scripts/wifi-enable.sh")
+                         .status()
+                         .map(|s| s.success())
+                         .unwrap_or(false);
+        if ok {
+            hub.send(Event::Device(DeviceEvent::NetUp)).ok();
+        } else {
+            context.settings.wifi = false;
+            context.online = false;
+            hub.send(Event::Notify("Couldn't bring WiFi up.".to_string())).ok();
+        }
     } else {
         Command::new("scripts/wifi-disable.sh")
                 .status()
@@ -337,8 +360,13 @@ pub fn run() -> Result<(), Error> {
 
     context.fb.set_inverted(context.settings.inverted);
 
+    // Kindle fork: same NetUp synthesis as set_wifi -- see its comment. Without
+    // it, starting with wifi = true leaves context.online false forever, so the
+    // UI never learns it is online even though the link is up.
     if context.settings.wifi {
-        Command::new("scripts/wifi-enable.sh").status().ok();
+        if Command::new("scripts/wifi-enable.sh").status().map(|s| s.success()).unwrap_or(false) {
+            tx.send(Event::Device(DeviceEvent::NetUp)).ok();
+        }
     } else {
         Command::new("scripts/wifi-disable.sh").status().ok();
     }
@@ -445,8 +473,18 @@ pub fn run() -> Result<(), Error> {
                         let essid = Command::new("scripts/essid.sh").output()
                                             .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
                                             .unwrap_or_default();
-                        let notif = Notification::new(format!("Network is up ({}, {}).", ip, essid),
-                                                      &tx, &mut rq, &mut context);
+                        // Kindle fork: signal strength, from wpa_cli signal_poll.
+                        // Empty when not associated, so an empty string means
+                        // "no reading" rather than an error to render.
+                        let rssi = Command::new("scripts/signal.sh").output()
+                                           .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
+                                           .unwrap_or_default();
+                        let msg = if rssi.is_empty() {
+                            format!("Network is up ({}, {}).", ip, essid)
+                        } else {
+                            format!("Network is up ({}, {}, {} dBm).", ip, essid, rssi)
+                        };
+                        let notif = Notification::new(msg, &tx, &mut rq, &mut context);
                         context.online = true;
                         view.children_mut().push(Box::new(notif) as Box<dyn View>);
                         if view.is::<Home>() {
@@ -1027,10 +1065,10 @@ pub fn run() -> Result<(), Error> {
                 }
             },
             Event::SetWifi(enable) => {
-                set_wifi(enable, &mut context);
+                set_wifi(enable, &tx, &mut context);
             },
             Event::Select(EntryId::ToggleWifi) => {
-                set_wifi(!context.settings.wifi, &mut context);
+                set_wifi(!context.settings.wifi, &tx, &mut context);
             },
             Event::Select(EntryId::TakeScreenshot) => {
                 let name = Local::now().format("screenshot-%Y%m%d_%H%M%S.png");

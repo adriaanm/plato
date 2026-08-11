@@ -1193,3 +1193,56 @@ python3 xbuild.py host --test --package plato-core     109 passed, 0 failed
 python3 xbuild.py kindle                               both binaries, ABI gate passed
   plato          50 793 KiB    e_flags=0x5000200
 ```
+
+## WiFi: the event that never arrives
+
+`crates/plato/src/app.rs`, three sites, all small. Upstream Plato learns that
+the network came up from `DeviceEvent::NetUp`, which `parse_usb_events()` in
+`crates/core/src/input.rs` reads out of **`/tmp/nickel-hardware-status`** — a
+pipe Kobo's `nickel` writes. On the Kindle that path does not exist, so the
+function's `open()` fails, the thread returns immediately, and **`NetUp` is
+never emitted at all**.
+
+The consequence is not a missing notification, it is a wrong belief:
+`context.online` stays `false` forever, so every part of the UI that gates on
+"are we online" behaves as if WiFi were off while the link is up.
+
+The fork's `wifi-enable.sh` blocks until the interface is associated *and*
+addressed (2 s typical, 13 s worst measured — it drives `wpa_supplicant` and
+`udhcpc` itself, see `docs/wifi.md` in the platokin repo), so its exit status is
+a truthful answer to "is the network up?". So each of the three call sites now
+checks it and synthesises the event upstream would have received:
+
+- `set_wifi()` — takes a `&Sender<Event>` now. On success sends
+  `Event::Device(DeviceEvent::NetUp)`; **on failure it rolls the setting back**
+  to `false` and notifies, rather than leaving the UI claiming WiFi is on.
+- startup (`if context.settings.wifi { … }`) — same synthesis.
+- `resume()` after suspend — same, via the `hub` it already has.
+
+Mergeable upstream? The `NetUp` synthesis is Kindle-specific. The rollback in
+`set_wifi` is arguably an upstream bug fix on its own (upstream ignores the
+script's exit status entirely and will happily show WiFi as on after a failed
+enable), and would be offered separately.
+
+### Signal strength
+
+The `NetUp` arm's notification gains a third field when a reading is available:
+
+```
+Network is up (192.168.178.190, <essid>, -56 dBm).
+```
+
+from a new `scripts/signal.sh` (`wpa_cli signal_poll` → `RSSI`), which prints
+nothing when not associated so "no reading" needs no error path. This is the
+"+ signal strength" half of the platokin repo's `WIFI-ON-OFF-SIGNAL` ticket.
+A persistent indicator in the status bar was deliberately not added: the number
+is most useful at the moment you connect, and the notification costs no screen
+real estate the rest of the time.
+
+### What is deliberately *not* here
+
+**No auto-connect at boot.** Adriaan's call, 2026-08-11: WiFi costs power, so
+Plato keeps `wifi = false` as the default and the user turns it on when they
+want to sync. That makes Plato the single owner of the WiFi state — worth
+stating because the alternative (a boot-time flag in the platokin repo's
+`ezssh-boot.sh`) would fight Plato's startup `wifi-disable.sh` on every launch.
