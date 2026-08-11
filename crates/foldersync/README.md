@@ -1,27 +1,33 @@
 # foldersync
 
-Mirror a folder from a computer on the LAN into a Plato library, as a
-[fetcher hook](../../doc/HOOKS.md).
+Mirror a folder from a computer on the LAN into a Plato library, from the
+Applications menu.
 
 Two binaries, no dependencies beyond `std` on either side:
 
 - **`folder_hub`** runs on the computer that holds the documents. It serves
   one folder read-only over HTTP and answers UDP discovery probes.
-- **`folder_fetcher`** runs on the reader. Plato starts it when the user
-  enters the hooked directory and `SIGTERM`s it when they leave, so the sync
-  lasts exactly as long as the user is looking at the folder — and on a device
-  where the radio is off by default, that is also exactly how long it is on.
+- **`folder_fetcher`** runs on the reader, started from **Applications → Sync**.
+  It speaks Plato's [fetcher protocol](../../doc/HOOKS.md), including asking for
+  WiFi, so on a device where the radio is off by default the radio is on for
+  exactly the length of the sync.
 
 ```
-                tap "Papers"
+            Applications ▸ Sync
   Plato ──────────────────────────► folder_fetcher
         ◄── {"type":"setWifi"} ────
         ─── {"network":"up"} ─────►
-                                      │  UDP broadcast: where are you?
+                                      │  who is serving? (cache, config, probe)
                                       ▼
                                    folder_hub ──► GET /manifest, GET /file/…
         ◄── {"addDocument"} × n ───
 ```
+
+**It is an application, not a `Hook`** — and that is a correction, not a
+preference. Attached as a hook it ran on *navigation*: every glance at the
+directory started a network operation, and the ordinary way out of the
+directory — opening a document — killed the transfer and reported it to the
+user as "abnormal process termination". Syncing is something you ask for.
 
 ## Why it looks like this
 
@@ -71,18 +77,22 @@ LAN convenience, not a security boundary — the traffic is plaintext.
 
 ## Installing the fetcher
 
-Put the binary in the library, and point a hook at it:
+Put the binary somewhere under Plato's working directory and name it in
+`Settings.toml`:
 
 ```toml
-[[libraries.hooks]]
-path = "Papers"
+[sync]
 program = "bin/folder_fetcher/folder_fetcher"
-sort-method = "added"
+path = "papers"          # where documents land, relative to the library root
 ```
+
+The Applications menu offers **Sync** only when `program` exists, so a reader
+without the fetcher never sees an entry that cannot work.
 
 Optional `folder_fetcher.conf`, read from the binary's own directory:
 
 ```
+# hub        =          # host[:port] to try before broadcasting
 # disco_port = 30303
 # token =
 # set_time  = true    # adopt the hub's clock when ours is off by over an hour
@@ -92,6 +102,13 @@ Optional `folder_fetcher.conf`, read from the binary's own directory:
 
 `.last-hub` is written alongside it and holds the last address that worked.
 Delete it to force a fresh discovery.
+
+**Set `hub` if discovery does not find the computer.** Known addresses — the
+cached one, then `hub` — are tried before any broadcast goes out, so on a stable
+network the sync starts instantly and on an access point that declines to
+forward broadcast between clients it works at all. That case is real and was
+what this ran into first: unicast to the hub worked perfectly while every probe
+vanished.
 
 ## Protocol
 
@@ -105,7 +122,7 @@ hub    -> back to the sender      PLATOSYNC1 OFFER <http-port> <epoch>
 The manifest, `GET /manifest`, tab-separated:
 
 ```
-#PLATOSYNC1 <epoch> <YYYY-MM-DD HH:MM:SS>
+#PLATOSYNC1 <epoch> <YYYY-MM-DD HH:MM:SS>      (the time is UTC)
 <size>	<mtime-epoch>	<relative/path.epub>
 ```
 

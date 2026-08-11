@@ -44,6 +44,13 @@ const CONFIG_NAME: &str = "folder_fetcher.conf";
 const CACHE_NAME: &str = ".last-hub";
 
 struct Config {
+    /// A hub address to try before broadcasting, as `host:port`.
+    ///
+    /// Discovery is the convenience, not the contract: plenty of access points
+    /// decline to forward broadcast between clients, and on one of those the
+    /// probe leaves the reader and is never seen again while ordinary unicast
+    /// works perfectly.  Naming the address makes the sync work anyway.
+    hub: String,
     disco_port: u16,
     token: String,
     /// Take the hub's clock when ours disagrees.  On a device whose RTC never
@@ -58,6 +65,7 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            hub: String::new(),
             disco_port: DEFAULT_DISCO_PORT,
             token: String::new(),
             set_time: true,
@@ -99,21 +107,7 @@ fn run(config: &Config, library_path: &Path, save_path: &Path,
     }
 
     let timeout = Duration::from_secs(config.timeout);
-    let (address, from_cache) = find_hub(config, timeout)?;
-
-    let manifest = match http_get_string(address, "/manifest", &config.token, timeout) {
-        Ok(text) => text,
-        // A cached address that no longer answers is the common case -- the
-        // computer moved networks, or DHCP moved it.  Fall back to a probe
-        // once before giving up.
-        Err(e) if from_cache => {
-            eprintln!("cached hub {} did not answer ({}), broadcasting", address, e);
-            let (address, _) = discover_and_cache(config, timeout)?;
-            http_get_string(address, "/manifest", &config.token, timeout)?
-        },
-        Err(e) => return Err(e),
-    };
-
+    let (address, manifest) = reach_hub(config, timeout)?;
     let manifest = parse_manifest(&manifest)?;
     remember_hub(address);
 
@@ -163,8 +157,13 @@ fn run(config: &Config, library_path: &Path, save_path: &Path,
 /// network is up.
 fn wait_for_network(config: &Config, wifi: bool) -> io::Result<()> {
     if !wifi {
-        emit(r#"{"type":"setWifi","enable":true}"#);
+        // Notify FIRST.  Plato brings WiFi up on its main thread -- the hook
+        // script blocks for the whole association, measured at 8-13 s on this
+        // reader -- so any event queued after `setWifi` renders only once the
+        // radio is already up.  Ask in the other order and the tap appears to
+        // do nothing at all.
         notify("Turning WiFi on…");
+        emit(r#"{"type":"setWifi","enable":true}"#);
     }
 
     // Plato writes `{"type":"network","status":"up"}` on our stdin when the
@@ -186,23 +185,68 @@ fn wait_for_network(config: &Config, wifi: bool) -> io::Result<()> {
                                         "the network did not come up"))
 }
 
-/// The cached address first -- on a stable home network that makes the whole
-/// discovery step disappear -- then a broadcast probe.
-fn find_hub(config: &Config, timeout: Duration) -> io::Result<(SocketAddr, bool)> {
-    if let Some(address) = cached_hub() {
-        return Ok((address, true));
-    }
-    discover_and_cache(config, timeout).map(|(address, _)| (address, false))
-}
+/// Find a hub and come back with its manifest.
+///
+/// Known addresses first -- the cached one, then any configured in
+/// `folder_fetcher.conf` -- and a broadcast probe only if none of them answer.
+/// Order matters twice over: on a stable network the sync starts instantly, and
+/// on an access point that eats broadcast it works at all.
+fn reach_hub(config: &Config, timeout: Duration) -> io::Result<(SocketAddr, String)> {
+    let mut tried = Vec::new();
 
-fn discover_and_cache(config: &Config, timeout: Duration) -> io::Result<(SocketAddr, u16)> {
+    for address in known_hubs(config) {
+        // Short connect budget: these are guesses, and a wrong one must not
+        // spend the whole timeout before the probe gets its turn.
+        match http_get_string(address, "/manifest", &config.token,
+                              Duration::from_secs(4)) {
+            Ok(manifest) => return Ok((address, manifest)),
+            Err(e) => {
+                eprintln!("{} did not answer: {}", address, e);
+                tried.push(address.to_string());
+            },
+        }
+    }
+
     notify("Looking for the library…");
     let (from, port) = discover(config.disco_port, &config.token, 3,
-                                Duration::from_millis(1500))?;
+                                Duration::from_millis(1500))
+        .map_err(|e| if tried.is_empty() { e } else {
+            io::Error::new(e.kind(),
+                           format!("{} (and no answer from {})", e, tried.join(", ")))
+        })?;
+
     let address = SocketAddr::new(from.ip(), port);
-    let _ = timeout;
-    remember_hub(address);
-    Ok((address, port))
+    let manifest = http_get_string(address, "/manifest", &config.token, timeout)?;
+    Ok((address, manifest))
+}
+
+/// Addresses worth trying before making any noise on the network.
+fn known_hubs(config: &Config) -> Vec<SocketAddr> {
+    let mut hubs = Vec::new();
+    let mut push = |address: SocketAddr| {
+        if !hubs.contains(&address) {
+            hubs.push(address);
+        }
+    };
+
+    if let Some(address) = cached_hub() {
+        push(address);
+    }
+    if !config.hub.is_empty() {
+        // A bare host means the default port, which is what anyone writing the
+        // config by hand will try first.
+        let text = if config.hub.contains(':') {
+            config.hub.clone()
+        } else {
+            format!("{}:{}", config.hub, DEFAULT_HTTP_PORT)
+        };
+        match text.parse() {
+            Ok(address) => push(address),
+            Err(..) => eprintln!("hub = {}: not an address", config.hub),
+        }
+    }
+
+    hubs
 }
 
 fn cached_hub() -> Option<SocketAddr> {
@@ -361,6 +405,7 @@ fn load_config() -> Config {
 
     for (key, value) in parse_config(&read_to_string_or_empty(&beside_binary(CONFIG_NAME))) {
         match key.as_str() {
+            "hub" => config.hub = value,
             "disco_port" => if let Ok(v) = value.parse() { config.disco_port = v },
             "token" => config.token = value,
             "set_time" => config.set_time = value == "true",
