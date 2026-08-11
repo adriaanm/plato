@@ -4,6 +4,7 @@ pub mod pdf;
 pub mod epub;
 pub mod layout;
 pub mod html;
+pub mod markdown;
 
 #[cfg(feature = "djvu")]
 mod djvulibre_sys;
@@ -253,6 +254,11 @@ pub fn open<P: AsRef<Path>>(path: P) -> Option<Box<dyn Document>> {
                 EpubDocument::new(&path)
                              .map_err(|e| eprintln!("{}: {:#}.", path.as_ref().display(), e))
                              .map(|d| Box::new(d) as Box<dyn Document>).ok()
+            },
+            "md" | "markdown" => {
+                markdown::open(&path)
+                        .map_err(|e| eprintln!("{}: {:#}.", path.as_ref().display(), e))
+                        .map(|d| Box::new(d) as Box<dyn Document>).ok()
             },
             "html" | "htm" => {
                 HtmlDocument::new(&path)

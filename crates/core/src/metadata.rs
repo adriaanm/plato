@@ -816,6 +816,15 @@ pub fn extract_metadata_from_document(prefix: &Path, info: &mut Info) {
                 Err(e) => eprintln!("Can't open {}: {:#}.", info.file.path.display(), e),
             }
         },
+        "md" | "markdown" => {
+            match crate::document::markdown::open(&path) {
+                Ok(doc) => {
+                    info.title = doc.title().unwrap_or_default();
+                    info.author = doc.author().unwrap_or_default();
+                },
+                Err(e) => eprintln!("Can't open {}: {:#}.", info.file.path.display(), e),
+            }
+        },
         "html" | "htm" => {
             match HtmlDocument::new(&path) {
                 Ok(doc) => {

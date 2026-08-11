@@ -1,0 +1,130 @@
+/* Viewer stylesheet for Markdown, which reaches the engine as synthesised
+   XHTML (crates/core/src/document/markdown.rs).
+
+   Deliberately close to html.css. The differences are the ones Markdown
+   actually produces and e-ink actually needs: the engine draws no borders and
+   no backgrounds, so every separation here has to be made out of space,
+   weight and indentation. */
+
+html > head {
+	display: none;
+}
+
+a {
+	color: #444;
+}
+
+i, em, cite, var, address {
+	font-style: italic;
+}
+
+b, strong {
+	font-weight: bold;
+}
+
+/* Notes start with an h1 that repeats the title; keep it from eating a third
+   of the first page. */
+h1 {
+	font-size: 1.6em;
+	margin: 0.5em 0 0.67em 0;
+}
+
+h2 {
+	font-size: 1.3em;
+	margin: 1.2em 0 0.6em 0;
+}
+
+h3 {
+	font-size: 1.12em;
+	margin: 1.2em 0 0.5em 0;
+}
+
+h4, h5, h6 {
+	font-size: 1em;
+	font-style: italic;
+	margin: 1.2em 0 0.5em 0;
+}
+
+p {
+	margin: 0.8em 0;
+	text-indent: 0;
+}
+
+pre, code, samp, kbd {
+	font-family: monospace;
+	font-size: 0.83em;
+}
+
+/* No background to set it off, so indent it and give it air. Measured, not
+   assumed: the engine *does* wrap an over-long line inside a `pre` (it
+   continues at the block's left edge) rather than clipping it, so long code
+   lines cost legibility but never content. */
+pre {
+	margin: 0.8em 0;
+	margin-left: 1em;
+	text-align: left;
+}
+
+blockquote {
+	margin: 0.8em 0;
+	margin-left: 1.2em;
+	margin-right: 0.6em;
+	font-style: italic;
+}
+
+ul, ol {
+	margin-left: 1.5em;
+	margin-top: 0.5em;
+	margin-bottom: 0.5em;
+}
+
+li > ul, li > ol {
+	margin-top: 0;
+	margin-bottom: 0;
+}
+
+/* Markdown's thematic break, since a bordered `<hr/>` would draw nothing. */
+p.rule {
+	text-align: center;
+	margin: 1.2em 0;
+}
+
+sub, sup {
+	font-size: 0.83em;
+}
+
+sub {
+	vertical-align: sub;
+}
+
+sup {
+	vertical-align: super;
+}
+
+/* Tables get real column-width computation from the engine, but no rules, so
+   the header carries the structure on its own. Padding is tighter than
+   html.css: a 6 inch screen has no room for 0.67em on both sides of every
+   cell. */
+table {
+	margin: 0.8em 0;
+	text-align: left;
+}
+
+th {
+	font-weight: bold;
+	text-align: left;
+}
+
+th, td {
+	padding: 0.15em 0.4em 0.15em 0;
+}
+
+/* Footnote definitions, which pulldown-cmark emits at the end of the body. */
+div.footnote-definition {
+	font-size: 0.9em;
+	margin: 0.5em 0;
+}
+
+div.footnote-definition sup.footnote-definition-label {
+	font-weight: bold;
+}

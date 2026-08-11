@@ -28,7 +28,7 @@ use foldersync::*;
 
 /// Extensions Plato can open.  Everything else in the folder is ignored, so
 /// the folder can also hold notes, `.DS_Store` and whatever else accumulates.
-const KINDS: &[&str] = &["epub", "pdf", "cbz", "djvu", "fb2", "xps", "mobi", "txt", "html"];
+const KINDS: &[&str] = &["epub", "pdf", "cbz", "djvu", "fb2", "xps", "mobi", "txt", "html", "md"];
 
 struct Config {
     root: PathBuf,

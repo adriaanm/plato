@@ -112,6 +112,10 @@ impl HtmlDocument {
         self.pages.clear();
     }
 
+    pub fn set_parent<P: AsRef<Path>>(&mut self, path: P) {
+        self.parent = path.as_ref().to_path_buf();
+    }
+
     pub fn set_viewer_stylesheet<P: AsRef<Path>>(&mut self, path: P) {
         self.viewer_stylesheet = path.as_ref().to_path_buf();
         self.pages.clear();
