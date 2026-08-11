@@ -330,7 +330,8 @@ fn adopt_clock(manifest: &Manifest) {
         return;
     }
 
-    match Command::new("date").arg("-s").arg(&manifest.stamp).status() {
+    // `-u`: the stamp is UTC, and the reader's own zone is not our business.
+    match Command::new("date").arg("-u").arg("-s").arg(&manifest.stamp).status() {
         Ok(status) if status.success() => {
             eprintln!("clock was off by {} s, set to {}", drift, manifest.stamp);
             // hwclock is absent on some devices and unwritable on others;

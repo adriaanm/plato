@@ -44,10 +44,28 @@ pub fn discover(disco_port: u16, token: &str, attempts: u32,
     socket.set_read_timeout(Some(timeout))?;
 
     let probe = format!("{} DISCOVER {}", MAGIC, token);
-    let target = SocketAddrV4::new(Ipv4Addr::BROADCAST, disco_port);
+
+    // 255.255.255.255 is the obvious target and the one that fails first:
+    // sending to it needs a default route, and this reader routinely has none
+    // (its DHCP client is configured not to install one).  So aim at every
+    // directly-connected network's own broadcast address as well.
+    let mut targets = vec![SocketAddrV4::new(Ipv4Addr::BROADCAST, disco_port)];
+    targets.extend(directed_broadcasts().into_iter()
+                                        .map(|ip| SocketAddrV4::new(ip, disco_port)));
 
     for _ in 0..attempts {
-        socket.send_to(probe.as_bytes(), target)?;
+        let mut sent = false;
+        let mut last_error = None;
+        for target in &targets {
+            match socket.send_to(probe.as_bytes(), target) {
+                Ok(..) => sent = true,
+                Err(e) => last_error = Some(e),
+            }
+        }
+        if !sent {
+            return Err(last_error.unwrap_or_else(||
+                io::Error::new(io::ErrorKind::AddrNotAvailable, "nowhere to broadcast")));
+        }
 
         let mut buf = [0u8; 256];
         // Drain whatever arrives within the window; anything that isn't a
@@ -61,6 +79,42 @@ pub fn discover(disco_port: u16, token: &str, attempts: u32,
     }
 
     Err(io::Error::new(io::ErrorKind::NotFound, "no hub answered"))
+}
+
+/// Broadcast addresses of the directly-connected networks, read out of
+/// `/proc/net/route`.
+///
+/// std cannot enumerate interfaces and this crate has no libc, but the routing
+/// table is a text file on the platform that needs this, and every route with a
+/// non-zero mask and no gateway describes a network we can reach directly.
+/// Returns nothing anywhere else, which is correct: the hub always has a
+/// default route.
+fn directed_broadcasts() -> Vec<Ipv4Addr> {
+    let mut out = Vec::new();
+
+    let table = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+    for line in table.lines().skip(1) {
+        let mut columns = line.split_whitespace();
+        let (_iface, destination, gateway) = (columns.next(), columns.next(), columns.next());
+        let mask = columns.nth(4);
+
+        // Fields are little-endian hex, which is why these are reversed.
+        let parse = |v: Option<&str>| v.and_then(|v| u32::from_str_radix(v, 16).ok())
+                                       .map(u32::swap_bytes);
+
+        if let (Some(destination), Some(gateway), Some(mask)) =
+            (parse(destination), parse(gateway), parse(mask)) {
+            if mask == 0 || gateway != 0 {
+                continue;
+            }
+            let broadcast = Ipv4Addr::from(destination | !mask);
+            if !out.contains(&broadcast) {
+                out.push(broadcast);
+            }
+        }
+    }
+
+    out
 }
 
 fn parse_offer(bytes: &[u8]) -> Option<u16> {
@@ -115,7 +169,7 @@ pub fn serve_discovery(disco_port: u16, http_port: u16, token: String) -> io::Re
 // not need one.  Line 1 is a header carrying the hub's clock in two forms;
 // every later line is one file.
 //
-//   #PLATOSYNC1 <epoch> <YYYY-MM-DD HH:MM:SS>
+//   #PLATOSYNC1 <epoch> <YYYY-MM-DD HH:MM:SS>   (UTC)
 //   <size>\t<mtime-epoch>\t<relative/path.epub>
 //
 // The formatted time exists so the device can `date -s` it without owning a
@@ -132,7 +186,7 @@ pub struct Entry {
 #[derive(Debug, Clone)]
 pub struct Manifest {
     pub epoch: i64,
-    /// The hub's local time, preformatted for `date -s`.
+    /// The hub's time in UTC, preformatted for `date -u -s`.
     pub stamp: String,
     pub entries: Vec<Entry>,
 }

@@ -165,7 +165,7 @@ fn serve_file(stream: &mut TcpStream, root: &Path, relative: &str) -> io::Result
 }
 
 fn manifest(root: &Path) -> String {
-    let mut body = format!("#{} {} {}\n", MAGIC, epoch_secs(), local_stamp());
+    let mut body = format!("#{} {} {}\n", MAGIC, epoch_secs(), utc_stamp());
 
     let mut entries = Vec::new();
     collect(root, root, &mut entries);
@@ -231,31 +231,17 @@ fn is_document(path: &Path) -> bool {
         .map_or(false, |e| KINDS.contains(&e.as_str()))
 }
 
-/// Local wall-clock time as `YYYY-MM-DD HH:MM:SS`, which is what busybox
-/// `date -s` accepts.  Computed by hand: this crate has no chrono, and the
+/// **UTC** wall-clock time as `YYYY-MM-DD HH:MM:SS`, which is what busybox
+/// `date -u -s` accepts.  Computed by hand: this crate has no chrono, and the
 /// device it serves has no correct clock to check the answer against.
-fn local_stamp() -> String {
-    let epoch = epoch_secs() + local_utc_offset();
-    let (year, month, day, hour, minute, second) = civil_from_epoch(epoch);
+///
+/// UTC and not local time, learned the hard way on the first device run: the
+/// hub sent CEST, the reader was on UTC, and `date -s` -- which interprets its
+/// argument in the *reader's* zone -- duly set the clock two hours fast.
+/// Sending UTC and setting with `-u` is right whatever either end's zone is.
+fn utc_stamp() -> String {
+    let (year, month, day, hour, minute, second) = civil_from_epoch(epoch_secs());
     format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", year, month, day, hour, minute, second)
-}
-
-/// Seconds east of UTC for the current local time.  Derived by asking libc via
-/// `date`, which is present everywhere this hub runs and avoids a tz database.
-fn local_utc_offset() -> i64 {
-    let output = process::Command::new("date").arg("+%z").output();
-    let text = match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        Err(..) => return 0,
-    };
-    // "+0200" / "-0730"
-    if text.len() < 5 {
-        return 0;
-    }
-    let sign = if text.starts_with('-') { -1 } else { 1 };
-    let hours: i64 = text[1..3].parse().unwrap_or(0);
-    let minutes: i64 = text[3..5].parse().unwrap_or(0);
-    sign * (hours * 3600 + minutes * 60)
 }
 
 /// Days-from-civil, inverted -- Howard Hinnant's algorithm.  Valid for any
