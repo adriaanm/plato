@@ -341,6 +341,9 @@ pub enum Event {
         sort_by: Option<(SortMethod, bool)>,
     },
     CheckFetcher(u32),
+    /// The link failed to come up.  Kindle fork: the enable path runs off the
+    /// event loop, so its failure has to travel back as an event.
+    NetUpFailed,
     EndOfSearch,
     Finished,
     ClockTick,

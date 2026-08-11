@@ -4,6 +4,7 @@ use std::thread;
 use std::process::Command;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use plato_core::anyhow::{Error, Context as ResultExt, format_err};
@@ -185,10 +186,9 @@ fn resume(id: TaskId, tasks: &mut Vec<Task>, view: &mut dyn View, hub: &Sender<E
         }
         if context.settings.wifi {
             // Kindle fork: report the link back, as at startup and in set_wifi.
-            if Command::new("scripts/wifi-enable.sh")
-                       .status().map(|s| s.success()).unwrap_or(false) {
-                hub.send(Event::Device(DeviceEvent::NetUp)).ok();
-            }
+            // On a thread: a wake that freezes for the whole association is a
+            // wake the user reads as a crash.
+            spawn_wifi(true, hub);
         }
     }
     if id == TaskId::Suspend || id == TaskId::PrepareSuspend {
@@ -224,33 +224,56 @@ fn power_off(view: &mut dyn View, history: &mut Vec<HistoryItem>, updating: &mut
 // this, enabling WiFi would set context.online = false forever and show no
 // notification, i.e. look like nothing happened.
 //
-// So: run the script, and synthesise NetUp ourselves when it succeeds. The
-// script blocks until associated + addressed (2 s typical, 13 s worst measured),
-// which is why its exit status is worth waiting for. On failure we roll the
-// setting back rather than leave the UI claiming WiFi is on.
+// So: run the script, and synthesise NetUp ourselves when it succeeds. On
+// failure we roll the setting back rather than leave the UI claiming WiFi is on.
+//
+// OFF THE EVENT LOOP, and that part is not a refinement. The script blocks
+// until associated and addressed -- 2 s typical, 13 s worst measured -- and run
+// inline it blocked the whole UI for that long: no repaint, no notification,
+// not even the one already queued explaining what was happening. A tap on
+// Applications > Sync looked completely dead until the radio came up. Anything
+// that shells out to the network belongs on a thread.
+static WIFI_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Run a WiFi script on a thread, reporting the outcome as an event.
+///
+/// One at a time: `wifi-up.sh` stops daemons, reloads the driver module and
+/// rewrites the routing table, so two of them racing is a bad way to find out
+/// what happens. A request that arrives mid-transition is dropped, not queued
+/// -- the answer would be stale by the time it ran.
+fn spawn_wifi(enable: bool, hub: &Sender<Event>) {
+    if WIFI_BUSY.swap(true, Ordering::SeqCst) {
+        hub.send(Event::Notify("WiFi is still changing state.".to_string())).ok();
+        return;
+    }
+
+    let hub = hub.clone();
+    thread::spawn(move || {
+        let script = if enable { "scripts/wifi-enable.sh" } else { "scripts/wifi-disable.sh" };
+        let ok = Command::new(script)
+                         .status()
+                         .map(|s| s.success())
+                         .unwrap_or(false);
+        WIFI_BUSY.store(false, Ordering::SeqCst);
+
+        if enable {
+            hub.send(if ok { Event::Device(DeviceEvent::NetUp) }
+                     else { Event::NetUpFailed }).ok();
+        }
+    });
+}
+
 fn set_wifi(enable: bool, hub: &Sender<Event>, context: &mut Context) {
     if context.settings.wifi == enable {
         return;
     }
+    // Set optimistically so the menu checkbox reflects the request at once;
+    // NetUpFailed rolls it back.
     context.settings.wifi = enable;
-    if context.settings.wifi {
-        let ok = Command::new("scripts/wifi-enable.sh")
-                         .status()
-                         .map(|s| s.success())
-                         .unwrap_or(false);
-        if ok {
-            hub.send(Event::Device(DeviceEvent::NetUp)).ok();
-        } else {
-            context.settings.wifi = false;
-            context.online = false;
-            hub.send(Event::Notify("Couldn't bring WiFi up.".to_string())).ok();
-        }
-    } else {
-        Command::new("scripts/wifi-disable.sh")
-                .status()
-                .ok();
+    if !enable {
         context.online = false;
     }
+    spawn_wifi(enable, hub);
 }
 
 #[derive(PartialEq)]
@@ -364,11 +387,9 @@ pub fn run() -> Result<(), Error> {
     // it, starting with wifi = true leaves context.online false forever, so the
     // UI never learns it is online even though the link is up.
     if context.settings.wifi {
-        if Command::new("scripts/wifi-enable.sh").status().map(|s| s.success()).unwrap_or(false) {
-            tx.send(Event::Device(DeviceEvent::NetUp)).ok();
-        }
+        spawn_wifi(true, &tx);
     } else {
-        Command::new("scripts/wifi-disable.sh").status().ok();
+        spawn_wifi(false, &tx);
     }
 
     if context.settings.frontlight {
@@ -564,9 +585,7 @@ pub fn run() -> Result<(), Error> {
                                 context.settings = settings;
                             }
                             if context.settings.wifi {
-                                Command::new("scripts/wifi-enable.sh")
-                                        .status()
-                                        .ok();
+                                spawn_wifi(true, &tx);
                             }
                             if context.settings.frontlight {
                                 let levels = context.settings.frontlight_levels;
@@ -908,6 +927,11 @@ pub fn run() -> Result<(), Error> {
                     dithered: context.fb.dithered(),
                 });
                 view = next_view;
+            },
+            Event::NetUpFailed => {
+                context.settings.wifi = false;
+                context.online = false;
+                tx.send(Event::Notify("Couldn't bring WiFi up.".to_string())).ok();
             },
             Event::Select(EntryId::Launch(app_cmd)) => {
                 view.children_mut().retain(|child| !child.is::<Menu>());
