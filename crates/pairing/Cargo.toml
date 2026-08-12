@@ -1,0 +1,18 @@
+[package]
+name = "pairing"
+version = "0.1.0"
+edition = "2021"
+description = "SPAKE2 pairing between the reader and a Mac: one implementation, both ends"
+
+# No async, no runtime.  The `plato` binary is threads-only and must stay that
+# way; everything here is std::net + std::thread.  Versions are chosen to reuse
+# what the workspace already resolves (sha2 0.10, hmac 0.12, subtle 2, getrandom
+# 0.2) so no duplicate dependency trees appear in the device binary.
+[dependencies]
+spake2 = "0.4"          # RustCrypto/PAKEs, warner's construction -- NOT RFC 9382
+hkdf = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+chacha20poly1305 = "0.10"
+subtle = "2"
+getrandom = "0.2"

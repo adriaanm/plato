@@ -8,6 +8,7 @@ members = [
   "crates/importer",
   "crates/fetcher",
   "crates/foldersync",
+  "crates/pairing",
   "crates/platonic",
 ]
 
