@@ -1151,6 +1151,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "platonic"
+version = "0.1.0"
+
+[[package]]
 name = "png"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

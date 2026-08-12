@@ -1,0 +1,16 @@
+[package]
+name = "platonic"
+version = "0.1.0"
+edition = "2021"
+description = "Push a document to the reader over ssh and open it (docs/platonic.md in platokin)"
+
+# Deliberately dependency-free: std only.  This is a single binary handed to
+# other Macs, so every dependency is a thing that has to build there too --
+# and the workspace has no argument parser in its lockfile, so adding one for
+# ten flags would be the heaviest change in the crate.  Same reasoning as
+# crates/foldersync.
+[dependencies]
+
+[[bin]]
+name = "platonic"
+path = "src/main.rs"
