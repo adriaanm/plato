@@ -192,6 +192,24 @@ impl View for Pairing {
         }
     }
 
+    /// **Load-bearing, and it does not look it.** `process_render_queue` calls
+    /// a view's own `render` only when `view.len() == 0 || view.is_background()`
+    /// -- a view that has children is otherwise taken to be a mere container,
+    /// and only its children get drawn.  This view has one child (the Back
+    /// icon) and draws everything that matters itself, so without this the
+    /// code, the address and the countdown are never drawn at all.
+    ///
+    /// The failure is silent and misleading: the queued Full update still runs,
+    /// so the panel **flashes and then shows nothing new**, which reads as "the
+    /// window never opened" rather than "the view drew nothing" -- the pairing
+    /// thread was armed and listening the whole time.  Confirmed on the device
+    /// 2026-08-12.  `dump_png` missed it because it builds this struct by hand
+    /// with no children and calls `render` directly, exercising a shape `new`
+    /// never produces.
+    fn is_background(&self) -> bool {
+        true
+    }
+
     fn might_rotate(&self) -> bool {
         false
     }
@@ -260,6 +278,39 @@ mod tests {
             fb.save(out.to_str().unwrap()).unwrap();
             println!("{}", out.display());
         }
+    }
+
+    /// The bug that shipped to the device on 2026-08-12, as a test.
+    ///
+    /// `process_render_queue` draws a view's own content only when
+    /// `len() == 0 || is_background()`.  This view has a child *and* draws
+    /// everything that matters itself, so if that ever stops holding the panel
+    /// flashes and shows nothing -- with the pairing thread armed and
+    /// listening behind it, which is what made it read as a UI that never
+    /// opened.
+    ///
+    /// `dump_png` could not catch it: it hand-builds the struct with no
+    /// children and calls `render` directly, so it exercises a shape `new`
+    /// never produces and never goes near the queue's decision.  This asserts
+    /// the invariant on the children `new` actually installs.
+    #[test]
+    fn a_view_that_draws_itself_must_be_rendered_by_the_queue() {
+        let icon = Icon::new("back", rect![0, 0, 10, 10], Event::Back);
+        let v = Pairing {
+            id: 1,
+            rect: rect![0, 0, 1072, 1448],
+            children: vec![Box::new(icon) as Box<dyn View>],
+            code: "abcd-2345".to_string(),
+            address: "192.168.178.190:30305".to_string(),
+            status: PairingStatus::Tick(165),
+            remaining: 165,
+            finished: false,
+        };
+        assert!(!v.children.is_empty(),
+                "this test is pointless if the view has no children");
+        assert!(v.len() == 0 || v.is_background(),
+                "Pairing draws its own content but the render queue would skip \
+                 it: the panel flashes and stays blank");
     }
 
     #[test]
