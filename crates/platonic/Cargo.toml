@@ -9,7 +9,13 @@ description = "Push a document to the reader over ssh and open it (docs/platonic
 # and the workspace has no argument parser in its lockfile, so adding one for
 # ten flags would be the heaviest change in the crate.  Same reasoning as
 # crates/foldersync.
+#
+# The one exception, and it is not really one: `platonic-recv` is the DEVICE
+# half of this tool, and what is linked from it is the wire protocol both ends
+# have to agree on.  One definition, no drift -- exactly the reasoning behind
+# `crates/pairing`.  It is std-only itself, so nothing new enters the tree.
 [dependencies]
+platonic-recv = { path = "../platonic-recv" }
 
 [[bin]]
 name = "platonic"

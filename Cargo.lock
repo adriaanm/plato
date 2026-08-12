@@ -1300,6 +1300,13 @@ dependencies = [
 [[package]]
 name = "platonic"
 version = "0.1.0"
+dependencies = [
+ "platonic-recv",
+]
+
+[[package]]
+name = "platonic-recv"
+version = "0.1.0"
 
 [[package]]
 name = "png"

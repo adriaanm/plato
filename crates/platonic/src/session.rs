@@ -13,6 +13,8 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use platonic_recv::proto::{GREETING, RECV_PATH};
+
 use crate::pure::{self, shell_quote, ssh_argv};
 
 pub struct Output {
@@ -70,6 +72,14 @@ impl Session {
             return Ok(Output { status: 0, stdout: Vec::new(), stderr: Vec::new() });
         }
         run_with_timeout(&argv, input, timeout)
+    }
+
+    /// The argv that runs the receiver.  Under a paired (restricted) key the
+    /// forced command replaces it and the string is irrelevant; under the
+    /// admin key it is what actually runs, so the two keys reach the same
+    /// program by different routes.
+    pub fn recv_argv(&self) -> Vec<String> {
+        ssh_argv(&self.host, RECV_PATH, &self.key, &self.known, &self.strict)
     }
 
     /// stdout as text; errors and timeouts read as "nothing came back", which
@@ -155,13 +165,59 @@ fn run_with_timeout(argv: &[String], input: Option<&[u8]>, timeout: Duration)
 // ----------------------------------------------------------------- discovery
 //
 
-/// Verified by connecting: the host key must match the alias entry AND the
-/// marker must come back -- output, not exit code.
-pub fn probe(host: &str, key: &PathBuf, known: &PathBuf, strict: &str) -> bool {
+/// What one connection attempt established.
+///
+/// `reachable` is the discovery answer: ssh authenticated under the
+/// HostKeyAlias, so this address IS the reader -- ssh refused every impostor
+/// for us.  `receiver` additionally says the forced-command program is
+/// deployed, which is what decides the transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    pub reachable: bool,
+    pub receiver: bool,
+    /// Why not, in one line, for the message that names the cause.
+    pub note: String,
+}
+
+/// Probe by running the receiver, not by running `echo`: a paired key has no
+/// shell, so a shell-shaped probe would work only for the admin key and fail
+/// exactly where the new design is meant to work.
+///
+/// Reading the answer:
+///
+/// * the greeting -> the reader, with the receiver deployed
+/// * no greeting, ssh exit != 255 -> the reader (auth and the host key both
+///   passed), but the receiver is missing or broken; 255 is ssh's own
+///   "could not connect / host key / auth" code
+/// * a timeout or a spawn failure -> not the reader
+pub fn probe(host: &str, key: &PathBuf, known: &PathBuf, strict: &str) -> Probe {
     let sess = Session::new(host, false, strict, key.clone(), known.clone());
-    match sess.run("echo PLATONIC_OK", None, Duration::from_secs(8)) {
-        Ok(out) => out.text().contains("PLATONIC_OK"),
-        Err(_) => false,
+    match sess.run(RECV_PATH, Some(&[]), Duration::from_secs(8)) {
+        Ok(out) if out.stdout.starts_with(GREETING) =>
+            Probe { reachable: true, receiver: true, note: String::new() },
+        Ok(out) if out.status != 255 => Probe {
+            reachable: true,
+            receiver: false,
+            note: {
+                let err = out.err_text();
+                let first = err.lines().next().unwrap_or("").trim().to_string();
+                if first.is_empty() {
+                    format!("exit {}", out.status)
+                } else {
+                    format!("exit {}: {}", out.status, first)
+                }
+            },
+        },
+        Ok(out) => Probe {
+            reachable: false,
+            receiver: false,
+            note: out.err_text().lines().next().unwrap_or("no answer").to_string(),
+        },
+        Err(_) => Probe {
+            reachable: false,
+            receiver: false,
+            note: "no answer".to_string(),
+        },
     }
 }
 

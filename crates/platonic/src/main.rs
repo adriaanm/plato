@@ -28,16 +28,19 @@
 //! against `device-facts/bin-listing.txt` (`find`, `stat`, `touch`, `timeout`
 //! all exist as applets) and every check trusts OUTPUT, not exit codes.
 
+mod link;
 mod pure;
 mod session;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use link::{open_link, Link, Transport};
+use platonic_recv::proto::Entry;
 use pure::*;
-use session::{arp_sweep, probe, resolve_all, RunError, Session};
+use session::{arp_sweep, probe, resolve_all, Probe, Session};
 
 const USAGE: &str = "\
 usage: platonic [FILE ...] [--to NAME] [--quiet] [--title T] [--open FILE]
@@ -56,6 +59,10 @@ push a document to the Kindle and start reading it (docs/platonic.md)
   --days N      inbox expiry age (default 14)
   --host H      reader address; skips discovery, no fallback
   --dry-run     print every ssh command instead of running it
+
+environment:
+  PLATONIC_TRANSPORT=recv|shell   force one transport (default: auto, which
+                prefers the restricted receiver and degrades loudly)
 ";
 
 fn die(msg: impl AsRef<str>) -> ! {
@@ -164,10 +171,14 @@ fn parse_args(argv: Vec<String>) -> Args {
 
 struct Ctx {
     key: PathBuf,
+    /// Which key was chosen.  It decides whether a fallback exists at all: a
+    /// paired key's ssh session runs the receiver and nothing else.
+    identity: Identity,
     known: PathBuf,
     cache: PathBuf,
     config: PathBuf,
     dry_run: bool,
+    transport: Transport,
 }
 
 impl Ctx {
@@ -188,8 +199,13 @@ impl Ctx {
                               key.display()),
             }
         }
+        let transport = Transport::from_env(
+            std::env::var("PLATONIC_TRANSPORT").ok().as_deref())
+            .unwrap_or_else(|e| die(e));
         Ctx {
             key,
+            identity,
+            transport,
             known: choose_known_hosts(
                 std::env::var("PLATONIC_KNOWN_HOSTS").ok().as_deref(), &home),
             cache: home.join(".cache/platonic/last-host"),
@@ -203,8 +219,15 @@ impl Ctx {
                      self.known.clone())
     }
 
-    fn probe(&self, host: &str) -> bool {
+    fn probe(&self, host: &str) -> Probe {
         probe(host, &self.key, &self.known, "yes")
+    }
+
+    /// A paired key may run exactly one program, so there is no shell to fall
+    /// back to.  `--pair` mints that key; every Mac set up before it keeps the
+    /// admin key, and keeps the fallback with it.
+    fn restricted_key(&self) -> bool {
+        self.identity == Identity::PerMac
     }
 
     fn read_cache(&self) -> Option<String> {
@@ -222,7 +245,11 @@ impl Ctx {
 
     /// The resolution ladder from docs/platonic.md, cheapest first, every rung
     /// verified by actually connecting under the HostKeyAlias.
-    fn discover(&self, host_opt: &Option<String>) -> String {
+    ///
+    /// The probe that finds the reader is also the probe that establishes
+    /// whether the receiver is deployed, so choosing the transport costs no
+    /// extra connection.
+    fn discover(&self, host_opt: &Option<String>) -> (String, Probe) {
         let explicit = host_opt.clone()
             .or_else(|| std::env::var("PLATONIC_HOST").ok())
             .filter(|s| !s.is_empty());
@@ -232,21 +259,24 @@ impl Ctx {
                 .or_else(|| self.read_cache())
                 .unwrap_or_else(|| USB_ADDR.to_string());
             println!("[dry-run] using host {} without probing", host);
-            return host;
+            return (host, Probe { reachable: true, receiver: true,
+                                  note: String::new() });
         }
 
         if let Some(host) = explicit {
             // The escape hatch: no fallback past it.
-            if self.probe(&host) {
-                return host;
+            let probe = self.probe(&host);
+            if probe.reachable {
+                return (host, probe);
             }
             die(format!("no reader at {} (from --host/PLATONIC_HOST); not \
                          falling back. {}", host, NO_READER_MSG));
         }
 
         if let Some(cached) = self.read_cache() {
-            if self.probe(&cached) {
-                return cached;
+            let probe = self.probe(&cached);
+            if probe.reachable {
+                return (cached, probe);
             }
         }
 
@@ -256,16 +286,18 @@ impl Ctx {
         // no client names at all.
         for name in dns_names(ALIAS) {
             for addr in resolve_all(&name) {
-                if self.probe(&addr) {
+                let probe = self.probe(&addr);
+                if probe.reachable {
                     self.write_cache(&addr);
-                    return addr;
+                    return (addr, probe);
                 }
             }
         }
 
-        if self.probe(USB_ADDR) {
+        let probe = self.probe(USB_ADDR);
+        if probe.reachable {
             self.write_cache(USB_ADDR);
-            return USB_ADDR.to_string();
+            return (USB_ADDR.to_string(), probe);
         }
 
         // The device MAC is device-identifying and must never enter the
@@ -279,9 +311,10 @@ impl Ctx {
             Some(mac) => match norm_mac(mac) {
                 Ok(mac) => {
                     if let Some(addr) = arp_sweep(&mac) {
-                        if self.probe(&addr) {
+                        let probe = self.probe(&addr);
+                        if probe.reachable {
                             self.write_cache(&addr);
-                            return addr;
+                            return (addr, probe);
                         }
                     }
                 }
@@ -398,71 +431,38 @@ fn prepare(source: &str, title_opt: &Option<String>) -> Result<Doc, String> {
 // ---------------------------------------------------- push / poke  /  sweep
 //
 
-fn run_or_die(sess: &Session, cmd: &str, input: Option<&[u8]>,
-              timeout: Duration) -> session::Output {
-    match sess.run(cmd, input, timeout) {
-        Ok(out) => out,
-        Err(RunError::Timeout) =>
-            die(format!("ssh timed out mid-command. {}", NO_READER_MSG)),
-        Err(RunError::Spawn(e)) => die(format!("could not run ssh: {}", e)),
+fn push_doc(link: &mut dyn Link, doc: &Doc, to: &str, now: f64) {
+    let written = link.put(to, &doc.name, &doc.data, now as i64)
+        .unwrap_or_else(|e| die(format!("push of {} failed: {}", doc.source, e)));
+    // The byte count is the push's only proof, whichever transport moved it.
+    if written != doc.data.len() as u64 {
+        die(format!("push of {} failed: the reader wrote {} bytes, not {}",
+                    doc.source, written, doc.data.len()));
     }
+    println!("pushed {} -> {}/{} ({} bytes)",
+             doc.source, to, doc.name, doc.data.len());
 }
 
-fn push_doc(sess: &Session, doc: &Doc, to: &str, now: f64) -> String {
-    let remote_dir = format!("{}/{}", DOCROOT, to);
-    let remote_path = format!("{}/{}", remote_dir, doc.name);
-    let cmd = push_command(&remote_dir, &remote_path, &touch_stamp(now));
-    let out = run_or_die(sess, &cmd, Some(&doc.data), Duration::from_secs(120));
-    if !sess.dry_run {
-        let reported = out.text().trim().to_string();
-        if reported != doc.data.len().to_string() {
-            die(format!("push of {} failed: remote size '{}', local {} ({})",
-                        doc.source, reported, doc.data.len(), out.err_text()));
-        }
-        println!("pushed {} -> {}/{} ({} bytes)",
-                 doc.source, to, doc.name, doc.data.len());
-    }
-    remote_path
-}
-
-/// Best-effort: the push already succeeded; a missing listener only means the
-/// document appears after a restart.
-fn poke_fifo(sess: &Session, line: &str) {
-    if !sess.dry_run {
-        let out = sess.out(
-            &format!("test -p {} && echo FIFO_OK || echo NO_FIFO", FIFO),
-            Duration::from_secs(15));
-        if !out.contains("FIFO_OK") {
-            eprintln!("warning: Plato is not running its command listener; \
-                       the document will appear after a restart");
-            return;
-        }
-    }
-    let out = sess.run(&fifo_write_command(line), None, Duration::from_secs(15));
-    let failed = match out {
-        Ok(o) => o.status != 0,
-        Err(_) => true,
+/// Best-effort: the push already succeeded, and a missing listener only means
+/// the document appears after a restart.
+fn poke(link: &mut dyn Link, target: Option<(&str, &str)>) {
+    let result = match target {
+        Some((folder, name)) => link.open(folder, name),
+        None => link.import(),
     };
-    if !sess.dry_run && failed {
-        eprintln!("warning: FIFO write timed out — is Plato reading {}?", FIFO);
+    if let Err(e) = result {
+        eprintln!("warning: {} — the document will appear after a restart", e);
     }
 }
 
 /// Expire `inbox/` by age, decided on the Mac's clock against mtimes this tool
 /// stamped.  Scoped to `inbox/` alone: a named folder means "keep this".
-fn sweep_inbox(sess: &Session, now: f64, days: i64) {
-    let entries = parse_stat_lines(&sess.out(&sweep_list_command(),
-                                             Duration::from_secs(30)));
-    let doomed = expired_paths(&entries, cutoff_epoch(now, days));
-    if doomed.is_empty() {
-        return;
-    }
-    let _ = sess.run(&rm_command(&doomed), None, Duration::from_secs(30));
-    for p in &doomed {
-        let base = Path::new(p).file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| p.clone());
-        println!("expired (>{}d): {}", days, base);
+fn sweep_inbox(link: &mut dyn Link, now: f64, days: i64) {
+    match link.sweep(cutoff_epoch(now, days) as i64) {
+        Ok(names) => for name in names {
+            println!("expired (>{}d): {}", days, name);
+        },
+        Err(e) => eprintln!("warning: sweep failed: {}", e),
     }
 }
 
@@ -507,63 +507,71 @@ fn cmd_push(ctx: &Ctx, args: &Args, now: f64) {
         die(errors.join("\n"));
     }
 
-    let sess = ctx.session(&ctx.discover(&args.host));
+    let (host, probe) = ctx.discover(&args.host);
+    let sess = ctx.session(&host);
+    let mut link = match open_link(&sess, ctx.transport, &probe,
+                                   ctx.restricted_key()) {
+        Ok(link) => link,
+        Err(e) => die(e),
+    };
 
-    let mut remote_paths = Vec::with_capacity(docs.len());
+    // The whole push is one session on the receiver path: every PUT, the
+    // open, and the sweep travel over the connection opened above.
     for doc in &docs {
-        remote_paths.push(push_doc(&sess, doc, to, now));
+        push_doc(link.as_mut(), doc, to, now);
     }
 
     // Opening: default for one file; several are delivered and none opened
     // ("which one did you mean" has no good default) unless --open names one.
     // --quiet still pokes import so the library refreshes.
-    let line = if args.quiet {
-        "import".to_string()
+    let target: Option<&Doc> = if args.quiet {
+        None
     } else if docs.len() == 1 {
-        format!("open {}", remote_paths[0])
-    } else if let Some(open) = &args.open {
-        let target = pick_open_target(&docs, open);
-        let idx = docs.iter().position(|d| std::ptr::eq(d, target)).unwrap();
-        format!("open {}", remote_paths[idx])
+        Some(&docs[0])
     } else {
-        "import".to_string()
+        args.open.as_ref().map(|open| pick_open_target(&docs, open))
     };
-    poke_fifo(&sess, &line);
+    poke(link.as_mut(), target.map(|d| (to, d.name.as_str())));
 
-    // Opportunistic: we are already connected, so the sweep costs a command.
-    sweep_inbox(&sess, now, args.days);
+    // Opportunistic: we are already connected, so the sweep costs one op.
+    sweep_inbox(link.as_mut(), now, args.days);
+    link.finish();
 }
 
 fn cmd_list(ctx: &Ctx, args: &Args, now: f64) {
-    let sess = ctx.session(&ctx.discover(&args.host));
-    let entries = parse_stat_lines(&sess.out(&list_command(),
-                                             Duration::from_secs(30)));
+    let (host, probe) = ctx.discover(&args.host);
+    let sess = ctx.session(&host);
+    let mut link = match open_link(&sess, ctx.transport, &probe,
+                                   ctx.restricted_key()) {
+        Ok(link) => link,
+        Err(e) => die(e),
+    };
+    let entries = match link.list() {
+        Ok(entries) => entries,
+        Err(e) => die(format!("could not list the library: {}", e)),
+    };
+    link.finish();
+
     if entries.is_empty() && !sess.dry_run {
         println!("nothing under {}", DOCROOT);
         return;
     }
 
-    let mut folders: Vec<(String, Vec<(i64, String)>)> = Vec::new();
-    for (mtime, path) in entries {
-        let rel = path.strip_prefix(&format!("{}/", DOCROOT))
-                      .unwrap_or(path.as_str());
-        let (folder, name) = match rel.rsplit_once('/') {
-            Some((f, n)) => (f.to_string(), n.to_string()),
-            None => (".".to_string(), rel.to_string()),
-        };
-        match folders.iter_mut().find(|(f, _)| *f == folder) {
-            Some((_, items)) => items.push((mtime, name)),
-            None => folders.push((folder, vec![(mtime, name)])),
+    let mut folders: Vec<(String, Vec<Entry>)> = Vec::new();
+    for entry in entries {
+        match folders.iter_mut().find(|(f, _)| *f == entry.folder) {
+            Some((_, items)) => items.push(entry),
+            None => folders.push((entry.folder.clone(), vec![entry])),
         }
     }
     folders.sort_by(|a, b| a.0.cmp(&b.0));
 
     for (folder, items) in &mut folders {
         println!("{}/", folder);
-        items.sort_by(|a, b| b.0.cmp(&a.0));
-        for (mtime, name) in items.iter() {
-            let age_d = (now - *mtime as f64) / 86_400.0;
-            let mut note = format!("{:5.1}d old", age_d);
+        items.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+        for entry in items.iter() {
+            let age_d = (now - entry.mtime as f64) / 86_400.0;
+            let mut note = format!("{}, {:5.1}d old", human_size(entry.size), age_d);
             if folder == "inbox" {
                 let left = args.days as f64 - age_d;
                 if left <= 0.0 {
@@ -572,7 +580,7 @@ fn cmd_list(ctx: &Ctx, args: &Args, now: f64) {
                     note.push_str(&format!("  expires in {:.1}d", left));
                 }
             }
-            println!("  {}  ({})", name, note);
+            println!("  {}  ({})", entry.name, note);
         }
     }
 }

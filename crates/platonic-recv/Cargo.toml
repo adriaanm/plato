@@ -1,0 +1,23 @@
+[package]
+name = "platonic-recv"
+version = "0.1.0"
+edition = "2021"
+description = "The one program a paired Mac may run on the reader (docs/platonic.md, 'The receiver')"
+
+# Dependency-free, std only, for two reasons beyond taste: this runs as root
+# behind a forced command, so every line of it should be readable in one
+# sitting; and it must be a static-musl binary that keeps working with the
+# userstore unmounted, which is easiest when nothing is linked at all.
+[dependencies]
+
+# The library half is the wire protocol plus the validation, and `platonic`
+# links it -- one definition, both ends, exactly the reasoning behind
+# crates/pairing.  The server lives here too rather than in main.rs so the
+# PUT/LIST/SWEEP tests can drive it against a temp directory on the host.
+[lib]
+name = "platonic_recv"
+path = "src/lib.rs"
+
+[[bin]]
+name = "platonic-recv"
+path = "src/main.rs"

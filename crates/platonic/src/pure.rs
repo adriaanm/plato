@@ -8,6 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
+use platonic_recv::proto::Entry;
+
 /// What Plato can render (docs/platonic.md "Any filetype").  Anything else
 /// that is UTF-8 text ships as fenced `.md`; binary is refused.
 ///
@@ -435,31 +437,71 @@ pub fn missing_kinds(kinds: &[String]) -> Vec<&'static str> {
         .collect()
 }
 
-/// busybox `stat -c '%Y %n'` lines -> (mtime, path).  Paths contain spaces on
-/// this library; split once.
-pub fn parse_stat_lines(output: &str) -> Vec<(i64, String)> {
+/// (mtime, size, path), as the shell path's `stat` prints them.
+pub type StatEntry = (i64, u64, String);
+
+/// busybox `stat -c '%Y %s %n'` lines -> (mtime, size, path).  Paths contain
+/// spaces on this library, so only the two numeric fields are split off.
+pub fn parse_stat_lines(output: &str) -> Vec<StatEntry> {
     let mut entries = Vec::new();
     for line in output.lines() {
         let line = line.trim_start();
-        let Some((head, rest)) = line.split_once(char::is_whitespace) else { continue };
-        let path = rest.trim_start();
-        if head.is_empty() || path.is_empty() {
+        let Some((mtime, rest)) = line.split_once(char::is_whitespace) else { continue };
+        let Some((size, path)) = rest.trim_start().split_once(char::is_whitespace)
+            else { continue };
+        let path = path.trim_start();
+        if path.is_empty() {
             continue;
         }
-        if !head.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        if let Ok(mtime) = head.parse::<i64>() {
-            entries.push((mtime, path.to_string()));
-        }
+        let (Ok(mtime), Ok(size)) = (mtime.parse::<i64>(), size.parse::<u64>())
+            else { continue };
+        entries.push((mtime, size, path.to_string()));
     }
     entries
 }
 
-pub fn expired_paths(entries: &[(i64, String)], cutoff: f64) -> Vec<String> {
+pub fn basename(path: &str) -> String {
+    match path.rsplit_once('/') {
+        Some((_, name)) if !name.is_empty() => name.to_string(),
+        _ => path.to_string(),
+    }
+}
+
+/// Shell-path listings carry absolute paths; the receiver reports folder and
+/// name separately.  Convert, so both links answer with the same type and
+/// `--list` has one implementation.
+pub fn entries_from_stat(entries: &[StatEntry]) -> Vec<Entry> {
+    let prefix = format!("{}/", DOCROOT);
+    entries.iter().map(|(mtime, size, path)| {
+        let rel = path.strip_prefix(&prefix).unwrap_or(path.as_str());
+        let (folder, name) = match rel.rsplit_once('/') {
+            Some((f, n)) => (f.to_string(), n.to_string()),
+            None => (".".to_string(), rel.to_string()),
+        };
+        Entry { folder, name, size: *size, mtime: *mtime }
+    }).collect()
+}
+
+/// A size a person reads at a glance.  `--list` gained sizes when the
+/// receiver started reporting them; a raw byte count for a 34 MB paper is
+/// noise.
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 3] = [("M", 1024 * 1024), ("K", 1024), ("B", 1)];
+    for (suffix, scale) in UNITS {
+        if bytes >= scale * 10 || (scale == 1) {
+            return format!("{}{}", bytes / scale, suffix);
+        }
+        if bytes >= scale {
+            return format!("{:.1}{}", bytes as f64 / scale as f64, suffix);
+        }
+    }
+    format!("{}B", bytes)
+}
+
+pub fn expired_paths(entries: &[StatEntry], cutoff: f64) -> Vec<String> {
     entries.iter()
-        .filter(|(mtime, _)| (*mtime as f64) <= cutoff)
-        .map(|(_, p)| p.clone())
+        .filter(|(mtime, _, _)| (*mtime as f64) <= cutoff)
+        .map(|(_, _, p)| p.clone())
         .collect()
 }
 
@@ -481,6 +523,11 @@ pub fn ssh_argv(host: &str, remote_cmd: &str, key: &Path, known: &Path,
         "-o".to_string(), format!("StrictHostKeyChecking={}", strict),
         "-o".to_string(), "BatchMode=yes".to_string(),
         "-o".to_string(), "ConnectTimeout=3".to_string(),
+        // The receiver session holds one connection open for the whole push,
+        // and a pipe has no timeout of its own: this is what bounds a reader
+        // that goes to sleep mid-transfer.  30 s of silence and ssh gives up.
+        "-o".to_string(), "ServerAliveInterval=5".to_string(),
+        "-o".to_string(), "ServerAliveCountMax=6".to_string(),
         format!("root@{}", host),
         remote_cmd.to_string(),
     ]
@@ -507,13 +554,13 @@ pub fn fifo_write_command(line: &str) -> String {
 }
 
 pub fn sweep_list_command() -> String {
-    format!("find {}/inbox -type f -exec stat -c '%Y %n' {{}} \\; 2>/dev/null",
+    format!("find {}/inbox -type f -exec stat -c '%Y %s %n' {{}} \\; 2>/dev/null",
             DOCROOT)
 }
 
 pub fn list_command() -> String {
     format!("find {} -mindepth 1 -maxdepth 2 -type f \
-             -exec stat -c '%Y %n' {{}} \\; 2>/dev/null", DOCROOT)
+             -exec stat -c '%Y %s %n' {{}} \\; 2>/dev/null", DOCROOT)
 }
 
 pub fn rm_command(paths: &[String]) -> String {
@@ -737,9 +784,9 @@ mod tests {
 
     #[test]
     fn expired_selection() {
-        let entries = vec![(100, "/i/old.md".to_string()),
-                           (200, "/i/edge.md".to_string()),
-                           (201, "/i/fresh.md".to_string())];
+        let entries = vec![(100, 1, "/i/old.md".to_string()),
+                           (200, 1, "/i/edge.md".to_string()),
+                           (201, 1, "/i/fresh.md".to_string())];
         assert_eq!(expired_paths(&entries, 200.0),
                    vec!["/i/old.md".to_string(), "/i/edge.md".to_string()]);
     }
@@ -809,15 +856,40 @@ mod tests {
 
     #[test]
     fn stat_paths_with_spaces_survive() {
-        let out = "1786000000 /mnt/us/documents/inbox/repo-plan.md\n\
-                   1786000001 /mnt/us/documents/books/Cutting Through Spiritual \
+        let out = "1786000000 4096 /mnt/us/documents/inbox/repo-plan.md\n\
+                   1786000001 12 /mnt/us/documents/books/Cutting Through Spiritual \
                    Materialism - Chogyam Trungpa.epub\n\
                    garbage line\n";
         let entries = parse_stat_lines(out);
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[1].1,
+        assert_eq!(entries[0].1, 4096);
+        assert_eq!(entries[1].2,
                    "/mnt/us/documents/books/Cutting Through Spiritual \
                     Materialism - Chogyam Trungpa.epub");
+    }
+
+    #[test]
+    fn shell_listings_become_the_same_entries_the_receiver_returns() {
+        let entries = entries_from_stat(&parse_stat_lines(
+            "1786000000 5 /mnt/us/documents/inbox/a.md\n"));
+        assert_eq!(entries, vec![Entry {
+            folder: "inbox".to_string(), name: "a.md".to_string(),
+            size: 5, mtime: 1_786_000_000,
+        }]);
+    }
+
+    #[test]
+    fn sizes_read_at_a_glance() {
+        assert_eq!(human_size(0), "0B");
+        assert_eq!(human_size(999), "999B");
+        assert_eq!(human_size(2048), "2.0K");
+        assert_eq!(human_size(34 * 1024 * 1024), "34M");
+    }
+
+    #[test]
+    fn basename_of_a_library_path() {
+        assert_eq!(basename("/mnt/us/documents/inbox/a b.md"), "a b.md");
+        assert_eq!(basename("bare.md"), "bare.md");
     }
 
     // ---- Settings.toml

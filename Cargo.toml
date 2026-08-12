@@ -10,6 +10,7 @@ members = [
   "crates/foldersync",
   "crates/pairing",
   "crates/platonic",
+  "crates/platonic-recv",
 ]
 
 [profile.release-minsized]

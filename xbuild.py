@@ -83,6 +83,13 @@ RUST_TARGET = "armv7-unknown-linux-musleabi"
 # which is the part the device cares about.
 ZIG_ARCH_FLAGS = ["-mfloat-abi=softfp", "-mcpu=cortex_a9"]
 
+# Packages with no C dependencies at all.  Asking for one of these skips the
+# whole native half -- MuPDF and its seven libraries -- which turns a cold
+# `xbuild.py kindle --package platonic-recv` from tens of minutes into
+# seconds.  Being on this list is a claim about the crate's `[dependencies]`,
+# so a crate that grows a `-sys` dependency has to come off it.
+PURE_RUST_PACKAGES = {"platonic-recv"}
+
 
 # --------------------------------------------------------------------------
 # The source table
@@ -786,6 +793,12 @@ def build_kindle(profile: Profile, args) -> None:
     if not shutil.which("cargo-zigbuild"):
         die("cargo-zigbuild is not on PATH (brew install cargo-zigbuild)")
     write_zig_wrappers(profile)
+    if set(profile.cargo_packages) <= PURE_RUST_PACKAGES:
+        log(f"pure-Rust packages ({', '.join(profile.cargo_packages)}): "
+            "skipping the native sources")
+        run_cargo(profile, args)
+        report_binaries(profile)
+        return
     (profile.prefix / "include").mkdir(parents=True, exist_ok=True)
     (profile.prefix / "lib").mkdir(parents=True, exist_ok=True)
     profile.cflags = list(ZIG_ARCH_FLAGS)
@@ -797,7 +810,13 @@ def build_kindle(profile: Profile, args) -> None:
     build_mupdf_wrapper(profile)
     profile.link_search.append(profile.prefix / "lib")
     run_cargo(profile, args)
+    report_binaries(profile)
 
+
+def report_binaries(profile: Profile) -> None:
+    """The ABI gate, on every binary the profile produced.  Nothing leaves this
+    driver unchecked -- a hard-float binary fails on the device as a bare "No
+    such file or directory"."""
     for pkg in profile.cargo_packages:
         out = ROOT / "target" / profile.cargo_target / "release" / pkg
         if not out.exists():
