@@ -125,16 +125,36 @@ def main():
         return 1
 
     # 3 ------------------------------------------------------------------
-    tty = subprocess.run(["ssh", "-tt"] + ssh_argv(host, RECV)[1:],
-                         input=b"", capture_output=True, timeout=30)
-    blob = (tty.stdout + tty.stderr).decode(errors="replace")
-    report("it refuses a tty", "stdin is a terminal" in blob or "PTY" in blob,
-           "a hand-run receiver says so instead of hanging on a framed "
-           "protocol nobody is speaking",
-           "with the ADMIN key dropbear grants the pty and the receiver "
-           "refuses; with a paired key dropbear refuses the pty first (E22). "
-           "Either message is a pass, and they prove different things.",
-           blob.strip()[:200])
+    # The receiver's tty guard CANNOT be exercised over this device's ssh, so
+    # do not pretend to test it -- an assertion that can only ever fail is not
+    # a check, it is a permanent red light nobody reads (see the mDNS `dig`
+    # probe, docs/wifi.md).
+    #
+    # Measured 2026-08-12: with `ssh -tt` dropbear does hand the command a pty
+    # (fd 0 -> /dev/pts/0), but /dev/pts is mounted and EMPTY, the node is
+    # already unlinked, and isatty(0) is FALSE -- `[ -t 0 ]` and busybox `tty`
+    # both say "not a tty".  So over ssh the guard is unreachable by
+    # construction.  It is defensive code for the case it names: a person
+    # running the binary by hand on a console.
+    #
+    # What IS checkable is that a pty session does not break the receiver, and
+    # that is worth a line, because it is the shape a confused user produces.
+    # The evidence has to be left in a file: with `-tt` and stdin at EOF the
+    # channel tears down before any output survives -- a control run of
+    # `echo I-RAN` prints nothing either, which is how this was caught.
+    subprocess.run(["ssh", "-tt"] + ssh_argv(host, RECV + " > /tmp/ttyprobe.out"
+                                             " 2>/tmp/ttyprobe.err")[1:],
+                   input=b"", capture_output=True, timeout=30)
+    out = sh(host, "cat /tmp/ttyprobe.out /tmp/ttyprobe.err; "
+                   "rm -f /tmp/ttyprobe.*")
+    blob = out.stdout.decode(errors="replace")
+    report("a pty session still gets a clean answer",
+           blob.startswith(GREETING.decode()) or "stdin is a terminal" in blob,
+           "a confused `ssh -tt` gets the greeting (dropbear's pty is not a "
+           "working terminal here) or the refusal -- never a hang",
+           "output read from the pty channel itself, which is discarded on "
+           "teardown; that is why this reads it back over a second connection",
+           blob.strip()[:200] or "(nothing)")
 
     # 4 ------------------------------------------------------------------
     body = f"# platonic-recv check {now}\n\nIf you can read this, PUT works.\n"

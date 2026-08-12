@@ -218,10 +218,29 @@ impl<R: Read, W: Write> Session<R, W> {
             left -= want as u64;
         }
         file.flush()?;
+        file.sync_all()?;
         // The mtime is the Mac's clock; expiry is decided against it, so it is
         // as much a part of the document as the bytes.
-        file.set_times(fs::FileTimes::new().set_modified(system_time(mtime)))?;
-        file.sync_all()?;
+        //
+        // Both stamps are set, and the atime is NOT omitted, because omitting
+        // it does not work here.  On the userstore -- an `fsp` FUSE layer over
+        // vfat -- futimens() with UTIME_OMIT for the atime returns success and
+        // silently changes nothing, while the same call with both values set
+        // works.  ext3 honours either form, which is why every host test
+        // passed and the device quietly kept the write time.
+        // Confirmed on the device 2026-08-12, scripts/mtime-probe.c.
+        let when = system_time(mtime);
+        file.set_times(fs::FileTimes::new().set_accessed(when).set_modified(when))?;
+        // And check, because the failure mode above is a successful no-op: a
+        // wrong mtime means the inbox sweep expires the document at the wrong
+        // time, which is silent too and much later.
+        if let Ok(got) = file.metadata().and_then(|m| m.modified()) {
+            if epoch_secs(got) != mtime {
+                log(&format!("mtime: asked {} got {} on {} -- the sweep will \
+                              judge this file by the wrong clock",
+                             mtime, epoch_secs(got), path.display()));
+            }
+        }
         Ok(written)
     }
 
