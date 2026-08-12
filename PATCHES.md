@@ -2,7 +2,7 @@
 
 Branch `platokin`, forked from `baskerville/plato@7da89f2` (2026-08-09).
 
-This fork exists to port Plato to a jailbroken **Kindle Paperwhite 3** — see
+This fork exists to port Plato to the **Kindle Paperwhite 3** — see
 `docs/plato-port.md` in the `platokin` repo. It is meant to stay **rebasable on
 upstream master**, so every divergence is listed here with its rationale, and
 each one is either (a) plausibly mergeable upstream or (b) confined to files

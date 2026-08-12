@@ -3,7 +3,7 @@
 > ## This fork: Plato on the Kindle Paperwhite 3
 >
 > This is a fork of [baskerville/plato](https://github.com/baskerville/plato)
-> focused on running Plato on a jailbroken **Kindle Paperwhite 3** (`muscat`,
+> focused on running Plato on the **Kindle Paperwhite 3** (`muscat`,
 > i.MX6SL "Wario", firmware 5.16.2.1.1, kernel `3.0.35-lab126`, 1072×1448
 > @ 300 dpi, armv7 **soft-float** ABI, glibc 2.20). What it adds, each piece
 > recorded in [PATCHES.md](PATCHES.md):
@@ -20,6 +20,22 @@
 >   two-column detection with column-wise navigation.
 > - Robustness fixes that are not Kindle-specific: a missing external helper
 >   can no longer crash the app, and a refused suspend no longer loops.
+> - Getting documents onto the device, host half included: `crates/foldersync`
+>   (pull a folder from a Mac on the LAN), `crates/platonic` (push one document
+>   and open it), `crates/pairing` (pairing from a code shown on the panel —
+>   SPAKE2, same-WiFi only, no account and no cloud) and `crates/platonic-recv`,
+>   which is what a paired Mac gets **instead of** a shell.
+>
+> ### The sibling repo
+>
+> This repository is the reader itself. **[adriaanm/platokin](https://github.com/adriaanm/platokin)**
+> holds the tooling that makes it work on a Paperwhite 3 — installing and
+> launching it, the host-side scripts, and the design docs explaining why things
+> are the way they are here.
+>
+> The split keeps this repo a Plato fork that can be read, built and upstreamed
+> on its own. Where a feature has two halves, both halves are here and the
+> design doc is next door.
 >
 > **We're happy to upstream any of this if there's interest** — the build
 > hygiene, the PDF features and the robustness fixes were written to be

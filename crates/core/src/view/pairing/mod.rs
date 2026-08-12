@@ -95,15 +95,32 @@ impl Pairing {
         }
     }
 
+    /// The code as it is shown: upper case, which reads cleaner on the panel
+    /// (Adriaan, 2026-08-12).
+    ///
+    /// Presentation only, and safe: the canonical form is lower case -- it is
+    /// what the SPAKE2 password bytes are derived from -- and `Code::parse`
+    /// lowercases every character, so what is on screen round-trips.
+    ///
+    /// Done here rather than in `new` deliberately: a transformation applied in
+    /// the constructor would be invisible to `dump_png`, which builds the
+    /// struct by hand, and the renders would stop showing what ships.  That is
+    /// exactly how the blank-screen bug hid.
+    fn shown_code(&self) -> String {
+        self.code.to_uppercase()
+    }
+
     /// The command to type, with the code already in it.
     ///
     /// Adriaan, 2026-08-12: the screen should show the command *including*
     /// `--code`, so it can be typed straight across rather than read, held in
     /// the head, and typed at a prompt that then asks for the code again.  The
     /// code is still shown on its own line above, big, because that is the part
-    /// people check a character at a time.
+    /// people check a character at a time -- and it matches the case shown
+    /// there, because two spellings of one code invites the question of which
+    /// one is meant.
     fn command(&self) -> String {
-        format!("platonic --pair --code {}", self.code)
+        format!("platonic --pair --code {}", self.shown_code())
     }
 
     /// The closing lines: the address as the zero-dependency fallback, and how
@@ -219,7 +236,7 @@ impl View for Pairing {
 
         // The code is the whole point: it is what somebody checks a character
         // at a time, so it gets the panel's full width and no cap.
-        draw_fitted(fb, fonts, &PAIRING_CODE_STYLE, dpi, &self.code, origin,
+        draw_fitted(fb, fonts, &PAIRING_CODE_STYLE, dpi, &self.shown_code(), origin,
                     width, at(0.32), (width * 6) / 7, u32::MAX);
 
         // The command, with the code already in it, so it can be typed
