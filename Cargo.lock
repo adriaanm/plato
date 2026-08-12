@@ -1248,6 +1248,7 @@ version = "0.9.45"
 dependencies = [
  "if-addrs",
  "mdns-sd",
+ "pairing",
  "plato-core",
 ]
 
