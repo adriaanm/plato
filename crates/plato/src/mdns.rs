@@ -6,6 +6,29 @@
 //! macOS resolves `.local` natively through mDNSResponder, so once the device
 //! answers, `ssh platokin.local` works from any Mac with nothing installed.
 //!
+//! ## Who decides that the radio is up
+//!
+//! **The scripts do, and they say so.**  Every path that changes the radio goes
+//! through the platokin repo's WiFi scripts -- Plato's own menu delegates to
+//! `wifi-enable.sh`/`wifi-disable.sh`, `just wifi-up` runs them over ssh, and an
+//! unattended reassociation reaches `wifi-l3.sh` through `wifi-events.sh`.  So
+//! they poke the command FIFO (`plato_core::fifo`) with `wifi-up [ADDR]` and
+//! `wifi-down`, alongside the existing `kick_clock` call, and this module acts
+//! on the verb.  Nothing here guesses, and nothing here polls.
+//!
+//! Two things that design still has to get right, both learned the hard way:
+//!
+//! * **A session can BEGIN with the radio already up**, which is the normal
+//!   case here -- WiFi is often brought up by the scripts over ssh long before
+//!   Plato starts, and the radio-off policy has usually cleared
+//!   `settings.wifi` besides.  There is no transition to observe then, so
+//!   `init()` takes ONE measurement at startup.  An earlier version keyed
+//!   everything off transitions and had exactly this hole.
+//! * **The verb is a notification, not evidence.**  `wifi_up` re-measures
+//!   `wlan0` rather than trusting the address on the line, because the address
+//!   is what goes in the A record and a stale one is worse than none.  A
+//!   disagreement between the two is logged, not silently resolved.
+//!
 //! Two hard constraints, both measured, both load-bearing:
 //!
 //! * **The port must be opened in the firewall.**  Amazon's boot chain is
@@ -22,15 +45,17 @@
 //! that already knows the address, and answering there would put the wlan0
 //! address on a link where it means nothing.
 //!
-//! Lifetime is the radio's lifetime, and not one second longer -- WiFi here
-//! exists only to serve a sync (docs/wifi.md), so the responder starts when
-//! `wifi-enable.sh` succeeds and is torn down *before* `wifi-disable.sh` runs,
-//! which is the only order in which the goodbye packets can still leave.
+//! ## Logging
+//!
+//! Every branch logs -- the verb received, the action taken, and the reason
+//! when the action is nothing.  That is the repo rule, and this is why it is
+//! spelled out here: the first field test of this module produced total
+//! silence, which is indistinguishable from a binary that does not contain it.
+//! The first check on the device is `netstat -uln | grep 5353`: it says whether
+//! the socket exists at all, and it depends on no query reaching us.
 
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::thread;
 use std::time::Duration;
 
 use mdns_sd::{ServiceDaemon, ServiceInfo};
@@ -41,61 +66,116 @@ const SERVICE_TYPE: &str = "_platonic._tcp.local.";
 const SSH_PORT: u16 = 2222;
 const IFACE: &str = "wlan0";
 
-/// DHCP can hand out a different address on reassociation, and `wifi-events.sh`
-/// re-associates without Plato hearing about it.  A stale A record is worse
-/// than no A record, so poll.
-const ADDR_POLL_INTERVAL: Duration = Duration::from_secs(20);
-
 /// Unregister and shutdown are asynchronous; both are worth a short wait so the
-/// goodbye packets are on the wire before the caller drops the radio.
+/// goodbye packets are on the wire before the radio goes.
 const TEARDOWN_WAIT: Duration = Duration::from_secs(2);
 
 struct Responder {
     daemon: ServiceDaemon,
     fullname: String,
-    name: String,
     addr: Ipv4Addr,
-    /// Which watcher thread owns this responder; a stale one exits on sight.
-    generation: u64,
 }
 
-static STATE: Mutex<Option<Responder>> = Mutex::new(None);
-static GENERATION: AtomicU64 = AtomicU64::new(0);
+struct Shared {
+    /// Empty until `init()` runs, and forever if the feature is switched off.
+    name: String,
+    responder: Option<Responder>,
+}
 
-/// Start (or restart) the responder for `name`, advertising `wlan0`'s current
-/// address.  An empty name disables the feature.  Idempotent and safe to call
-/// when it is already running.
-pub fn start(name: &str) {
+static SHARED: Mutex<Shared> = Mutex::new(Shared {
+    name: String::new(),
+    responder: None,
+});
+
+/// Record the name and take the one startup measurement.  Called once at app
+/// start, unconditionally and NOT gated on `settings.wifi`: whether the radio
+/// is up right now is a question for `getifaddrs`, not for a saved setting.
+pub fn init(name: &str) {
     if name.is_empty() {
+        println!("mDNS: disabled (mdns-name is empty).");
         return;
     }
 
-    stop();
+    let mut shared = SHARED.lock().unwrap();
+    shared.name = name.to_string();
+    println!("mDNS: enabled as {}.local; measuring {} at startup.", name, IFACE);
+    advertise(&mut shared, "startup");
+}
+
+/// `wifi-up [ADDR]` from the FIFO, and Plato's own successful enable.  The
+/// address on the line is advisory: `wlan0` is re-measured, and a disagreement
+/// is reported rather than resolved silently.
+pub fn wifi_up(hint: Option<&str>) {
+    let mut shared = SHARED.lock().unwrap();
+    if shared.name.is_empty() {
+        println!("mDNS: wifi-up ignored -- the responder is disabled.");
+        return;
+    }
+    if let (Some(hint), Some(measured)) = (hint, iface_addr(IFACE)) {
+        if hint != measured.to_string() {
+            println!("mDNS: wifi-up says {} but {} measures {}; using the \
+                      measurement.", hint, IFACE, measured);
+        }
+    }
+    advertise(&mut shared, "wifi-up");
+}
+
+/// `wifi-down` from the FIFO, and every in-process path that drops the radio
+/// (suspend, share, exit, the menu toggle).  Idempotent, and deliberately
+/// reachable from both: whichever arrives first does the work, and the second
+/// says so rather than falling silent.
+///
+/// It must run BEFORE the link goes -- a goodbye packet sent over a dead link
+/// is not sent at all, and this is a network we do not own.
+pub fn stop() {
+    let mut shared = SHARED.lock().unwrap();
+    if shared.name.is_empty() {
+        return;
+    }
+    let name = shared.name.clone();
+    match shared.responder.take() {
+        Some(responder) => {
+            teardown(responder);
+            println!("mDNS: wifi-down -- withdrew {}.local.", name);
+        }
+        None => println!("mDNS: wifi-down -- nothing was advertised."),
+    }
+}
+
+/// Measure, then register if that changes anything.  `why` names the trigger,
+/// so the log says which of the several callers actually did the work.
+fn advertise(shared: &mut Shared, why: &str) {
+    let name = shared.name.clone();
 
     let Some(addr) = iface_addr(IFACE) else {
-        eprintln!("mDNS: no IPv4 address on {}; not advertising.", IFACE);
+        // Not an error: the radio is simply off, or the poke beat the address.
+        println!("mDNS: {} -- {} has no IPv4 address; not advertising.",
+                 why, IFACE);
         return;
     };
 
-    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-    match register(name, addr, generation) {
-        Ok(responder) => {
-            println!("mDNS: advertising {}.local as {} on {}.",
-                     name, addr, IFACE);
-            *STATE.lock().unwrap() = Some(responder);
-            spawn_watcher(generation);
-        }
-        Err(e) => eprintln!("mDNS: can't advertise {}.local: {}.", name, e),
+    if shared.responder.as_ref().map(|r| r.addr) == Some(addr) {
+        println!("mDNS: {} -- already advertising {}.local as {}; no change.",
+                 why, name, addr);
+        return;
     }
-}
 
-/// Withdraw the records and stop the daemon.  Must be called *before* the radio
-/// goes down: a goodbye packet sent over a dead link is not sent at all.
-pub fn stop() {
-    let Some(responder) = STATE.lock().unwrap().take() else { return };
-    // Invalidate the watcher without waiting for it: it checks on its next tick.
-    GENERATION.fetch_add(1, Ordering::SeqCst);
-    teardown(responder);
+    if let Some(responder) = shared.responder.take() {
+        let old = responder.addr;
+        teardown(responder);
+        println!("mDNS: {} -- {}.local moved off {}.", why, name, old);
+    }
+
+    match register(&name, addr) {
+        Ok(responder) => {
+            shared.responder = Some(responder);
+            println!("mDNS: {} -- advertising {}.local as {} on {}, and {} on \
+                      port {} (udp/5353 must be open on {}).",
+                     why, name, addr, IFACE, SERVICE_TYPE, SSH_PORT, IFACE);
+        }
+        Err(e) => eprintln!("mDNS: {} -- can't advertise {}.local as {}: {}.",
+                            why, name, addr, e),
+    }
 }
 
 fn teardown(responder: Responder) {
@@ -105,11 +185,9 @@ fn teardown(responder: Responder) {
     if let Ok(rx) = responder.daemon.shutdown() {
         rx.recv_timeout(TEARDOWN_WAIT).ok();
     }
-    println!("mDNS: withdrew {}.local.", responder.name);
 }
 
-fn register(name: &str, addr: Ipv4Addr, generation: u64)
-            -> Result<Responder, mdns_sd::Error> {
+fn register(name: &str, addr: Ipv4Addr) -> Result<Responder, mdns_sd::Error> {
     let daemon = ServiceDaemon::new()?;
     // Order matters: the selections are applied in the order they arrive, so
     // "everything off, then wlan0 on" leaves exactly wlan0 (loopback included
@@ -125,55 +203,20 @@ fn register(name: &str, addr: Ipv4Addr, generation: u64)
     let fullname = info.get_fullname().to_string();
     daemon.register(info)?;
 
-    Ok(Responder { daemon, fullname, name: name.to_string(), addr, generation })
+    Ok(Responder { daemon, fullname, addr })
 }
 
-/// Re-register when `wlan0`'s address changes under us, and stand down when the
-/// address disappears -- announcing a lease we no longer hold is the failure
-/// this whole feature is supposed to prevent.
-fn spawn_watcher(generation: u64) {
-    thread::spawn(move || loop {
-        thread::sleep(ADDR_POLL_INTERVAL);
-
-        // The lock is held across the whole swap on purpose: a `stop()` that
-        // interleaved with a re-registration would leave the freshly made
-        // daemon behind, advertising on a radio the app has decided to drop.
-        let mut guard = STATE.lock().unwrap();
-        let (name, known_addr) = match guard.as_ref() {
-            Some(responder) if responder.generation == generation =>
-                (responder.name.clone(), responder.addr),
-            _ => return,
-        };
-
-        match iface_addr(IFACE) {
-            Some(addr) if addr == known_addr => {}
-            Some(addr) => {
-                teardown(guard.take().expect("checked above"));
-                match register(&name, addr, generation) {
-                    Ok(responder) => {
-                        println!("mDNS: {}.local moved to {}.", name, addr);
-                        *guard = Some(responder);
-                    }
-                    Err(e) => {
-                        eprintln!("mDNS: can't re-advertise {}.local: {}.",
-                                  name, e);
-                        return;
-                    }
-                }
-            }
-            None => {
-                eprintln!("mDNS: {} lost its address; withdrawing.", IFACE);
-                teardown(guard.take().expect("checked above"));
-                return;
-            }
-        }
-    });
-}
-
+/// The interface's IPv4 address.
+///
+/// `filter().find_map()`, NOT `find().and_then()` -- `getifaddrs` returns one
+/// entry per address, so on a dual-stack interface the FIRST `wlan0` entry is
+/// its IPv6 link-local one.  Matching the name and then asking that one entry
+/// for v4 reports "no address" on an interface that plainly has one.  Caught on
+/// the Mac, where `en1`'s v4 address sits sixth in the list behind five v6 ones.
 fn iface_addr(name: &str) -> Option<Ipv4Addr> {
     if_addrs::get_if_addrs().ok()?.into_iter()
-        .find(|iface| iface.name == name && !iface.is_loopback())
-        .and_then(|iface| match iface.ip() {
+        .filter(|iface| iface.name == name && !iface.is_loopback())
+        .find_map(|iface| match iface.ip() {
             IpAddr::V4(addr) => Some(addr),
             _ => None,
         })

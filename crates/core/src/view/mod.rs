@@ -302,6 +302,11 @@ pub enum Event {
     // which is Home's menu entry.
     ImportLibrary,
     OpenByPath(PathBuf),
+    // Also from the FIFO, but poked by the device's own WiFi scripts rather
+    // than from the Mac: the radio came up / is about to go down. They carry
+    // the mDNS responder's lifecycle.
+    WifiUp(Option<String>),
+    WifiDown,
     LoadPixmap(usize),
     Update(UpdateMode),
     RefreshBookPreview(PathBuf, Option<PathBuf>),

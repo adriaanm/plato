@@ -189,7 +189,7 @@ fn resume(id: TaskId, tasks: &mut Vec<Task>, view: &mut dyn View, hub: &Sender<E
             // Kindle fork: report the link back, as at startup and in set_wifi.
             // On a thread: a wake that freezes for the whole association is a
             // wake the user reads as a crash.
-            spawn_wifi(true, &context.settings.mdns_name, hub);
+            spawn_wifi(true, hub);
         }
     }
     if id == TaskId::Suspend || id == TaskId::PrepareSuspend {
@@ -243,19 +243,19 @@ static WIFI_BUSY: AtomicBool = AtomicBool::new(false);
 /// what happens. A request that arrives mid-transition is dropped, not queued
 /// -- the answer would be stale by the time it ran.
 ///
-/// The mDNS responder rides on this transition, because this is the only place
-/// that knows the radio's state changed. It is started only after the script
-/// reports success -- there is no address to advertise before that -- and it is
-/// torn down BEFORE the radio goes, so its goodbye packets still have a link to
-/// leave by (crate::mdns).
-fn spawn_wifi(enable: bool, mdns_name: &str, hub: &Sender<Event>) {
+/// The mDNS responder is told about the transition but does NOT depend on it:
+/// it decides from wlan0's address, so a session that begins with the radio
+/// already up -- the normal case here, since WiFi is often brought up by the
+/// scripts over ssh -- still gets a responder. What this path contributes is
+/// the ordering the watcher cannot see: tear down BEFORE the radio goes, so
+/// the goodbye packets still have a link to leave by (crate::mdns).
+fn spawn_wifi(enable: bool, hub: &Sender<Event>) {
     if WIFI_BUSY.swap(true, Ordering::SeqCst) {
         hub.send(Event::Notify("WiFi is still changing state.".to_string())).ok();
         return;
     }
 
     let hub = hub.clone();
-    let mdns_name = mdns_name.to_string();
     thread::spawn(move || {
         if !enable {
             crate::mdns::stop();
@@ -269,7 +269,10 @@ fn spawn_wifi(enable: bool, mdns_name: &str, hub: &Sender<Event>) {
 
         if enable {
             if ok {
-                crate::mdns::start(&mdns_name);
+                // wifi-up.sh pokes the FIFO too, so this is usually a
+                // no-change no-op; it is kept because it costs nothing and
+                // covers a device whose scripts predate the poke.
+                crate::mdns::wifi_up(None);
             }
             hub.send(if ok { Event::Device(DeviceEvent::NetUp) }
                      else { Event::NetUpFailed }).ok();
@@ -287,7 +290,7 @@ fn set_wifi(enable: bool, hub: &Sender<Event>, context: &mut Context) {
     if !enable {
         context.online = false;
     }
-    spawn_wifi(enable, &context.settings.mdns_name, hub);
+    spawn_wifi(enable, hub);
 }
 
 #[derive(PartialEq)]
@@ -397,15 +400,22 @@ pub fn run() -> Result<(), Error> {
 
     spawn_fifo_listener(fifo_path(), tx.clone());
 
+    // One measurement, NOT gated on settings.wifi: this session very often
+    // begins with the radio already up (the scripts bring WiFi up over ssh, and
+    // the radio-off policy has usually cleared settings.wifi by then), and a
+    // session that starts that way sees no transition at all. Every later
+    // change arrives as a wifi-up/wifi-down poke on the FIFO -- see crate::mdns.
+    crate::mdns::init(&context.settings.mdns_name);
+
     context.fb.set_inverted(context.settings.inverted);
 
     // Kindle fork: same NetUp synthesis as set_wifi -- see its comment. Without
     // it, starting with wifi = true leaves context.online false forever, so the
     // UI never learns it is online even though the link is up.
     if context.settings.wifi {
-        spawn_wifi(true, &context.settings.mdns_name, &tx);
+        spawn_wifi(true, &tx);
     } else {
-        spawn_wifi(false, &context.settings.mdns_name, &tx);
+        spawn_wifi(false, &tx);
     }
 
     if context.settings.frontlight {
@@ -601,7 +611,7 @@ pub fn run() -> Result<(), Error> {
                                 context.settings = settings;
                             }
                             if context.settings.wifi {
-                                spawn_wifi(true, &context.settings.mdns_name, &tx);
+                                spawn_wifi(true, &tx);
                             }
                             if context.settings.frontlight {
                                 let levels = context.settings.frontlight_levels;
@@ -932,6 +942,18 @@ pub fn run() -> Result<(), Error> {
                     context.fb.set_dithered(dithered);
                     handle_event(view.as_mut(), &Event::Invalid(path), &tx, &mut bus, &mut rq, &mut context);
                 }
+            },
+            // The WiFi scripts' pokes. On a thread because the teardown waits
+            // for the goodbye packets to be confirmed -- a couple of seconds of
+            // frozen UI is not a price worth paying for a log line. The module
+            // is internally locked and every entry point is idempotent, so
+            // overlapping pokes are safe.
+            Event::WifiUp(ref addr) => {
+                let addr = addr.clone();
+                thread::spawn(move || crate::mdns::wifi_up(addr.as_deref()));
+            },
+            Event::WifiDown => {
+                thread::spawn(crate::mdns::stop);
             },
             Event::ImportLibrary => {
                 // The FIFO's `import`: the same sequence as the USB unshare.

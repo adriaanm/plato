@@ -1,7 +1,19 @@
 //! The remote-control seam (ezkindle `docs/platonic.md`): a thread blocks
 //! reading a FIFO and maps each line to an event, the same shape as the input
-//! threads. Two verbs: `import` re-scans the library, `open <path>` re-scans
-//! and then opens the document exactly as a tap on its row would.
+//! threads.
+//!
+//! Four verbs. `import` re-scans the library and `open <path>` re-scans and
+//! then opens the document exactly as a tap on its row would -- both driven by
+//! `platonic` from the Mac.
+//!
+//! `wifi-up [ADDR]` and `wifi-down` are driven by the DEVICE's own WiFi
+//! scripts, and exist because the scripts are the chokepoint: every path that
+//! changes the radio goes through them, including `just wifi-up` over ssh and
+//! an unattended reassociation, neither of which Plato can otherwise see. They
+//! carry the mDNS responder's lifecycle (`crate::mdns` in the plato crate).
+//! The address is optional and advisory -- the responder re-measures `wlan0`
+//! -- so a script that knows the address may pass it and one that does not can
+//! stay silent.
 
 use std::env;
 use std::fs::File;
@@ -21,6 +33,11 @@ pub const DEFAULT_FIFO_PATH: &str = "/tmp/plato.cmd";
 pub enum Command {
     Import,
     Open(PathBuf),
+    /// The radio came up (or reassociated, or changed address).
+    WifiUp(Option<String>),
+    /// The radio is about to go down. Sent BEFORE the teardown, so the
+    /// responder's goodbye packets still have a link to leave by.
+    WifiDown,
 }
 
 /// `/tmp/plato.cmd` on the device; `PLATO_FIFO` overrides it for host runs.
@@ -41,6 +58,19 @@ pub fn parse_command(line: &str) -> Option<Command> {
         if !rest.is_empty() {
             return Some(Command::Open(PathBuf::from(rest)));
         }
+    }
+    if line == "wifi-down" {
+        return Some(Command::WifiDown);
+    }
+    // The address is optional: `wifi-up` alone is as valid as `wifi-up 1.2.3.4`,
+    // because the responder measures the interface either way.
+    if line == "wifi-up" {
+        return Some(Command::WifiUp(None));
+    }
+    if let Some(rest) = line.strip_prefix("wifi-up ") {
+        let rest = rest.trim();
+        return Some(Command::WifiUp(
+            if rest.is_empty() { None } else { Some(rest.to_string()) }));
     }
     None
 }
@@ -84,6 +114,8 @@ pub fn spawn_fifo_listener(path: PathBuf, tx: Sender<Event>) {
             match parse_command(&line) {
                 Some(Command::Import) => { tx.send(Event::ImportLibrary).ok(); },
                 Some(Command::Open(path)) => { tx.send(Event::OpenByPath(path)).ok(); },
+                Some(Command::WifiUp(addr)) => { tx.send(Event::WifiUp(addr)).ok(); },
+                Some(Command::WifiDown) => { tx.send(Event::WifiDown).ok(); },
                 None => {
                     if !line.trim().is_empty() {
                         eprintln!("Unknown command on {}: {}.", path.display(), line.trim());
@@ -114,6 +146,26 @@ mod tests {
     fn parse_open_relative() {
         assert_eq!(parse_command("open inbox/foo.md\n"),
                    Some(Command::Open(PathBuf::from("inbox/foo.md"))));
+    }
+
+    #[test]
+    fn parse_wifi_verbs() {
+        assert_eq!(parse_command("wifi-down"), Some(Command::WifiDown));
+        assert_eq!(parse_command(" wifi-down\n"), Some(Command::WifiDown));
+        assert_eq!(parse_command("wifi-up"), Some(Command::WifiUp(None)));
+        assert_eq!(parse_command("wifi-up\n"), Some(Command::WifiUp(None)));
+        assert_eq!(parse_command("wifi-up 192.168.178.190"),
+                   Some(Command::WifiUp(Some("192.168.178.190".to_string()))));
+        // A script that word-splits to nothing must not become a different
+        // verb: `wifi-up $ADDR` with ADDR unset is still a plain wifi-up.
+        assert_eq!(parse_command("wifi-up   "), Some(Command::WifiUp(None)));
+    }
+
+    #[test]
+    fn wifi_verbs_are_not_confused_with_their_prefixes() {
+        assert_eq!(parse_command("wifi"), None);
+        assert_eq!(parse_command("wifi-upgrade"), None);
+        assert_eq!(parse_command("wifi-downgrade"), None);
     }
 
     #[test]
