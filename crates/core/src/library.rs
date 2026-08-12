@@ -216,6 +216,41 @@ impl Library {
         (files, dirs)
     }
 
+    // The Info a tap on this entry would send: from the database when there
+    // is one, otherwise built from the file the way `list` does. The path is
+    // relative to `home`.
+    pub fn info_by_path<P: AsRef<Path>>(&self, path: P) -> Option<Info> {
+        let relat = path.as_ref();
+        if self.mode == LibraryMode::Database {
+            return self.paths.get(relat)
+                       .and_then(|fp| self.db.get(fp))
+                       .cloned();
+        }
+
+        let full_path = self.home.join(relat);
+        let md = full_path.metadata().ok()?;
+        if !md.is_file() {
+            return None;
+        }
+        let kind = file_kind(&full_path).unwrap_or_default();
+        let size = md.len();
+        let fp = md.fingerprint(self.fat32_epoch).ok()?;
+        let file = FileInfo {
+            path: relat.to_path_buf(),
+            kind,
+            size,
+        };
+        let secs = (*fp >> 32) as i64;
+        let nsecs = ((*fp & ((1<<32) - 1)) % 1_000_000_000) as u32;
+        let added = DateTime::from_timestamp(secs, nsecs)?.naive_utc();
+        Some(Info {
+            file,
+            added,
+            reader: self.reading_states.get(&fp).cloned(),
+            .. Default::default()
+        })
+    }
+
     pub fn import(&mut self, settings: &ImportSettings) {
         if self.mode == LibraryMode::Filesystem {
             return;

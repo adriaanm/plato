@@ -297,6 +297,11 @@ pub enum Event {
     Key(KeyKind),
     Open(Box<Info>),
     OpenHtml(String, Option<String>),
+    // From the command FIFO (fifo.rs), not from any view: re-scan the
+    // library, and re-scan-then-open. Distinct from EntryId::Import,
+    // which is Home's menu entry.
+    ImportLibrary,
+    OpenByPath(PathBuf),
     LoadPixmap(usize),
     Update(UpdateMode),
     RefreshBookPreview(PathBuf, Option<PathBuf>),

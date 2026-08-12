@@ -24,6 +24,7 @@ use plato_core::view::rotation_values::RotationValues;
 use plato_core::document::sys_info_as_html;
 use plato_core::input::{DeviceEvent, PowerSource, ButtonCode, ButtonStatus, VAL_RELEASE, VAL_PRESS};
 use plato_core::input::{raw_events, device_events, usb_events, display_rotate_event, button_scheme_event};
+use plato_core::fifo::{fifo_path, spawn_fifo_listener};
 use plato_core::gesture::{GestureEvent, gesture_events};
 use plato_core::helpers::{load_toml, save_toml, is_installed, suspend_outcome, SuspendOutcome};
 use plato_core::settings::{ButtonScheme, Settings, SETTINGS_PATH, RotationLock, IntermKind};
@@ -380,6 +381,8 @@ pub fn run() -> Result<(), Error> {
             }
         });
     }
+
+    spawn_fifo_listener(fifo_path(), tx.clone());
 
     context.fb.set_inverted(context.settings.inverted);
 
@@ -909,6 +912,35 @@ pub fn run() -> Result<(), Error> {
                     }
                     context.fb.set_dithered(dithered);
                     handle_event(view.as_mut(), &Event::Invalid(path), &tx, &mut bus, &mut rq, &mut context);
+                }
+            },
+            Event::ImportLibrary => {
+                // The FIFO's `import`: the same sequence as the USB unshare.
+                context.library.reload();
+                context.batch_import();
+                view.handle_event(&Event::Reseed, &tx, &mut bus, &mut rq, &mut context);
+                tx.send(Event::Notify("Library imported.".to_string())).ok();
+            },
+            Event::OpenByPath(ref path) => {
+                // The FIFO's `open`: it implies import -- a file pushed a
+                // moment ago has no library entry to look up yet.
+                context.library.reload();
+                context.batch_import();
+                view.handle_event(&Event::Reseed, &tx, &mut bus, &mut rq, &mut context);
+                let relat = path.strip_prefix(&context.library.home).unwrap_or(path);
+                if let Some(info) = context.library.info_by_path(relat) {
+                    if view.is::<Reader>() {
+                        // Close the current document the way EntryId::Quit
+                        // does: hand the reader a Back so its quit() saves the
+                        // position, then let the Back arm pop it off history.
+                        // Event::Open alone would stack reader on reader.
+                        view.handle_event(&Event::Back, &tx, &mut bus, &mut rq, &mut context);
+                        tx.send(Event::Back).ok();
+                    }
+                    tx.send(Event::Notify(format!("{} added.", info.title()))).ok();
+                    tx.send(Event::Open(Box::new(info))).ok();
+                } else {
+                    tx.send(Event::Notify(format!("Can't find {}.", path.display()))).ok();
                 }
             },
             Event::Select(EntryId::About) => {

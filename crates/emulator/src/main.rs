@@ -38,6 +38,7 @@ use plato_core::settings::{Settings, SETTINGS_PATH, IntermKind};
 use plato_core::geom::{Rectangle, Axis};
 use plato_core::color::Color;
 use plato_core::gesture::{GestureEvent, gesture_events};
+use plato_core::fifo::{fifo_path, spawn_fifo_listener};
 use plato_core::device::CURRENT_DEVICE;
 use plato_core::battery::{Battery, FakeBattery};
 use plato_core::frontlight::{Frontlight, LightLevels};
@@ -269,6 +270,8 @@ fn main() -> Result<(), Error> {
         }
     });
 
+    spawn_fifo_listener(fifo_path(), tx.clone());
+
     let mut history: Vec<Box<dyn View>> = Vec::new();
     let mut rq = RenderQueue::new();
     let mut view: Box<dyn View> = Box::new(Home::new(context.fb.rect(), &tx,
@@ -422,6 +425,36 @@ fn main() -> Result<(), Error> {
                             }
                         }
                         handle_event(view.as_mut(), &Event::Invalid(path), &tx, &mut bus, &mut rq, &mut context);
+                    }
+                },
+                Event::ImportLibrary => {
+                    // The FIFO's `import`: the same sequence as the USB unshare.
+                    context.library.reload();
+                    context.batch_import();
+                    view.handle_event(&Event::Reseed, &tx, &mut bus, &mut rq, &mut context);
+                    tx.send(Event::Notify("Library imported.".to_string())).ok();
+                },
+                Event::OpenByPath(ref path) => {
+                    // The FIFO's `open`: it implies import -- a file pushed a
+                    // moment ago has no library entry to look up yet.
+                    context.library.reload();
+                    context.batch_import();
+                    view.handle_event(&Event::Reseed, &tx, &mut bus, &mut rq, &mut context);
+                    let relat = path.strip_prefix(&context.library.home).unwrap_or(path);
+                    if let Some(info) = context.library.info_by_path(relat) {
+                        if view.is::<Reader>() {
+                            // Close the current document the way EntryId::Quit
+                            // does: hand the reader a Back so its quit() saves
+                            // the position, then let the Back arm pop it off
+                            // history. Event::Open alone would stack reader on
+                            // reader.
+                            view.handle_event(&Event::Back, &tx, &mut bus, &mut rq, &mut context);
+                            tx.send(Event::Back).ok();
+                        }
+                        tx.send(Event::Notify(format!("{} added.", info.title()))).ok();
+                        tx.send(Event::Open(Box::new(info))).ok();
+                    } else {
+                        tx.send(Event::Notify(format!("Can't find {}.", path.display()))).ok();
                     }
                 },
                 Event::OpenHtml(ref html, ref link_uri) => {

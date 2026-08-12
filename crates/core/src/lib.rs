@@ -8,6 +8,7 @@ pub mod frontlight;
 pub mod lightsensor;
 pub mod battery;
 pub mod input;
+pub mod fifo;
 pub mod helpers;
 mod dictionary;
 pub mod document;
