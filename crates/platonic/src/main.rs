@@ -29,6 +29,7 @@
 //! all exist as applets) and every check trusts OUTPUT, not exit codes.
 
 mod link;
+mod pair;
 mod pure;
 mod session;
 
@@ -55,7 +56,8 @@ push a document to the Kindle and start reading it (docs/platonic.md)
   --title T     library title (heading) for text/stdin input
   --open FILE   with several files, the one to open
   --list        what is on the reader, and when inbox items expire
-  --pair        one-time per Mac (not yet wired up)
+  --pair        one-time per Mac: tap Applications > Pair a Mac on the
+                reader, then type the code it shows
   --days N      inbox expiry age (default 14)
   --host H      reader address; skips discovery, no fallback
   --dry-run     print every ssh command instead of running it
@@ -585,16 +587,6 @@ fn cmd_list(ctx: &Ctx, args: &Args, now: f64) {
     }
 }
 
-/// TODO(PLATONIC-MAGIC-PAIR): wire this to the `pairing` crate (SPAKE2), which
-/// mints the per-Mac `~/.ssh/platonic_ed25519` push key and installs it on the
-/// device.  The pieces this needs from `pure.rs` -- the known_hosts alias
-/// derivation, `allowed-kinds` inspection -- are already ported and tested;
-/// only the protocol half is missing.
-fn cmd_pair(_ctx: &Ctx, _args: &Args, _now: f64) {
-    eprintln!("pairing not yet wired up — see PLATONIC-MAGIC-PAIR");
-    std::process::exit(1);
-}
-
 fn main() {
     let args = parse_args(std::env::args().skip(1).collect());
     let now = SystemTime::now().duration_since(UNIX_EPOCH)
@@ -605,7 +597,7 @@ fn main() {
     if args.list {
         cmd_list(&ctx, &args, now);
     } else if args.pair {
-        cmd_pair(&ctx, &args, now);
+        pair::cmd_pair(&ctx, &args);
     } else {
         cmd_push(&ctx, &args, now);
     }

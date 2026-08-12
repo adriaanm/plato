@@ -10,12 +10,16 @@ description = "Push a document to the reader over ssh and open it (docs/platonic
 # ten flags would be the heaviest change in the crate.  Same reasoning as
 # crates/foldersync.
 #
-# The one exception, and it is not really one: `platonic-recv` is the DEVICE
-# half of this tool, and what is linked from it is the wire protocol both ends
-# have to agree on.  One definition, no drift -- exactly the reasoning behind
-# `crates/pairing`.  It is std-only itself, so nothing new enters the tree.
+# The two exceptions are the same exception twice: each is the OTHER END of a
+# wire this tool speaks, linked so no parameter is written down in two places.
+# `platonic-recv` is the device's document receiver -- std-only itself, so
+# nothing new enters the tree.  `pairing` is the SPAKE2 handshake the reader
+# runs in its pairing window; it brings the RustCrypto stack the device binary
+# already links, and re-implementing that protocol on this side is exactly the
+# drift the shared crate exists to prevent.
 [dependencies]
 platonic-recv = { path = "../platonic-recv" }
+pairing = { path = "../pairing" }
 
 [[bin]]
 name = "platonic"

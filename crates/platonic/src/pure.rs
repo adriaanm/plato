@@ -26,7 +26,7 @@ pub const ALIAS: &str = "platokin";
 pub const USB_ADDR: &str = "192.168.15.244";
 pub const DOCROOT: &str = "/mnt/us/documents";
 pub const FIFO: &str = "/tmp/plato.cmd";
-#[allow(dead_code)] // used by --pair, a stub until PLATONIC-MAGIC-PAIR lands
+#[allow(dead_code)] // dormant since --pair landed; see DORMANT below
 pub const SETTINGS_TOML: &str = "/mnt/us/plato/Settings.toml";
 pub const DEFAULT_DAYS: i64 = 14;
 
@@ -341,6 +341,15 @@ pub fn arp_lookup(table: &[(String, String)], mac: &str) -> Option<String> {
     table.iter().find(|(m, _)| m == mac).map(|(_, ip)| ip.clone())
 }
 
+// DORMANT, and deliberately kept.  `--pair` (src/pair.rs) landed 2026-08-12
+// and made two of these unnecessary rather than wrong: the reader now SENDS its
+// host key over the confirmed channel, so the alias entry is written from that
+// instead of derived from an address-keyed line somebody else wrote
+// (`derive_alias_line`, `find_source_line`).  The `allowed-kinds` trio is the
+// check docs/platonic.md asks --pair to make, which cannot be made yet: a
+// paired key may run only `platonic-recv`, and the receiver has no op that
+// reads `Settings.toml`.  Both are cheap to keep and expensive to re-derive.
+
 fn known_hosts_lines(text: &str) -> impl Iterator<Item = &str> {
     text.lines().map(|l| l.trim()).filter(|l| {
         !l.is_empty() && !l.starts_with('#') && !l.starts_with('|')
@@ -349,7 +358,7 @@ fn known_hosts_lines(text: &str) -> impl Iterator<Item = &str> {
 
 /// Does any known_hosts line already answer for the alias?  ssh looks up
 /// `[platokin]:2222` for a non-default port; accept the bare name too.
-#[allow(dead_code)] // used by --pair, a stub until PLATONIC-MAGIC-PAIR lands
+#[allow(dead_code)] // dormant since --pair landed; see DORMANT below
 pub fn alias_present(known_text: &str) -> bool {
     let bracketed = format!("[{}]:{}", ALIAS, SSH_PORT);
     known_hosts_lines(known_text).any(|line| {
@@ -361,7 +370,7 @@ pub fn alias_present(known_text: &str) -> bool {
 /// Rewrite an existing known_hosts line's host field to answer for the alias,
 /// keeping the key material verbatim.  Hashed lines (`|1|…`) cannot be derived
 /// from.
-#[allow(dead_code)] // used by --pair, a stub until PLATONIC-MAGIC-PAIR lands
+#[allow(dead_code)] // dormant since --pair landed; see DORMANT below
 pub fn derive_alias_line(line: &str) -> Result<String, String> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') || line.starts_with('|') {
@@ -377,7 +386,7 @@ pub fn derive_alias_line(line: &str) -> Result<String, String> {
 
 /// The line to derive the alias from: the entry keyed to the usbnet address on
 /// our port.
-#[allow(dead_code)] // used by --pair, a stub until PLATONIC-MAGIC-PAIR lands
+#[allow(dead_code)] // dormant since --pair landed; see DORMANT below
 pub fn find_source_line(known_text: &str) -> Option<String> {
     let wanted = format!("[{}]:{}", USB_ADDR, SSH_PORT);
     known_hosts_lines(known_text)
@@ -390,7 +399,7 @@ pub fn find_source_line(known_text: &str) -> Option<String> {
 
 /// Extract the `allowed-kinds` array from Plato's `Settings.toml`.  Returns
 /// (kinds, the matched line).
-#[allow(dead_code)] // used by --pair, a stub until PLATONIC-MAGIC-PAIR lands
+#[allow(dead_code)] // dormant since --pair landed; see DORMANT below
 pub fn parse_allowed_kinds(toml_text: &str) -> Option<(Vec<String>, String)> {
     for line in toml_text.lines() {
         let trimmed = line.trim_start();
@@ -418,7 +427,7 @@ pub fn parse_allowed_kinds(toml_text: &str) -> Option<(Vec<String>, String)> {
     None
 }
 
-#[allow(dead_code)] // used by --pair, a stub until PLATONIC-MAGIC-PAIR lands
+#[allow(dead_code)] // dormant since --pair landed; see DORMANT below
 pub fn corrected_kinds_line(kinds: &[String]) -> String {
     let mut ordered: Vec<String> = kinds.to_vec();
     for k in RENDERABLE {
@@ -430,7 +439,7 @@ pub fn corrected_kinds_line(kinds: &[String]) -> String {
     format!("allowed-kinds = [{}]", inner.join(", "))
 }
 
-#[allow(dead_code)] // used by --pair, a stub until PLATONIC-MAGIC-PAIR lands
+#[allow(dead_code)] // dormant since --pair landed; see DORMANT below
 pub fn missing_kinds(kinds: &[String]) -> Vec<&'static str> {
     RENDERABLE.iter().copied()
         .filter(|k| !kinds.iter().any(|have| have == k))
