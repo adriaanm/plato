@@ -14,9 +14,10 @@
 use crate::color::{BLACK, WHITE};
 use crate::context::Context;
 use crate::device::CURRENT_DEVICE;
-use crate::font::{font_from_style, Fonts, NORMAL_STYLE, PAIRING_CODE_STYLE};
+use crate::font::{font_from_style, Fonts, Style, FONT_SIZES, DISPLAY_FONT_SIZE,
+                  DISPLAY_STYLE, NORMAL_STYLE, PAIRING_CODE_STYLE};
 use crate::framebuffer::{Framebuffer, UpdateMode};
-use crate::geom::{CornerSpec, Rectangle};
+use crate::geom::{CornerSpec, Point, Rectangle};
 use crate::unit::scale_by_dpi;
 use crate::view::icon::Icon;
 use crate::view::{Bus, Event, Hub, RenderData, RenderQueue, View};
@@ -94,26 +95,61 @@ impl Pairing {
         }
     }
 
-    /// The line under the code: what to do, or what happened.
-    fn message(&self) -> Vec<String> {
+    /// The command to type, with the code already in it.
+    ///
+    /// Adriaan, 2026-08-12: the screen should show the command *including*
+    /// `--code`, so it can be typed straight across rather than read, held in
+    /// the head, and typed at a prompt that then asks for the code again.  The
+    /// code is still shown on its own line above, big, because that is the part
+    /// people check a character at a time.
+    fn command(&self) -> String {
+        format!("platonic --pair --code {}", self.code)
+    }
+
+    /// The closing lines: the address as the zero-dependency fallback, and how
+    /// long is left.
+    fn footer(&self) -> Vec<String> {
+        let mut lines = vec![format!("This reader: {}", self.address),
+                             format!("Closes in {}", clock(self.remaining))];
+        if let PairingStatus::WrongCode { attempts, max } = self.status {
+            lines.push(format!("Wrong code, try again ({} of {}).", attempts, max));
+        }
+        lines
+    }
+
+    /// What replaces the whole code-and-command block once the window is over.
+    fn outcome(&self) -> Vec<String> {
         match &self.status {
-            PairingStatus::Tick(..) | PairingStatus::WrongCode { .. } => {
-                let mut lines = vec![
-                    "Run: platonic --pair".to_string(),
-                    format!("This reader: {}", self.address),
-                    format!("Closes in {}", clock(self.remaining)),
-                ];
-                if let PairingStatus::WrongCode { attempts, max } = self.status {
-                    lines.push(format!("Wrong code, try again ({} of {}).", attempts, max));
-                }
-                lines
-            },
             PairingStatus::Paired(summary) => vec![summary.clone(), "Tap Back.".to_string()],
             PairingStatus::Failed(reason) => vec!["Pairing failed.".to_string(), reason.clone()],
             PairingStatus::Expired => vec!["The pairing window closed.".to_string(),
                                            "Nothing was changed.".to_string()],
+            _ => Vec::new(),
         }
     }
+}
+
+/// Draw one centred line, grown or shrunk to `target` px wide.
+///
+/// Everything on this screen is sized to the panel rather than given a guessed
+/// point size: it is read across a room, and a layout that merely happens to
+/// fit at 300 dpi is a layout that will not fit on the next panel.  `cap` stops
+/// a short string (a two-word heading) from being blown up to absurdity.
+fn draw_fitted(fb: &mut dyn Framebuffer, fonts: &mut Fonts, style: &Style, dpi: u16,
+               text: &str, origin: Point, width: i32, dy: i32,
+               target: i32, cap: u32) -> i32 {
+    let font = font_from_style(fonts, style, dpi);
+    // Always re-assert the size: these fonts are shared and cached, so a
+    // previous draw's set_size is still in effect.
+    font.set_size(style.size, dpi);
+    let mut plan = font.plan(text, None, None);
+    if plan.width > 0 && target > 0 {
+        let size = ((style.size as f32 * target as f32 / plan.width as f32) as u32).min(cap);
+        font.set_size(size, dpi);
+        plan = font.plan(text, None, None);
+    }
+    font.render(fb, BLACK, &plan, origin + pt!((width - plan.width) / 2, dy));
+    font.line_height()
 }
 
 fn clock(secs: u64) -> String {
@@ -157,38 +193,51 @@ impl View for Pairing {
         let height = self.rect.height() as i32;
 
         fb.draw_rectangle(&self.rect, WHITE);
+        let origin = self.rect.min;
 
-        let font = font_from_style(fonts, &NORMAL_STYLE, dpi);
-        let plan = font.plan("Pair a Mac", None, None);
-        let mut dy = height / 6;
-        font.render(fb, BLACK, &plan, self.rect.min + pt!((width - plan.width) / 2, dy));
+        // The panel is the unit of layout: this screen is read across a room
+        // and typed from, so everything is placed as a fraction of the height
+        // and grown to a fraction of the width.  Nothing here is a point size
+        // that happens to look right at 300 dpi.
+        let at = |f: f32| (height as f32 * f) as i32;
 
-        // The code is the whole point, so it is grown to the panel rather than
-        // given a guessed size: measure, scale to the target width, measure
-        // again.  It is never clipped and never ellipsized.
-        //
-        // It disappears the moment the window is over: a code still on screen
-        // reads as a window still open, which is exactly what it is not.
-        dy += height / 6;
-        if !self.status.is_terminal() {
-            let font = font_from_style(fonts, &PAIRING_CODE_STYLE, dpi);
-            let target = (width * 4) / 5;
-            let mut plan = font.plan(&self.code, None, None);
-            if plan.width != target && plan.width > 0 {
-                let size = (PAIRING_CODE_STYLE.size as f32 * target as f32
-                            / plan.width as f32) as u32;
-                font.set_size(size, dpi);
-                plan = font.plan(&self.code, None, None);
+        draw_fitted(fb, fonts, &DISPLAY_STYLE, dpi, "Pair a Mac", origin, width,
+                    at(0.12), width / 2, DISPLAY_FONT_SIZE);
+
+        if self.status.is_terminal() {
+            // The code goes the moment the window is over: a code still on
+            // screen reads as a window still open, which is exactly what it is
+            // not.  The outcome takes its place, in its size.
+            let mut dy = at(0.40);
+            for line in self.outcome() {
+                let h = draw_fitted(fb, fonts, &NORMAL_STYLE, dpi, &line, origin,
+                                    width, dy, (width * 3) / 4, FONT_SIZES[2]);
+                dy += 2 * h;
             }
-            font.render(fb, BLACK, &plan, self.rect.min + pt!((width - plan.width) / 2, dy));
-            dy += height / 8;
+            return;
         }
-        let font = font_from_style(fonts, &NORMAL_STYLE, dpi);
-        let step = 2 * font.line_height();
-        for line in self.message() {
-            let plan = font.plan(line, None, None);
-            font.render(fb, BLACK, &plan, self.rect.min + pt!((width - plan.width) / 2, dy));
-            dy += step;
+
+        // The code is the whole point: it is what somebody checks a character
+        // at a time, so it gets the panel's full width and no cap.
+        draw_fitted(fb, fonts, &PAIRING_CODE_STYLE, dpi, &self.code, origin,
+                    width, at(0.32), (width * 6) / 7, u32::MAX);
+
+        // The command, with the code already in it, so it can be typed
+        // straight across instead of being memorised (Adriaan, 2026-08-12).
+        // Monospace and nearly full width: this is the line that gets
+        // transcribed, so the WIDTH is what decides its size -- the cap is
+        // deliberately loose enough not to bind, or the one line somebody has
+        // to read while typing ends up the smallest thing on the screen.
+        draw_fitted(fb, fonts, &NORMAL_STYLE, dpi, "On your Mac, run:", origin,
+                    width, at(0.48), width / 3, FONT_SIZES[1]);
+        draw_fitted(fb, fonts, &PAIRING_CODE_STYLE, dpi, &self.command(), origin,
+                    width, at(0.57), (width * 9) / 10, 4 * FONT_SIZES[2]);
+
+        let mut dy = at(0.72);
+        for line in self.footer() {
+            let h = draw_fitted(fb, fonts, &NORMAL_STYLE, dpi, &line, origin,
+                                width, dy, width / 2, FONT_SIZES[1]);
+            dy += 2 * h;
         }
     }
 

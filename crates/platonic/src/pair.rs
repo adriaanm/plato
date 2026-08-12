@@ -571,7 +571,23 @@ pub fn cmd_pair(ctx: &Ctx, args: &Args) {
     };
 
     let (addr, _label) = find_reader(ctx, &args.host);
-    let reply = exchange(addr, &ssh_public_key, &mut read_code)
+    // `--code` supplies the FIRST attempt only.  A code given on the command
+    // line that the reader rejects is a typo like any other, and the honest
+    // answer is to ask -- replaying it for all ten attempts would spend the
+    // whole window on one wrong string, and the reader counts those.
+    let mut supplied = args.code.clone();
+    let mut codes = |attempt: usize| -> Code {
+        if let Some(raw) = supplied.take() {
+            match Code::parse(&raw) {
+                Ok(code) => return code,
+                // Do not fall through to the prompt: whoever passed --code is
+                // plausibly a script, and a script is not watching for one.
+                Err(e) => die(format!("--code: {}", e)),
+            }
+        }
+        read_code(attempt)
+    };
+    let reply = exchange(addr, &ssh_public_key, &mut codes)
         .unwrap_or_else(|e| die(e));
 
     println!();

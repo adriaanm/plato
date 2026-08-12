@@ -58,6 +58,8 @@ push a document to the Kindle and start reading it (docs/platonic.md)
   --list        what is on the reader, and when inbox items expire
   --pair        one-time per Mac: tap Applications > Pair a Mac on the
                 reader, then type the code it shows
+  --code C      the code, instead of being prompted for it (with --pair).
+                Also readable on stdin: echo CODE | platonic --pair
   --days N      inbox expiry age (default 14)
   --host H      reader address; skips discovery, no fallback
   --dry-run     print every ssh command instead of running it
@@ -93,6 +95,7 @@ struct Args {
     open: Option<String>,
     list: bool,
     pair: bool,
+    code: Option<String>,
     days: i64,
     host: Option<String>,
     dry_run: bool,
@@ -107,6 +110,7 @@ fn parse_args(argv: Vec<String>) -> Args {
         open: None,
         list: false,
         pair: false,
+        code: None,
         days: DEFAULT_DAYS,
         host: None,
         dry_run: false,
@@ -146,6 +150,7 @@ fn parse_args(argv: Vec<String>) -> Args {
             "--quiet" => args.quiet = true,
             "--list" => args.list = true,
             "--pair" => args.pair = true,
+            "--code" => args.code = Some(value("--code")),
             "--dry-run" => args.dry_run = true,
             "-" => args.files.push("-".to_string()),
             other if other.starts_with('-') && other.len() > 1 => {
