@@ -189,7 +189,7 @@ fn resume(id: TaskId, tasks: &mut Vec<Task>, view: &mut dyn View, hub: &Sender<E
             // Kindle fork: report the link back, as at startup and in set_wifi.
             // On a thread: a wake that freezes for the whole association is a
             // wake the user reads as a crash.
-            spawn_wifi(true, hub);
+            spawn_wifi(true, &context.settings.mdns_name, hub);
         }
     }
     if id == TaskId::Suspend || id == TaskId::PrepareSuspend {
@@ -242,14 +242,24 @@ static WIFI_BUSY: AtomicBool = AtomicBool::new(false);
 /// rewrites the routing table, so two of them racing is a bad way to find out
 /// what happens. A request that arrives mid-transition is dropped, not queued
 /// -- the answer would be stale by the time it ran.
-fn spawn_wifi(enable: bool, hub: &Sender<Event>) {
+///
+/// The mDNS responder rides on this transition, because this is the only place
+/// that knows the radio's state changed. It is started only after the script
+/// reports success -- there is no address to advertise before that -- and it is
+/// torn down BEFORE the radio goes, so its goodbye packets still have a link to
+/// leave by (crate::mdns).
+fn spawn_wifi(enable: bool, mdns_name: &str, hub: &Sender<Event>) {
     if WIFI_BUSY.swap(true, Ordering::SeqCst) {
         hub.send(Event::Notify("WiFi is still changing state.".to_string())).ok();
         return;
     }
 
     let hub = hub.clone();
+    let mdns_name = mdns_name.to_string();
     thread::spawn(move || {
+        if !enable {
+            crate::mdns::stop();
+        }
         let script = if enable { "scripts/wifi-enable.sh" } else { "scripts/wifi-disable.sh" };
         let ok = Command::new(script)
                          .status()
@@ -258,6 +268,9 @@ fn spawn_wifi(enable: bool, hub: &Sender<Event>) {
         WIFI_BUSY.store(false, Ordering::SeqCst);
 
         if enable {
+            if ok {
+                crate::mdns::start(&mdns_name);
+            }
             hub.send(if ok { Event::Device(DeviceEvent::NetUp) }
                      else { Event::NetUpFailed }).ok();
         }
@@ -274,7 +287,7 @@ fn set_wifi(enable: bool, hub: &Sender<Event>, context: &mut Context) {
     if !enable {
         context.online = false;
     }
-    spawn_wifi(enable, hub);
+    spawn_wifi(enable, &context.settings.mdns_name, hub);
 }
 
 #[derive(PartialEq)]
@@ -390,9 +403,9 @@ pub fn run() -> Result<(), Error> {
     // it, starting with wifi = true leaves context.online false forever, so the
     // UI never learns it is online even though the link is up.
     if context.settings.wifi {
-        spawn_wifi(true, &tx);
+        spawn_wifi(true, &context.settings.mdns_name, &tx);
     } else {
-        spawn_wifi(false, &tx);
+        spawn_wifi(false, &context.settings.mdns_name, &tx);
     }
 
     if context.settings.frontlight {
@@ -588,7 +601,7 @@ pub fn run() -> Result<(), Error> {
                                 context.settings = settings;
                             }
                             if context.settings.wifi {
-                                spawn_wifi(true, &tx);
+                                spawn_wifi(true, &context.settings.mdns_name, &tx);
                             }
                             if context.settings.frontlight {
                                 let levels = context.settings.frontlight_levels;
@@ -680,6 +693,9 @@ pub fn run() -> Result<(), Error> {
                 // Synchronous on purpose, unlike every other WiFi call: we are
                 // about to suspend, and a thread would simply be frozen too.
                 if context.settings.wifi {
+                    // Before the script, never after: a goodbye packet sent
+                    // over a dead link is not sent at all.
+                    crate::mdns::stop();
                     Command::new("scripts/wifi-disable.sh")
                             .status()
                             .ok();
@@ -798,6 +814,9 @@ pub fn run() -> Result<(), Error> {
                 // Synchronous on purpose, unlike every other WiFi call: we are
                 // about to suspend, and a thread would simply be frozen too.
                 if context.settings.wifi {
+                    // Before the script, never after: a goodbye packet sent
+                    // over a dead link is not sent at all.
+                    crate::mdns::stop();
                     Command::new("scripts/wifi-disable.sh")
                             .status()
                             .ok();
@@ -1214,6 +1233,12 @@ pub fn run() -> Result<(), Error> {
             tx.send(ce).ok();
         }
     }
+
+    // Quit, reboot and power off all end here, and all of them end the radio.
+    // Withdraw the records while there is still a link to withdraw them over --
+    // otherwise the network we do not own keeps a record of a reader that is
+    // gone for its whole TTL.
+    crate::mdns::stop();
 
     if exit_status == ExitStatus::Quit && !CURRENT_DEVICE.has_gyroscope() && context.display.rotation != initial_rotation {
         context.fb.set_rotation(initial_rotation).ok();

@@ -250,10 +250,16 @@ impl Ctx {
             }
         }
 
-        for addr in resolve_all(ALIAS) {
-            if self.probe(&addr) {
-                self.write_cache(&addr);
-                return addr;
+        // Two name rungs, cheapest first -- see `pure::dns_names`.  The
+        // `.local` one is answered by the reader's own mDNS responder
+        // (crates/plato/src/mdns.rs), so it works on a router that registers
+        // no client names at all.
+        for name in dns_names(ALIAS) {
+            for addr in resolve_all(&name) {
+                if self.probe(&addr) {
+                    self.write_cache(&addr);
+                    return addr;
+                }
             }
         }
 

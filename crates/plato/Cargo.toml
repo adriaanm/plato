@@ -9,4 +9,6 @@ name = "plato"
 path = "src/main.rs"
 
 [dependencies]
+if-addrs = "0.15.0"
+mdns-sd = { version = "0.21.0", default-features = false }
 plato-core = { path = "../core" }

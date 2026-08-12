@@ -30,6 +30,27 @@ pub const DEFAULT_DAYS: i64 = 14;
 
 pub const NO_READER_MSG: &str = "no reader found — is it awake with WiFi on?";
 
+/// The name rungs of the discovery ladder, cheapest first.
+///
+/// 1. The bare name, answered by the router *if* it registers DHCP client
+///    names.  Ours does; a public user's may not, which is why this is a fast
+///    path rather than a mechanism (docs/pairing-candidates.md).
+/// 2. `<name>.local`, answered by the reader itself over mDNS — no router
+///    cooperation at all.  macOS resolves it natively through mDNSResponder,
+///    so this rung costs the Mac nothing but a name.
+///
+/// The order is load-bearing: rung 1 is one unicast query to a resolver that
+/// usually has the answer cached, rung 2 is a multicast round trip that waits
+/// for the reader to be awake and associated.  On a network where both work,
+/// paying for the cheap one first is free.
+///
+/// Both rungs are still verified by connecting under the HostKeyAlias, so a
+/// name hijacked by anything else on the LAN fails the probe rather than
+/// receiving a document.
+pub fn dns_names(alias: &str) -> Vec<String> {
+    vec![alias.to_string(), format!("{}.local", alias)]
+}
+
 //
 // ------------------------------------------------------------------ identity
 //
@@ -507,6 +528,31 @@ pub fn rm_command(paths: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- the discovery ladder's name rungs
+
+    #[test]
+    fn dns_names_puts_the_router_name_before_the_mdns_one() {
+        assert_eq!(dns_names(ALIAS), vec!["platokin", "platokin.local"]);
+    }
+
+    #[test]
+    fn dns_names_follows_a_renamed_reader() {
+        // The responder's name is a Settings key; rename it there and the
+        // `.local` rung has to follow, or the ladder probes a name nothing
+        // answers to.
+        assert_eq!(dns_names("study"), vec!["study", "study.local"]);
+    }
+
+    #[test]
+    fn the_mdns_rung_is_not_the_usb_address() {
+        // Ordering guard for the ladder as a whole: the `.local` name is tried
+        // while still on WiFi, BEFORE falling back to the usbnet address --
+        // which only answers with the cable in.
+        let names = dns_names(ALIAS);
+        assert!(!names.iter().any(|n| n == USB_ADDR));
+        assert_eq!(names.last().unwrap(), "platokin.local");
+    }
 
     // ---- --to validation
 

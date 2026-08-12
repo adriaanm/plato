@@ -135,6 +135,15 @@ pub struct Settings {
     pub keyboard_layout: String,
     pub frontlight: bool,
     pub wifi: bool,
+    /// Kindle fork: the name the mDNS responder claims, `.local` implied --
+    /// `platokin` answers to `platokin.local`.  Compile-time configuration is
+    /// the rule in this fork, but a *name* is the one thing two readers on one
+    /// LAN must not share, so it earns a key.  Empty disables the responder.
+    ///
+    /// Note the deployed `Settings.toml` decides: a serde default applies only
+    /// when the key is ABSENT (CLAUDE.md, 2026-08-11).  Plato rewrites the file
+    /// on suspend and on exit, so the key materialises there on its own.
+    pub mdns_name: String,
     pub inverted: bool,
     pub sleep_cover: bool,
     pub auto_share: bool,
@@ -621,6 +630,7 @@ impl Default for Settings {
             keyboard_layout: "English".to_string(),
             frontlight: true,
             wifi: false,
+            mdns_name: "platokin".to_string(),
             inverted: false,
             sleep_cover: true,
             auto_share: false,

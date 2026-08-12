@@ -1,4 +1,5 @@
 mod app;
+mod mdns;
 
 use plato_core::anyhow::Error;
 use crate::app::run;
