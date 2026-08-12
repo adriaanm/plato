@@ -26,6 +26,20 @@
 >   SPAKE2, same-WiFi only, no account and no cloud) and `crates/platonic-recv`,
 >   which is what a paired Mac gets **instead of** a shell.
 >
+> ### Installing the Mac-side tool
+>
+> ```sh
+> cargo install --path crates/platonic
+> ```
+>
+> Note the `--path`: `cargo install platonic` looks on crates.io, where this is
+> not published, and pointing it at the workspace root fails with *"there is
+> nothing to install … only packages with binaries can be installed"*, because
+> the root package has no binary.
+>
+> Then `platonic FILE` pushes a document to the reader and opens it, and
+> `platonic --pair --code …` pairs a new Mac using the code the reader shows.
+>
 > ### The sibling repo
 >
 > This repository is the reader itself. **[adriaanm/platokin](https://github.com/adriaanm/platokin)**
