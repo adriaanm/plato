@@ -42,6 +42,7 @@ pub mod calculator;
 pub mod sketch;
 pub mod touch_events;
 pub mod rotation_values;
+pub mod pairing;
 
 use std::ops::{Deref, DerefMut};
 use std::time::{Instant, Duration};
@@ -307,6 +308,10 @@ pub enum Event {
     // the mDNS responder's lifecycle.
     WifiUp(Option<String>),
     WifiDown,
+    /// Progress and outcome of a pairing window (`AppCmd::PairMac`). Sent from
+    /// the pairing thread, which never blocks the event loop; the view that
+    /// shows the code is a display only and owns nothing.
+    Pairing(pairing::PairingStatus),
     LoadPixmap(usize),
     Update(UpdateMode),
     RefreshBookPreview(PathBuf, Option<PathBuf>),
@@ -393,6 +398,10 @@ pub enum AppCmd {
     /// the others this opens no view: it starts a background fetcher and
     /// reports through notifications.
     Sync,
+    /// Open a bounded pairing window so a Mac on the same WiFi can earn push
+    /// access by typing the code shown on screen.  Kindle fork; the window
+    /// itself lives in the `plato` crate's pairing thread.
+    PairMac,
 }
 
 impl AppCmd {

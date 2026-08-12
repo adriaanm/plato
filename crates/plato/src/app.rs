@@ -21,6 +21,7 @@ use plato_core::view::calculator::Calculator;
 use plato_core::view::sketch::Sketch;
 use plato_core::view::touch_events::TouchEvents;
 use plato_core::view::rotation_values::RotationValues;
+use plato_core::view::pairing::Pairing;
 use plato_core::document::sys_info_as_html;
 use plato_core::input::{DeviceEvent, PowerSource, ButtonCode, ButtonStatus, VAL_RELEASE, VAL_PRESS};
 use plato_core::input::{raw_events, device_events, usb_events, display_rotate_event, button_scheme_event};
@@ -1019,6 +1020,16 @@ pub fn run() -> Result<(), Error> {
                 });
                 view = next_view;
             },
+            // The pairing view is a display, not the owner of the window: the
+            // user can leave it and the thread runs to its own deadline. An
+            // outcome that lands with the view gone would otherwise vanish,
+            // and "did it pair?" is exactly the question that must not be left
+            // open.
+            Event::Pairing(ref status) if status.is_terminal() && !view.is::<Pairing>() => {
+                if let Some(line) = status.notification() {
+                    tx.send(Event::Notify(line)).ok();
+                }
+            },
             Event::NetUpFailed => {
                 context.settings.wifi = false;
                 context.online = false;
@@ -1071,6 +1082,25 @@ pub fn run() -> Result<(), Error> {
                             tx.send(Event::Notify("Sync from the Home view.".to_string())).ok();
                         }
                         None
+                    },
+                    // Every precondition is checked before a code reaches the
+                    // screen: the radio has to be up and the host key has to
+                    // parse.  A window nobody can reach, or one that cannot
+                    // answer a Mac that typed the code correctly, is worse than
+                    // a refusal that says why.
+                    AppCmd::PairMac => {
+                        match crate::pairing::arm(&context.settings.mdns_name, &tx) {
+                            Ok(armed) => Some(Box::new(
+                                Pairing::new(context.fb.rect(), armed.code,
+                                             format!("{}:{}", armed.address, armed.port),
+                                             armed.window.as_secs(),
+                                             &mut rq, &mut context)) as Box<dyn View>),
+                            Err(reason) => {
+                                eprintln!("Can't pair: {}", reason);
+                                tx.send(Event::Notify(reason)).ok();
+                                None
+                            },
+                        }
                     },
                 };
 

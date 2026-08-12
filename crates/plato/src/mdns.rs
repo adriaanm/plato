@@ -213,7 +213,7 @@ fn register(name: &str, addr: Ipv4Addr) -> Result<Responder, mdns_sd::Error> {
 /// its IPv6 link-local one.  Matching the name and then asking that one entry
 /// for v4 reports "no address" on an interface that plainly has one.  Caught on
 /// the Mac, where `en1`'s v4 address sits sixth in the list behind five v6 ones.
-fn iface_addr(name: &str) -> Option<Ipv4Addr> {
+pub(crate) fn iface_addr(name: &str) -> Option<Ipv4Addr> {
     if_addrs::get_if_addrs().ok()?.into_iter()
         .filter(|iface| iface.name == name && !iface.is_loopback())
         .find_map(|iface| match iface.ip() {

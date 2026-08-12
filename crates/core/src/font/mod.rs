@@ -56,6 +56,17 @@ pub const KBD_LABEL: Style = Style {
     size: FONT_SIZES[0],
 };
 
+/// The pairing code, and nothing else.  Monospace bold rather than the display
+/// face: the code is *transcribed*, not read, so unambiguous glyphs and thick
+/// strokes matter more than elegance -- Cormorant at 39pt is beautiful and
+/// wrong for eight characters somebody has to copy across a room.  The size is
+/// a starting point; the view scales it to the panel's width.
+pub const PAIRING_CODE_STYLE: Style = Style {
+    family: Family::Monospace,
+    variant: Variant::BOLD,
+    size: FONT_SIZES[2],
+};
+
 pub const DISPLAY_STYLE: Style = Style {
     family: Family::Display,
     variant: Variant::REGULAR,

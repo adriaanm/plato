@@ -502,6 +502,13 @@ fn main() -> Result<(), Error> {
                             }
                             None
                         },
+                        // The pairing window needs wlan0, iptables and the
+                        // device's ssh key files; there is nothing to pair with
+                        // here.
+                        AppCmd::PairMac => {
+                            tx.send(Event::Notify("Pairing runs on the device.".to_string())).ok();
+                            None
+                        },
                     };
                     if let Some(mut next_view) = next_view {
                         transfer_notifications(view.as_mut(), next_view.as_mut(), &mut rq, &mut context);

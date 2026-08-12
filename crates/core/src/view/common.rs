@@ -75,7 +75,8 @@ pub fn application_entries(is_available: impl Fn(&AppCmd) -> bool) -> Vec<EntryK
     let apps = [("Dictionary", AppCmd::Dictionary { query: String::new(), language: String::new() }),
                 ("Calculator", AppCmd::Calculator),
                 ("Sketch", AppCmd::Sketch),
-                ("Sync", AppCmd::Sync)];
+                ("Sync", AppCmd::Sync),
+                ("Pair a Mac", AppCmd::PairMac)];
     let tools = [("Touch Events", AppCmd::TouchEvents),
                  ("Rotation Values", AppCmd::RotationValues)];
 
@@ -311,7 +312,7 @@ mod tests {
     #[test]
     fn every_app_is_offered_when_every_helper_is_installed() {
         assert_eq!(labels(&application_entries(|_| true)),
-                   ["Dictionary", "Calculator", "Sketch", "Sync", "---",
+                   ["Dictionary", "Calculator", "Sketch", "Sync", "Pair a Mac", "---",
                     "Touch Events", "Rotation Values"]);
     }
 
@@ -320,7 +321,7 @@ mod tests {
     fn an_app_with_a_missing_helper_is_not_offered() {
         let entries = application_entries(|cmd| *cmd != AppCmd::Calculator);
         assert_eq!(labels(&entries),
-                   ["Dictionary", "Sketch", "Sync", "---",
+                   ["Dictionary", "Sketch", "Sync", "Pair a Mac", "---",
                     "Touch Events", "Rotation Values"]);
     }
 
