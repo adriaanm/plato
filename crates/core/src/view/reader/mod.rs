@@ -395,12 +395,12 @@ impl Reader {
         open(&path).and_then(|mut doc| {
             let (width, height) = context.display.dims;
             let font_size = info.reader.as_ref().and_then(|r| r.font_size)
-                                .unwrap_or(settings.reader.font_size);
+                                .unwrap_or_else(|| settings.reader.font_size_for(&info.file.kind));
 
             doc.layout(width, height, font_size, CURRENT_DEVICE.dpi);
 
             let margin_width = info.reader.as_ref().and_then(|r| r.margin_width)
-                                   .unwrap_or(settings.reader.margin_width);
+                                   .unwrap_or_else(|| settings.reader.margin_width_for(&info.file.kind));
 
             if margin_width != DEFAULT_MARGIN_WIDTH {
                 doc.set_margin_width(margin_width);
@@ -627,7 +627,7 @@ impl Reader {
 
         let mut doc = HtmlDocument::new_from_memory(html);
         let (width, height) = context.display.dims;
-        let font_size = context.settings.reader.font_size;
+        let font_size = context.settings.reader.font_size_for(&info.file.kind);
         doc.layout(width, height, font_size, CURRENT_DEVICE.dpi);
         let pages_count = doc.pages_count();
         info.title = doc.title().unwrap_or_default();
@@ -1421,7 +1421,7 @@ impl Reader {
                 tool_bar.update_font_family(font_family, rq);
                 let font_size = self.info.reader.as_ref()
                                     .and_then(|r| r.font_size)
-                                    .unwrap_or(settings.reader.font_size);
+                                    .unwrap_or_else(|| settings.reader.font_size_for(&self.info.file.kind));
                 tool_bar.update_font_size_slider(font_size, rq);
                 let text_align = self.info.reader.as_ref()
                                     .and_then(|r| r.text_align)
@@ -1438,7 +1438,7 @@ impl Reader {
             let reflowable = self.reflowable;
             let margin_width = self.info.reader.as_ref()
                                    .and_then(|r| if reflowable { r.margin_width } else { r.screen_margin_width })
-                                   .unwrap_or_else(|| if reflowable { settings.reader.margin_width } else { 0 });
+                                   .unwrap_or_else(|| if reflowable { settings.reader.margin_width_for(&self.info.file.kind) } else { 0 });
             tool_bar.update_margin_width(margin_width, rq);
         }
     }
@@ -2432,7 +2432,9 @@ impl Reader {
             }
 
             let font_size = self.info.reader.as_ref().and_then(|r| r.font_size)
-                                .unwrap_or(context.settings.reader.font_size);
+                                .unwrap_or_else(|| context.settings.reader.font_size_for(&self.info.file.kind));
+            // The bounds stay global on purpose: they are the range this
+            // screen is legible at, not a per-filetype preference.
             let min_font_size = context.settings.reader.font_size / 2.0;
             let max_font_size = 3.0 * context.settings.reader.font_size / 2.0;
             let entries = (0..=20).filter_map(|v| {
@@ -2571,7 +2573,7 @@ impl Reader {
             let reflowable = self.reflowable;
             let margin_width = self.info.reader.as_ref()
                                    .and_then(|r| if reflowable { r.margin_width } else { r.screen_margin_width })
-                                   .unwrap_or_else(|| if reflowable { context.settings.reader.margin_width } else { 0 });
+                                   .unwrap_or_else(|| if reflowable { context.settings.reader.margin_width_for(&self.info.file.kind) } else { 0 });
             let min_margin_width = context.settings.reader.min_margin_width;
             let max_margin_width = context.settings.reader.max_margin_width;
             let entries = (min_margin_width..=max_margin_width).map(|mw|
@@ -4414,7 +4416,7 @@ impl View for Reader {
             Event::Select(EntryId::SetFontSize(v)) => {
                 let font_size = self.info.reader.as_ref()
                                     .and_then(|r| r.font_size)
-                                    .unwrap_or(context.settings.reader.font_size);
+                                    .unwrap_or_else(|| context.settings.reader.font_size_for(&self.info.file.kind));
                 let font_size = font_size - 1.0 + v as f32 / 10.0;
                 self.set_font_size(font_size, hub, rq, context);
                 true
@@ -4743,7 +4745,7 @@ impl View for Reader {
         if self.reflowable {
             let font_size = self.info.reader.as_ref()
                                 .and_then(|r| r.font_size)
-                                .unwrap_or(context.settings.reader.font_size);
+                                .unwrap_or_else(|| context.settings.reader.font_size_for(&self.info.file.kind));
             let mut doc = self.doc.lock().unwrap();
             doc.layout(rect.width(), rect.height(), font_size, CURRENT_DEVICE.dpi);
             let current_page = self.current_page.min(doc.pages_count() - 1);

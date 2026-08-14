@@ -444,8 +444,46 @@ pub struct ReaderSettings {
     pub scroll_overlap_lines: usize,
     pub ignore_document_css: bool,
     pub dithered_kinds: FxHashSet<String>,
+    /// Per-filetype overrides of the defaults above, keyed by the same
+    /// lowercase extension `FileInfo::kind` carries. Only the two settings a
+    /// filetype plausibly wants to differ on are overridable; everything else
+    /// stays one number for the whole device.
+    ///
+    /// The order of preference is document, then kind, then `[reader]`, so a
+    /// size dialled in on one book still wins, and a kind that isn't named
+    /// here behaves exactly as it did before this existed.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub kinds: BTreeMap<String, KindSettings>,
     pub paragraph_breaker: ParagraphBreakerSettings,
     pub refresh_rate: RefreshRateSettings,
+}
+
+impl ReaderSettings {
+    /// The size a freshly opened document of this kind is laid out at.
+    pub fn font_size_for(&self, kind: &str) -> f32 {
+        self.kinds.get(kind)
+            .and_then(|k| k.font_size)
+            .unwrap_or(self.font_size)
+    }
+
+    /// The margin, in millimeters, a freshly opened document of this kind is
+    /// laid out with.
+    pub fn margin_width_for(&self, kind: &str) -> i32 {
+        self.kinds.get(kind)
+            .and_then(|k| k.margin_width)
+            .unwrap_or(self.margin_width)
+    }
+}
+
+/// What one filetype changes about the reader defaults. Both fields are
+/// optional: absent means "whatever `[reader]` says".
+#[derive(Debug, Copy, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct KindSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub margin_width: Option<i32>,
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
@@ -563,6 +601,14 @@ impl Default for ReaderSettings {
             scroll_overlap_lines: 2,
             ignore_document_css: false,
             dithered_kinds: ["cbz", "png", "jpg", "jpeg"].iter().map(|k| k.to_string()).collect(),
+            // Markdown is what `platonic` pushes off the Mac -- plans, notes,
+            // source files -- and it is read as reference, not as prose. It
+            // wants as much on the page as the screen will carry, where an
+            // EPUB wants a comfortable measure.
+            kinds: [("md".to_string(), KindSettings {
+                        font_size: Some(8.5),
+                        margin_width: Some(2),
+                    })].into_iter().collect(),
             paragraph_breaker: ParagraphBreakerSettings::default(),
             refresh_rate: RefreshRateSettings::default(),
         }
@@ -656,5 +702,59 @@ impl Default for Settings {
             frontlight_levels: LightLevels::default(),
             frontlight_presets: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn markdown_is_denser_than_everything_else_by_default() {
+        let reader = ReaderSettings::default();
+        assert_eq!(reader.font_size_for("md"), 8.5);
+        assert_eq!(reader.margin_width_for("md"), 2);
+        // An unnamed kind is exactly what it was before `kinds` existed.
+        assert_eq!(reader.font_size_for("epub"), DEFAULT_FONT_SIZE);
+        assert_eq!(reader.margin_width_for("epub"), DEFAULT_MARGIN_WIDTH);
+    }
+
+    #[test]
+    fn a_settings_file_without_the_section_still_gets_the_markdown_defaults() {
+        // The upgrade case: every Settings.toml already on a device predates
+        // `[reader.kinds]` and spells out `[reader]` in full, because Plato
+        // rewrites the file on exit.
+        let settings: Settings = toml::from_str("\
+            [reader]\n\
+            font-size = 11.0\n\
+            margin-width = 8\n\
+        ").unwrap();
+        assert_eq!(settings.reader.font_size_for("md"), 8.5);
+        assert_eq!(settings.reader.margin_width_for("md"), 2);
+    }
+
+    #[test]
+    fn a_settings_file_with_the_section_replaces_the_whole_map() {
+        // Note the shape of this: `kinds` is one field, so naming *any* kind
+        // in the file displaces the default map entirely. Hand-editing a file
+        // that has no `[reader.kinds]` yet has to restate `md` to keep it.
+        let settings: Settings = toml::from_str("\
+            [reader.kinds.md]\n\
+            font-size = 9.0\n\
+        ").unwrap();
+        assert_eq!(settings.reader.font_size_for("md"), 9.0);
+        // Absent within a kind that *is* named means "fall back to [reader]".
+        assert_eq!(settings.reader.margin_width_for("md"), DEFAULT_MARGIN_WIDTH);
+    }
+
+    #[test]
+    fn the_defaults_survive_a_round_trip_through_toml() {
+        // Plato rewrites Settings.toml on exit, so a default that cannot
+        // serialize is a default that silently disappears after one run.
+        let written = toml::to_string(&Settings::default()).unwrap();
+        assert!(written.contains("[reader.kinds.md]"), "{}", written);
+        let read: Settings = toml::from_str(&written).unwrap();
+        assert_eq!(read.reader.font_size_for("md"), 8.5);
+        assert_eq!(read.reader.margin_width_for("md"), 2);
     }
 }

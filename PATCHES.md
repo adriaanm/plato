@@ -1246,3 +1246,65 @@ Plato keeps `wifi = false` as the default and the user turns it on when they
 want to sync. That makes Plato the single owner of the WiFi state — worth
 stating because the alternative (a boot-time flag in the platokin repo's
 `ezssh-boot.sh`) would fight Plato's startup `wifi-disable.sh` on every launch.
+
+## Reader defaults per filetype, and markdown's denser page
+
+Files: `crates/core/src/settings/mod.rs`, `crates/core/src/view/reader/mod.rs`.
+
+The reader had one font size and one margin width for the whole device. That is
+right for a library of books, and wrong here, because this fork reads two very
+different things: EPUBs bought on kobo.com, which want a comfortable measure,
+and **markdown pushed off the Mac by `platonic`** — plans, notes, source files —
+which is consulted rather than read, and wants as much on the screen as the
+screen will carry.
+
+So `ReaderSettings` gains one map:
+
+```toml
+[reader.kinds.md]
+font-size = 8.5
+margin-width = 2
+```
+
+keyed by the same lowercase extension `FileInfo::kind` already carries, with a
+`KindSettings` value whose two fields are both `Option`. The resolution order is
+**document, then kind, then `[reader]`** — a size dialled in on one book still
+wins, and a kind that is not named behaves exactly as it did before this
+existed. Two methods, `ReaderSettings::font_size_for(kind)` and
+`margin_width_for(kind)`, are the only way the middle step is reached; the eight
+sites in `reader/mod.rs` that used to say `settings.reader.font_size` or
+`.margin_width` as a fallback now call them (open, `from_html`, the tool bar,
+both menus, `SetFontSize`, and the resize path).
+
+The `md` entry above **is the compiled default**, not just sample config. That
+is what makes it reach a device already in the field: `ReaderSettings` carries
+`#[serde(default)]`, so a `Settings.toml` with no `[reader.kinds]` — which is
+every one written before this change, and Plato rewrites the file on exit —
+takes the whole map from `Default`. Nothing has to be hand-edited on the
+Kindle. A markdown file already in `.metadata.json` picks the new size up too,
+since `ReaderInfo::font_size` stays `None` unless the size was changed by hand
+on that document.
+
+The one sharp edge, which the tests pin: `kinds` is a single field, so naming
+*any* kind in a `Settings.toml` displaces the default map entirely. Adding a
+`[reader.kinds.pdf]` section by hand to a file that has no `[reader.kinds]` yet
+would drop markdown's defaults with it. In practice the window is small — the
+first exit serialises the full map — but it is the kind of thing that is
+invisible when it bites.
+
+Deliberately **not** per-kind: `min-font-size` / `max-font-size` and
+`min-margin-width` / `max-margin-width`. Those are the range this screen is
+legible at, a property of the hardware rather than of a filetype, and making
+them per-kind would *narrow* what markdown can be adjusted to rather than widen
+it. Also not touched: `from_html`'s margin, which upstream has never taken from
+settings at all.
+
+Mergeable upstream? Plausibly — it is a generalisation of the `dithered-kinds`
+idea already there, it defaults to upstream's exact behaviour for every kind but
+`md`, and upstream does not render markdown at all, so the default map would be
+empty there.
+
+`contrib/Settings-sample.toml` is left alone, as it has been for every other
+setting this fork has added (`auto-crop`, `auto-columns`,
+`scroll-overlap-lines`, `mdns-name`): it is an upstream file, and editing it
+only makes a rebase fight.
