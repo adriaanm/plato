@@ -115,14 +115,14 @@ font-path = "/mnt/onboard/fonts"
 # The default serif font.
 font-family = "Libertinus Serif"
 # The default, minimum and maximum font sizes, in points.
-font-size = 11.0
+font-size = 9.0
 min-font-size = 5.5
 max-font-size = 16.5
 # The default text alignment.
 # Possible values: "left", "right", "center", "justify".
 text-align = "left"
 # The default, minimum and maximum margin widths, in millimeters.
-margin-width = 8
+margin-width = 2
 min-margin-width = 0
 max-margin-width = 10
 # The default line height, in ems.
@@ -135,6 +135,14 @@ ignore-document-css = false
 # The file extensions of the files that will automatically be dithered
 # when opened for the first time.
 dithered-kinds = ["cbz", "jpg", "png", "jpeg"]
+
+# Per-file-kind overrides of the `[reader]` defaults above. A kind that isn't
+# named here, or a key absent from a kind that is, falls back to `[reader]`.
+# Note that `kinds` is a single field: naming *any* kind here replaces the
+# built-in map entirely, so restate `md` if you want to keep it.
+[reader.kinds.md]
+font-size = 6.5
+margin-width = 1
 
 [reader.paragraph-breaker]
 # The penalty for hyphenated lines. The maximum value is 10_000.

@@ -57,9 +57,9 @@ lazy_static! {
 pub const LOGO_SPECIAL_PATH: &str = "logo:";
 pub const COVER_SPECIAL_PATH: &str = "cover:";
 // Default font size in points.
-pub const DEFAULT_FONT_SIZE: f32 = 11.0;
+pub const DEFAULT_FONT_SIZE: f32 = 9.0;
 // Default margin width in millimeters.
-pub const DEFAULT_MARGIN_WIDTH: i32 = 8;
+pub const DEFAULT_MARGIN_WIDTH: i32 = 2;
 // Default line height in ems.
 pub const DEFAULT_LINE_HEIGHT: f32 = 1.2;
 // Default font family name.
@@ -592,12 +592,18 @@ impl Default for ReaderSettings {
             font_path: DEFAULT_FONT_PATH.to_string(),
             font_family: DEFAULT_FONT_FAMILY.to_string(),
             font_size: DEFAULT_FONT_SIZE,
-            min_font_size: DEFAULT_FONT_SIZE / 2.0,
-            max_font_size: 3.0 * DEFAULT_FONT_SIZE / 2.0,
+            // The bounds are absolute rather than derived from the defaults
+            // above. They describe the range this screen is legible over,
+            // which is a property of the panel, not of wherever the default
+            // happens to sit -- and the default now sits at the dense end, so
+            // deriving would put large print and a roomy margin out of the
+            // menu's reach entirely.
+            min_font_size: 5.5,
+            max_font_size: 16.5,
             text_align: DEFAULT_TEXT_ALIGN,
             margin_width: DEFAULT_MARGIN_WIDTH,
-            min_margin_width: DEFAULT_MARGIN_WIDTH.saturating_sub(8),
-            max_margin_width: DEFAULT_MARGIN_WIDTH.saturating_add(2),
+            min_margin_width: 0,
+            max_margin_width: 10,
             line_height: DEFAULT_LINE_HEIGHT,
             continuous_fit_to_width: true,
             auto_crop: true,
@@ -616,8 +622,8 @@ impl Default for ReaderSettings {
             kinds: [(
                 "md".to_string(),
                 KindSettings {
-                    font_size: Some(8.5),
-                    margin_width: Some(2),
+                    font_size: Some(6.5),
+                    margin_width: Some(1),
                 },
             )]
             .into_iter()
@@ -730,11 +736,39 @@ mod tests {
     #[test]
     fn markdown_is_denser_than_everything_else_by_default() {
         let reader = ReaderSettings::default();
-        assert_eq!(reader.font_size_for("md"), 8.5);
-        assert_eq!(reader.margin_width_for("md"), 2);
+        assert_eq!(reader.font_size_for("md"), 6.5);
+        assert_eq!(reader.margin_width_for("md"), 1);
         // An unnamed kind is exactly what it was before `kinds` existed.
         assert_eq!(reader.font_size_for("epub"), DEFAULT_FONT_SIZE);
         assert_eq!(reader.margin_width_for("epub"), DEFAULT_MARGIN_WIDTH);
+    }
+
+    #[test]
+    fn every_default_is_reachable_from_its_menu() {
+        // The bounds used to be computed from the defaults, so lowering a
+        // default dragged the whole selectable range down with it -- and
+        // `DEFAULT_MARGIN_WIDTH - 8` went negative once the default fell below
+        // 8, which the margin menu happily offered. The menus are built by
+        // walking min..=max, so what this really pins is that a default is
+        // always one of the choices, and that a margin is never negative.
+        let reader = ReaderSettings::default();
+        assert!(reader.min_margin_width >= 0, "{}", reader.min_margin_width);
+        for kind in ["md", "epub"] {
+            let font_size = reader.font_size_for(kind);
+            assert!(
+                font_size >= reader.min_font_size && font_size <= reader.max_font_size,
+                "{kind}: {font_size} outside {}..={}",
+                reader.min_font_size,
+                reader.max_font_size
+            );
+            let margin_width = reader.margin_width_for(kind);
+            assert!(
+                margin_width >= reader.min_margin_width && margin_width <= reader.max_margin_width,
+                "{kind}: {margin_width} outside {}..={}",
+                reader.min_margin_width,
+                reader.max_margin_width
+            );
+        }
     }
 
     #[test]
@@ -750,8 +784,8 @@ mod tests {
         ",
         )
         .unwrap();
-        assert_eq!(settings.reader.font_size_for("md"), 8.5);
-        assert_eq!(settings.reader.margin_width_for("md"), 2);
+        assert_eq!(settings.reader.font_size_for("md"), 6.5);
+        assert_eq!(settings.reader.margin_width_for("md"), 1);
     }
 
     #[test]
@@ -762,11 +796,14 @@ mod tests {
         let settings: Settings = toml::from_str(
             "\
             [reader.kinds.md]\n\
-            font-size = 9.0\n\
+            font-size = 7.25\n\
         ",
         )
         .unwrap();
-        assert_eq!(settings.reader.font_size_for("md"), 9.0);
+        // Deliberately a size that is neither the `md` default nor
+        // DEFAULT_FONT_SIZE, so the assertion can only pass by reading the
+        // file.
+        assert_eq!(settings.reader.font_size_for("md"), 7.25);
         // Absent within a kind that *is* named means "fall back to [reader]".
         assert_eq!(settings.reader.margin_width_for("md"), DEFAULT_MARGIN_WIDTH);
     }
@@ -778,7 +815,7 @@ mod tests {
         let written = toml::to_string(&Settings::default()).unwrap();
         assert!(written.contains("[reader.kinds.md]"), "{}", written);
         let read: Settings = toml::from_str(&written).unwrap();
-        assert_eq!(read.reader.font_size_for("md"), 8.5);
-        assert_eq!(read.reader.margin_width_for("md"), 2);
+        assert_eq!(read.reader.font_size_for("md"), 6.5);
+        assert_eq!(read.reader.margin_width_for("md"), 1);
     }
 }
