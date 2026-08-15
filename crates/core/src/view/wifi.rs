@@ -41,6 +41,16 @@ const RADII: [f32; 3] = [0.34, 0.64, 0.94];
 const DOT_RADIUS: f32 = 0.11;
 const STROKE: f32 = 0.135;
 
+/// The lit-arc count for each frame of the sweep, cycled.
+///
+/// Up and back down rather than up-and-wrap. The wrap put a hard reset between
+/// three arcs and one, which on a panel that ghosts reads as a stutter; walking
+/// back down means every step changes exactly one arc, and the ghost of the arc
+/// just cleared falls where the next frame is going anyway.
+///
+/// Never 0: that frame is the Off glyph exactly.
+const SWEEP: [usize; 4] = [1, 2, 3, 2];
+
 /// The glyph's height, as a fraction of the frontlight icon's.
 ///
 /// Measured against that icon rather than against the slot, because the slot is
@@ -167,7 +177,7 @@ fn dot_color(state: WifiState) -> Color {
 fn lit(state: WifiState, frame: usize) -> usize {
     match state {
         WifiState::Off => 0,
-        WifiState::Connecting => frame,
+        WifiState::Connecting => SWEEP[frame % SWEEP.len()],
         // On but unconfirmed: everything but the outermost arc, so the
         // difference from a settled link is visible without being alarming.
         WifiState::On => RADII.len() - 1,
@@ -187,15 +197,8 @@ fn next_frame(current: WifiState, next: WifiState, frame: usize) -> Option<usize
         // Settled: repaint once, on the way in, and then never again.
         return if next == current { None } else { Some(0) };
     }
-    Some(if next == current {
-        // 1..=len, never 0: a frame with no arcs lit is pixel-identical to the
-        // Off state, so a sweep that began there looked like the tap had done
-        // nothing -- worst at the very first frame, which is the one moment the
-        // feedback matters most.
-        frame % RADII.len() + 1
-    } else {
-        1
-    })
+    // The frame is an index into SWEEP, so it just walks that table.
+    Some(if next == current { (frame + 1) % SWEEP.len() } else { 0 })
 }
 
 /// Rasterize the strike-through: a round-capped segment, anti-aliased the same
@@ -327,12 +330,14 @@ impl View for Wifi {
             let top = center.1 - (outer * scale + thickness / 2.0);
             let bottom = center.1 + DOT_RADIUS * scale;
             let middle = (top + bottom) / 2.0;
-            // 90% of the glyph's own span, trimmed symmetrically: at full
-            // length the ends overshot the fan far enough to read as their own
-            // mark rather than as a line drawn across it.
-            let reach = 0.9 * (2.0 * half_width).max(bottom - top) / 2.0;
-            let start = (center.0 - reach, middle - reach);
-            let end = (center.0 + reach, middle + reach);
+            // The two ends are trimmed by different amounts, because the fan is
+            // not symmetric about this line. Up and to the left the strike runs
+            // past the outer arc, which anchors it; down and to the right the
+            // ink stops at the dot, so an equal overhang there hangs in empty
+            // space and reads as the line having missed.
+            let reach = (2.0 * half_width).max(bottom - top) / 2.0;
+            let start = (center.0 - 0.82 * reach, middle - 0.82 * reach);
+            let end = (center.0 + 0.62 * reach, middle + 0.62 * reach);
 
             // No white knockout under it. That is the usual way to separate a
             // strike from what it crosses, but here the fan is already dimmed
@@ -425,20 +430,26 @@ mod tests {
         println!("{}", out.display());
     }
 
-    /// The sweep lights every arc in turn and wraps -- and never shows the
-    /// zero-arc frame, which would be indistinguishable from Off.
+    /// The sweep runs up and back down, and never shows the zero-arc frame,
+    /// which is the Off glyph exactly.
     #[test]
-    fn the_sweep_lights_every_arc_in_turn_and_wraps() {
+    fn the_sweep_walks_up_and_back_down() {
         let mut frame = next_frame(WifiState::Off, WifiState::Connecting, 7).unwrap();
 
         let mut seen = Vec::new();
-        for _ in 0..2 * RADII.len() {
+        for _ in 0..2 * SWEEP.len() {
             seen.push(lit(WifiState::Connecting, frame));
             frame = next_frame(WifiState::Connecting, WifiState::Connecting, frame).unwrap();
         }
-        assert_eq!(seen, vec![1, 2, 3, 1, 2, 3]);
+        assert_eq!(seen, vec![1, 2, 3, 2, 1, 2, 3, 2]);
         assert!(!seen.contains(&0),
                 "a frame with no arcs lit is the Off glyph exactly");
+
+        // Every step changes exactly one arc. That is what lets the ghost of a
+        // cleared arc read as part of the motion instead of as a smear.
+        for pair in seen.windows(2) {
+            assert_eq!(pair[0].abs_diff(pair[1]), 1, "{seen:?}");
+        }
     }
 
     /// A settled radio must stop repainting. This is the check that keeps the
