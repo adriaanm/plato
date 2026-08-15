@@ -125,6 +125,23 @@ impl<'a> XmlParser<'a> {
                                 },
                                 Some('[') => {
                                     self.advance(1);
+                                    // `<![CDATA[ … ]]>` is character data, not
+                                    // markup, and skipping it loses text that
+                                    // was meant to be read: feeds routinely
+                                    // wrap a whole title or article body in
+                                    // one (The Verge wraps every title), and
+                                    // an EPUB wraps a stylesheet in one.
+                                    if self.starts_with("CDATA[") {
+                                        self.advance(6);
+                                        let offset = self.offset;
+                                        let end = self.input[offset..].find("]]>")
+                                                      .map_or(self.input.len(), |i| offset + i);
+                                        if end > offset {
+                                            tree.get_mut(parent_id)
+                                                .append(text(&self.input[offset..end], offset));
+                                        }
+                                        self.offset = end;
+                                    }
                                     self.advance_until("]]>");
                                 },
                                 _ => {
@@ -201,6 +218,34 @@ mod tests {
         let child = xml.root().first_child().unwrap()
                        .children().nth(1);
         assert_eq!(child.map(|c| c.text()), Some(" ".to_string()));
+    }
+
+    #[test]
+    fn test_cdata_is_text() {
+        let text = "<a><![CDATA[b < c & d]]></a>";
+        let xml = XmlParser::new(text).parse();
+        assert_eq!(xml.root().text(), "b < c & d");
+    }
+
+    #[test]
+    fn test_cdata_beside_ordinary_text() {
+        let text = "<a>x<![CDATA[y]]>z</a>";
+        let xml = XmlParser::new(text).parse();
+        assert_eq!(xml.root().text(), "xyz");
+    }
+
+    #[test]
+    fn test_unterminated_cdata_keeps_what_it_has() {
+        let text = "<a><![CDATA[tail";
+        let xml = XmlParser::new(text).parse();
+        assert_eq!(xml.root().text(), "tail");
+    }
+
+    #[test]
+    fn test_conditional_section_is_still_skipped() {
+        let text = "<a><![INCLUDE[<b>x</b>]]>y</a>";
+        let xml = XmlParser::new(text).parse();
+        assert_eq!(xml.root().text(), "y");
     }
 
     #[test]
