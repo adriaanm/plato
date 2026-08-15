@@ -34,11 +34,22 @@ impl TopBar {
                                   root_event);
         children.push(Box::new(root_icon) as Box<dyn View>);
 
-        // Five fixed slots on the right, from the edge inwards: menu,
-        // frontlight, battery, WiFi, and then the clock, which is the only one
-        // whose width depends on its content.
-        let mut clock_rect = rect![rect.max - pt!(5*side, side),
-                                   rect.max - pt!(4*side, 0)];
+        // Five fixed slots on the right, from the edge inwards: menu, WiFi,
+        // frontlight, battery, and then the clock, which is the only one whose
+        // width depends on its content.
+        //
+        // The slots are narrower than they are tall, which is the one thing
+        // here that is not obvious. A square slot is the bar's full height,
+        // 121 px at this DPI, and the widest thing drawn in one is the battery
+        // at about 75 -- so square slots spent nearly half the bar on air
+        // between the icons. Three quarters halves that gap and leaves the
+        // glyphs untouched, since each is centered in whatever slot it gets.
+        //
+        // Height stays `side`: the tap targets keep the bar's full height, and
+        // 90 px of width is still a comfortable one.
+        let slot = 3 * side / 4;
+        let mut clock_rect = rect![rect.max - pt!(4*slot + side, side),
+                                   rect.max - pt!(4*slot, 0)];
         let clock_label = Clock::new(&mut clock_rect, context);
         let title_rect = rect![rect.min.x + side, rect.min.y,
                                clock_rect.min.x, rect.max.y];
@@ -50,27 +61,27 @@ impl TopBar {
         // Second from the right, between the frontlight and the menu. The
         // children are pushed in a different order than they are laid out --
         // the accessors below index this vector, not the bar.
-        let wifi_widget = Wifi::new(rect![rect.max - pt!(2*side, side),
-                                          rect.max - pt!(side, 0)],
+        let wifi_widget = Wifi::new(rect![rect.max - pt!(2*slot, side),
+                                          rect.max - pt!(slot, 0)],
                                     context);
         children.push(Box::new(wifi_widget) as Box<dyn View>);
 
         let capacity = context.battery.capacity().map_or(0.0, |v| v[0]);
         let status = context.battery.status().map_or(crate::battery::Status::Discharging, |v| v[0]);
-        let battery_widget = Battery::new(rect![rect.max - pt!(4*side, side),
-                                                rect.max - pt!(3*side, 0)],
+        let battery_widget = Battery::new(rect![rect.max - pt!(4*slot, side),
+                                                rect.max - pt!(3*slot, 0)],
                                           capacity,
                                           status);
         children.push(Box::new(battery_widget) as Box<dyn View>);
 
         let name = if context.settings.frontlight { "frontlight" } else { "frontlight-disabled" };
         let frontlight_icon = Icon::new(name,
-                                        rect![rect.max - pt!(3*side, side),
-                                              rect.max - pt!(2*side, 0)],
+                                        rect![rect.max - pt!(3*slot, side),
+                                              rect.max - pt!(2*slot, 0)],
                                         Event::Show(ViewId::Frontlight));
         children.push(Box::new(frontlight_icon) as Box<dyn View>);
 
-        let menu_rect = rect![rect.max-side, rect.max];
+        let menu_rect = rect![rect.max - pt!(slot, side), rect.max];
         let menu_icon = Icon::new("menu",
                                   menu_rect,
                                   Event::ToggleNear(ViewId::MainMenu, menu_rect));
@@ -146,9 +157,11 @@ impl View for TopBar {
     fn resize(&mut self, rect: Rectangle, hub: &Hub, rq: &mut RenderQueue, context: &mut Context) {
         let side = rect.height() as i32;
         self.children[0].resize(rect![rect.min, rect.min+side], hub, rq, context);
+        // Same narrowed pitch as `new` -- see the comment there.
+        let slot = 3 * side / 4;
         let clock_width = self.children[2].rect().width() as i32;
-        let clock_rect = rect![rect.max - pt!(4*side + clock_width, side),
-                               rect.max - pt!(4*side, 0)];
+        let clock_rect = rect![rect.max - pt!(4*slot + clock_width, side),
+                               rect.max - pt!(4*slot, 0)];
         self.children[1].resize(rect![rect.min.x + side,
                                       rect.min.y,
                                       clock_rect.min.x,
@@ -157,16 +170,16 @@ impl View for TopBar {
         self.children[2].resize(clock_rect, hub, rq, context);
         // WiFi, second from the right -- see `new` for why this is not in
         // child order.
-        self.children[3].resize(rect![rect.max - pt!(2*side, side),
-                                      rect.max - pt!(side, 0)],
+        self.children[3].resize(rect![rect.max - pt!(2*slot, side),
+                                      rect.max - pt!(slot, 0)],
                                 hub, rq, context);
-        self.children[4].resize(rect![rect.max - pt!(4*side, side),
-                                      rect.max - pt!(3*side, 0)],
+        self.children[4].resize(rect![rect.max - pt!(4*slot, side),
+                                      rect.max - pt!(3*slot, 0)],
                                 hub, rq, context);
-        self.children[5].resize(rect![rect.max - pt!(3*side, side),
-                                      rect.max - pt!(2*side, 0)],
+        self.children[5].resize(rect![rect.max - pt!(3*slot, side),
+                                      rect.max - pt!(2*slot, 0)],
                                 hub, rq, context);
-        self.children[6].resize(rect![rect.max-side, rect.max],
+        self.children[6].resize(rect![rect.max - pt!(slot, side), rect.max],
                                 hub, rq, context);
         self.rect = rect;
     }
