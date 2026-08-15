@@ -39,6 +39,7 @@ pub mod key;
 pub mod home;
 pub mod reader;
 pub mod dictionary;
+pub mod news;
 pub mod calculator;
 pub mod sketch;
 pub mod touch_events;
@@ -313,6 +314,22 @@ pub enum Event {
     /// the pairing thread, which never blocks the event loop; the view that
     /// shows the code is a display only and owns nothing.
     Pairing(pairing::PairingStatus),
+    /// A news page finished on its worker thread. The fetch never runs on the
+    /// event loop: a slow radio would otherwise freeze the reader for as long
+    /// as the request takes, and the timeout is 30 seconds.
+    NewsLoaded {
+        source: String,
+        route: crate::news::Route,
+        page: Box<crate::news::Page>,
+    },
+    NewsFailed(String),
+    /// The news view's own back: up one level within the app, and out of it
+    /// only when there is no level left.
+    ///
+    /// It cannot be `Event::Back`, which the app loop consumes itself to pop
+    /// the whole view -- a view never sees it, so a view with internal history
+    /// has no way to answer it.
+    NewsBack,
     LoadPixmap(usize),
     Update(UpdateMode),
     RefreshBookPreview(PathBuf, Option<PathBuf>),
@@ -453,6 +470,8 @@ pub enum ViewId {
     KeyboardLayoutMenu,
     Frontlight,
     Dictionary,
+    News,
+    NewsSourceMenu,
     FontSizeMenu,
     TextAlignMenu,
     FontFamilyMenu,
@@ -586,6 +605,7 @@ pub enum EntryId {
     ToggleSelectDirectory(PathBuf),
     SetStatus(PathBuf, SimpleStatus),
     SearchAuthor(String),
+    SetNewsSource(String),
     RemovePreset(usize),
     FirstColumn(FirstColumn),
     SecondColumn(SecondColumn),

@@ -25,7 +25,9 @@ impl TopBar {
 
         let side = rect.height() as i32;
         let icon_name = match root_event {
-            Event::Back => "back",
+            // NewsBack is a back arrow too: it goes up one level inside the
+            // news view instead of leaving it.
+            Event::Back | Event::NewsBack => "back",
             _ => "search",
         };
 
