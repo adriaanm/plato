@@ -20,6 +20,7 @@ use crate::font::Fonts;
 use crate::framebuffer::{Framebuffer, UpdateMode};
 use crate::geom::{surface_area, Rectangle};
 use crate::gesture::GestureEvent;
+use crate::view::icon::ICONS_PIXMAPS;
 use crate::view::{Bus, Event, Hub, Id, RenderData, RenderQueue, View, ID_FEEDER};
 use std::f32::consts::FRAC_PI_2;
 
@@ -32,17 +33,23 @@ const DIM: Color = Color::Gray(186);
 /// a right angle in total.
 const HALF_SPAN: f32 = 0.85 * FRAC_PI_2 / 2.0;
 
-/// Arc radii and the dot, as fractions of the glyph's height. Three arcs, so
-/// three radii; the dot sits at the common center.
+/// Arc radii and the dot, in units of the outermost arc's radius. Three arcs,
+/// so three radii; the dot sits at the common center.
 // Chosen so the gap between the dot and the first arc matches the gap between
 // arcs -- at 0.42 the dot read as detached from the fan rather than part of it.
 const RADII: [f32; 3] = [0.34, 0.64, 0.94];
 const DOT_RADIUS: f32 = 0.11;
 const STROKE: f32 = 0.135;
 
-/// The glyph's height as a fraction of the slot it is given, matching the
-/// optical weight of the battery beside it.
-const GLYPH_SCALE: f32 = 0.46;
+/// The glyph's height, as a fraction of the frontlight icon's.
+///
+/// Measured against that icon rather than against the slot, because the slot is
+/// much bigger than anything drawn in it and matching it made this the largest
+/// thing in the bar. The neighbours are all `icons/*.svg` rendered at one
+/// scale, so the only way to be the same size as them is to ask one of them how
+/// big it is. 0.9 because at parity the fan still read as oversized -- it is
+/// solid where the sun and the battery are mostly outline.
+const GLYPH_SCALE: f32 = 0.9;
 
 /// What the icon is saying. Derived from the context on every repaint rather
 /// than stored, so it cannot drift from what the rest of the app believes.
@@ -108,6 +115,41 @@ impl Wifi {
         }
     }
 
+    /// Where the fan's center sits, the unit its radii are measured in, and the
+    /// stroke width -- all in device pixels.
+    ///
+    /// Two things this gets right that the first version did not, both visible
+    /// on the panel and neither on a dump of the widget alone:
+    ///
+    /// The size comes from the frontlight icon, not from the slot. The slot is
+    /// far larger than anything drawn in it -- the neighbouring icons are 56 px
+    /// glyphs in a 121 px box -- so a fraction of the slot made this the
+    /// largest thing in the bar. Every neighbour is an `icons/*.svg` at one
+    /// shared scale, so the only way to match them is to measure one.
+    ///
+    /// And it centers the glyph's *extent*, not the arcs' common center. The
+    /// dot hangs below that center while the arcs rise well above it, so
+    /// centering on it sat the whole glyph low against the battery and the sun.
+    fn geometry(&self) -> ((f32, f32), f32, f32) {
+        let outer = RADII[RADII.len() - 1];
+        let reference = ICONS_PIXMAPS.get("frontlight")
+                                     .map(|pixmap| pixmap.height as f32)
+                                     // Only if the icon set failed to load, in
+                                     // which case the bar has bigger problems.
+                                     .unwrap_or_else(|| self.rect.height() as f32 / 2.0);
+
+        // Solve for the unit the radii are in: the glyph spans from the top of
+        // the outermost arc's stroke down to the bottom of the dot.
+        let scale = reference * GLYPH_SCALE / (outer + STROKE / 2.0 + DOT_RADIUS);
+        let thickness = (STROKE * scale).max(2.0);
+
+        let above = outer * scale + thickness / 2.0;
+        let below = DOT_RADIUS * scale;
+        let center = (self.rect.min.x as f32 + self.rect.width() as f32 / 2.0,
+                      self.rect.min.y as f32 + (self.rect.height() as f32 + above - below) / 2.0);
+
+        (center, scale, thickness)
+    }
 }
 
 /// How many arcs are lit, outwards from the dot.
@@ -214,29 +256,19 @@ impl View for Wifi {
     fn render(&self, fb: &mut dyn Framebuffer, _rect: Rectangle, _fonts: &mut Fonts) {
         fb.draw_rectangle(&self.rect, WHITE);
 
-        // Every measure below is a fraction of the slot, which the top bar has
-        // already sized for the panel -- so there is no scale_by_dpi here. The
-        // constants Battery uses are in design units and need it; these are not.
-        let height = self.rect.height() as f32 * GLYPH_SCALE;
-        let thickness = (STROKE * height).max(2.0);
-
-        // The dot is the fan's center, so the glyph hangs below the middle of
-        // the slot by half its own height.
-        let center = (self.rect.min.x as f32 + self.rect.width() as f32 / 2.0,
-                      self.rect.min.y as f32 + (self.rect.height() as f32 + height) / 2.0);
-
+        let (center, scale, thickness) = self.geometry();
         let lit = lit(self.state, self.frame);
 
         for (index, fraction) in RADII.iter().enumerate() {
             let color = if index < lit { BLACK } else { DIM };
-            draw_arc(fb, center, fraction * height, thickness, color, &self.rect);
+            draw_arc(fb, center, fraction * scale, thickness, color, &self.rect);
         }
 
         // The dot is always solid: it is the one part that says "there is a
         // radio here at all", and it doubles as the target the eye returns to
         // while the arcs sweep.
         fb.draw_disk(pt!(center.0 as i32, center.1 as i32),
-                     (DOT_RADIUS * height).max(2.0) as i32,
+                     (DOT_RADIUS * scale).max(2.0) as i32,
                      BLACK);
     }
 

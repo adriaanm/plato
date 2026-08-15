@@ -47,23 +47,26 @@ impl TopBar {
         children.push(Box::new(title_label) as Box<dyn View>);
         children.push(Box::new(clock_label) as Box<dyn View>);
 
-        let wifi_widget = Wifi::new(rect![rect.max - pt!(4*side, side),
-                                          rect.max - pt!(3*side, 0)],
+        // Second from the right, between the frontlight and the menu. The
+        // children are pushed in a different order than they are laid out --
+        // the accessors below index this vector, not the bar.
+        let wifi_widget = Wifi::new(rect![rect.max - pt!(2*side, side),
+                                          rect.max - pt!(side, 0)],
                                     context);
         children.push(Box::new(wifi_widget) as Box<dyn View>);
 
         let capacity = context.battery.capacity().map_or(0.0, |v| v[0]);
         let status = context.battery.status().map_or(crate::battery::Status::Discharging, |v| v[0]);
-        let battery_widget = Battery::new(rect![rect.max - pt!(3*side, side),
-                                                rect.max - pt!(2*side, 0)],
+        let battery_widget = Battery::new(rect![rect.max - pt!(4*side, side),
+                                                rect.max - pt!(3*side, 0)],
                                           capacity,
                                           status);
         children.push(Box::new(battery_widget) as Box<dyn View>);
 
         let name = if context.settings.frontlight { "frontlight" } else { "frontlight-disabled" };
         let frontlight_icon = Icon::new(name,
-                                        rect![rect.max - pt!(2*side, side),
-                                              rect.max - pt!(side, 0)],
+                                        rect![rect.max - pt!(3*side, side),
+                                              rect.max - pt!(2*side, 0)],
                                         Event::Show(ViewId::Frontlight));
         children.push(Box::new(frontlight_icon) as Box<dyn View>);
 
@@ -152,14 +155,16 @@ impl View for TopBar {
                                       rect.max.y],
                                 hub, rq, context);
         self.children[2].resize(clock_rect, hub, rq, context);
-        self.children[3].resize(rect![rect.max - pt!(4*side, side),
+        // WiFi, second from the right -- see `new` for why this is not in
+        // child order.
+        self.children[3].resize(rect![rect.max - pt!(2*side, side),
+                                      rect.max - pt!(side, 0)],
+                                hub, rq, context);
+        self.children[4].resize(rect![rect.max - pt!(4*side, side),
                                       rect.max - pt!(3*side, 0)],
                                 hub, rq, context);
-        self.children[4].resize(rect![rect.max - pt!(3*side, side),
+        self.children[5].resize(rect![rect.max - pt!(3*side, side),
                                       rect.max - pt!(2*side, 0)],
-                                hub, rq, context);
-        self.children[5].resize(rect![rect.max - pt!(2*side, side),
-                                      rect.max - pt!(side, 0)],
                                 hub, rq, context);
         self.children[6].resize(rect![rect.max-side, rect.max],
                                 hub, rq, context);
