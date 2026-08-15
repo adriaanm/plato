@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import platform
 import shutil
@@ -88,7 +89,12 @@ ZIG_ARCH_FLAGS = ["-mfloat-abi=softfp", "-mcpu=cortex_a9"]
 # `xbuild.py kindle --package platonic-recv` from tens of minutes into
 # seconds.  Being on this list is a claim about the crate's `[dependencies]`,
 # so a crate that grows a `-sys` dependency has to come off it.
-PURE_RUST_PACKAGES = {"platonic-recv"}
+#
+# `plato-net` is on the list even though ring's build script compiles C: what
+# the list is really about is the SOURCES table -- MuPDF and its seven
+# libraries -- and ring brings its own C along, built by the same `zig cc`
+# cargo-zigbuild already points cc-rs at.
+PURE_RUST_PACKAGES = {"platonic-recv", "plato-net"}
 
 
 # --------------------------------------------------------------------------
@@ -684,7 +690,13 @@ def run_cargo(profile: Profile, args) -> None:
                "--target", profile.cargo_target, "--release"]
     else:
         verb = "run" if args.run else "test" if args.test else "build"
-        cmd = ["cargo", verb, *packages]
+        # Release here too, and not for speed: a debug build of this workspace
+        # is several gigabytes of debuginfo, and a `cargo test` that quietly
+        # creates a second, debug copy of everything next to the release one is
+        # how this machine runs out of disk mid-link -- which surfaces as a bare
+        # "linker command failed", not as "no space left".  The cross profile
+        # above has always been release; this makes the host match.
+        cmd = ["cargo", verb, *packages, "--release"]
     if profile.cargo_features:
         cmd += ["--features", ",".join(profile.cargo_features)]
     cmd += args.cargo
@@ -813,16 +825,32 @@ def build_kindle(profile: Profile, args) -> None:
     report_binaries(profile)
 
 
+def package_binaries(pkg: str) -> list[str]:
+    """The ``[[bin]]`` names a package produces, asked of cargo rather than
+    assumed from the package name.  They coincide for ``plato`` and
+    ``plato-harness``; they do not for ``plato-net`` (``net-smoke``) or
+    ``foldersync`` (two binaries), and a wrong guess here reads as "expected a
+    binary at ..." after a build that in fact succeeded."""
+    cargo = shutil.which("cargo") or die("cargo is not on PATH")
+    out = subprocess.run([cargo, "metadata", "--no-deps", "--format-version", "1"],
+                         cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    for package in json.loads(out)["packages"]:
+        if package["name"] == pkg:
+            return [t["name"] for t in package["targets"] if "bin" in t["kind"]]
+    die(f"no package named {pkg} in the workspace")
+
+
 def report_binaries(profile: Profile) -> None:
     """The ABI gate, on every binary the profile produced.  Nothing leaves this
     driver unchecked -- a hard-float binary fails on the device as a bare "No
     such file or directory"."""
     for pkg in profile.cargo_packages:
-        out = ROOT / "target" / profile.cargo_target / "release" / pkg
-        if not out.exists():
-            die(f"expected a binary at {out}")
-        check_arm_abi(out)
-        log(f"{out}  ({out.stat().st_size // 1024} KiB)")
+        for name in package_binaries(pkg):
+            out = ROOT / "target" / profile.cargo_target / "release" / name
+            if not out.exists():
+                die(f"expected a binary at {out}")
+            check_arm_abi(out)
+            log(f"{out}  ({out.stat().st_size // 1024} KiB)")
 
 
 BUILDERS = {"host": build_host, "kindle": build_kindle}
