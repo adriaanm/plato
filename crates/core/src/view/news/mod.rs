@@ -269,6 +269,15 @@ impl News {
     /// Follow what was tapped, or turn the page. Three kinds of link exist and
     /// only the first is navigation.
     fn follow_link(&mut self, pt: Point, hub: &Hub, rq: &mut RenderQueue, context: &mut Context) {
+        // While a route is waiting for the radio there is nothing on the page
+        // to tap -- no links, one line of text -- so a tap is a retry. It is
+        // the escape hatch for a wait that outlived whatever it was waiting
+        // for, which is a thing that can happen to any promise about a radio.
+        if let Some(route) = self.pending.take() {
+            self.load(route, hub, rq, context);
+            return;
+        }
+
         let dpi = CURRENT_DEVICE.dpi;
         let small_height = scale_by_dpi(SMALL_BAR_HEIGHT, dpi) as i32;
         let thickness = scale_by_dpi(THICKNESS_MEDIUM, dpi) as i32;

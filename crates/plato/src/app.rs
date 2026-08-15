@@ -1022,9 +1022,25 @@ pub fn run() -> Result<(), Error> {
             Event::WifiUp(ref addr) => {
                 let addr = addr.clone();
                 thread::spawn(move || crate::mdns::wifi_up(addr.as_deref()));
+                // The device's scripts are the authority on the radio, and this
+                // poke is them saying the link is up. Plato used to update its
+                // mDNS responder and go on believing it was offline -- so a
+                // view that waits for the network waited forever with WiFi
+                // plainly up, which is exactly what News did. NetUp is sent
+                // rather than the flag set here, so the one path that reports
+                // a link stays the one path that reports a link.
+                if !context.online {
+                    context.settings.wifi = true;
+                    tx.send(Event::Device(DeviceEvent::NetUp)).ok();
+                }
             },
             Event::WifiDown => {
                 thread::spawn(crate::mdns::stop);
+                // Same authority, the other way. Leaving `settings.wifi` true
+                // over a radio the scripts have taken down would also make the
+                // next "turn WiFi on" a no-op, since `set_wifi` compares.
+                context.settings.wifi = false;
+                context.online = false;
             },
             Event::ImportLibrary => {
                 // The FIFO's `import`: the same sequence as the USB unshare.
