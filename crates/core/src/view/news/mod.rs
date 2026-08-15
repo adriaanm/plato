@@ -282,10 +282,52 @@ impl News {
 
         let mut target = None;
         if let Some((links, _)) = self.doc.links(Location::Exact(self.location)) {
-            for link in links {
+            // An exact hit on a link's own glyphs always wins: it is the only
+            // way to reach the odd one out on a line -- the story's outbound
+            // host link sits on the same line as its comment count.
+            for link in &links {
                 if (link.rect.to_rect() + offset).includes(pt) {
                     target = Some(link.text.clone());
                     break;
+                }
+            }
+
+            // Otherwise fall back to the block the link belongs to. A story is
+            // a run of consecutive links to the same place -- the headline,
+            // over however many lines it wraps, and the comment count that
+            // follows it -- so the union of their rectangles is the row, white
+            // space and short last lines included. At 5.5 pt the glyphs are a
+            // couple of millimetres tall; the row is a finger.
+            if target.is_none() {
+                let mut run: Option<(&str, Rectangle)> = None;
+                for link in &links {
+                    let next = link.rect.to_rect();
+                    // Two links to the same place with a paragraph between them
+                    // -- the same URL cited by two comments, say -- are not one
+                    // block, and merging them would swallow everything in the
+                    // gap. Only carry a run across a line break.
+                    let contiguous = run.as_ref().is_some_and(|(_, rect)| {
+                        next.min.y - rect.max.y <= 2 * next.height() as i32
+                    });
+                    match run {
+                        Some((uri, ref mut rect)) if uri == link.text && contiguous => rect.absorb(&next),
+                        _ => {
+                            if let Some((uri, rect)) = run.take() {
+                                if (rect + offset).includes(pt) {
+                                    target = Some(uri.to_string());
+                                    break;
+                                }
+                            }
+                            run = Some((&link.text, next));
+                        },
+                    }
+                }
+                if target.is_none() {
+                    if let Some((uri, rect)) = run {
+                        if (rect + offset).includes(pt) {
+                            target = Some(uri.to_string());
+                        }
+                    }
                 }
             }
         }
