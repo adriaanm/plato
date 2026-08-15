@@ -489,7 +489,24 @@ pub fn run() -> Result<(), Error> {
                   BATTERY_REFRESH_INTERVAL, &tx, &mut tasks);
     tx.send(Event::WakeUp).ok();
 
+    // `PLATO_LOG_INPUT=1` traces the touch pipeline into the log: every finger
+    // transition the panel reported, and every gesture the recogniser made of
+    // them, in the order they happened. It is the only way to tell "the panel
+    // never reported a second finger" apart from "it did, and the gesture came
+    // out as something other than the one expected" -- and those two have
+    // completely different fixes.
+    let log_input = env::var_os("PLATO_LOG_INPUT").is_some();
+
     while let Ok(evt) = rx.recv() {
+        if log_input {
+            match evt {
+                Event::Device(DeviceEvent::Finger { id, status, position, time }) =>
+                    eprintln!("input: finger {id} {status:?} at {position} t={time:.3}"),
+                Event::Gesture(ref ge) => eprintln!("input: gesture {ge}"),
+                _ => (),
+            }
+        }
+
         match evt {
             Event::Device(de) => {
                 match de {
