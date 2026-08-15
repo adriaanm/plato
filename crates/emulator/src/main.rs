@@ -11,7 +11,7 @@ use sdl2::event::Event as SdlEvent;
 use sdl2::keyboard::{Scancode, Keycode, Mod};
 use sdl2::render::{WindowCanvas, BlendMode};
 use sdl2::pixels::{Color as SdlColor, PixelFormatEnum};
-use sdl2::mouse::MouseState;
+use sdl2::mouse::{MouseButton, MouseState};
 use sdl2::rect::Point as SdlPoint;
 use sdl2::rect::Rect as SdlRect;
 use plato_core::framebuffer::{Framebuffer, UpdateMode};
@@ -76,25 +76,44 @@ fn seconds(timestamp: u32) -> f64 {
     timestamp as f64 / 1000.0
 }
 
+/// How far the second finger lands from the first, in pixels, and the x below
+/// which it goes to the right instead of the left -- so it stays on screen at
+/// either edge.
+const SECOND_FINGER_OFFSET: i32 = 120;
+
+/// The right mouse button is a **second finger**, not a second button.
+///
+/// A mouse has one pointer and the panel has ten, so every multi-touch gesture
+/// -- the news view opens its font size menu on a two-finger tap -- would
+/// otherwise be testable only on the device, which is exactly what this
+/// emulator exists to avoid. Right-press puts two fingers down and right-release
+/// lifts both, which the gesture recogniser reads as one `MultiTap`.
 #[inline]
-pub fn device_event(event: SdlEvent) -> Option<DeviceEvent> {
+pub fn device_events(event: SdlEvent) -> Vec<DeviceEvent> {
+    let finger = |id, status, position, timestamp| {
+        DeviceEvent::Finger { id, status, position, time: seconds(timestamp) }
+    };
+    let pair = |status, x: i32, y, timestamp| {
+        let dx = if x > SECOND_FINGER_OFFSET + 40 { -SECOND_FINGER_OFFSET }
+                 else { SECOND_FINGER_OFFSET };
+        vec![finger(0, status, pt!(x, y), timestamp),
+             finger(1, status, pt!(x + dx, y), timestamp)]
+    };
+
     match event {
+        SdlEvent::MouseButtonDown { timestamp, x, y, mouse_btn: MouseButton::Right, .. } =>
+            pair(FingerStatus::Down, x, y, timestamp),
+        SdlEvent::MouseButtonUp { timestamp, x, y, mouse_btn: MouseButton::Right, .. } =>
+            pair(FingerStatus::Up, x, y, timestamp),
         SdlEvent::MouseButtonDown { timestamp, x, y, .. } =>
-            Some(DeviceEvent::Finger { id: 0,
-                                       status: FingerStatus::Down,
-                                       position: pt!(x, y),
-                                       time: seconds(timestamp) }),
+            vec![finger(0, FingerStatus::Down, pt!(x, y), timestamp)],
         SdlEvent::MouseButtonUp { timestamp, x, y, .. } =>
-            Some(DeviceEvent::Finger { id: 0,
-                                       status: FingerStatus::Up,
-                                       position: pt!(x, y),
-                                       time: seconds(timestamp) }),
+            vec![finger(0, FingerStatus::Up, pt!(x, y), timestamp)],
+        // Motion stays one finger: dragging two of them is a pinch or a
+        // multi-swipe, and neither has a sensible mouse spelling.
         SdlEvent::MouseMotion { timestamp, x, y, .. } =>
-            Some(DeviceEvent::Finger { id: 0,
-                                       status: FingerStatus::Motion,
-                                       position: pt!(x, y),
-                                       time: seconds(timestamp) }),
-        _ => None,
+            vec![finger(0, FingerStatus::Motion, pt!(x, y), timestamp)],
+        _ => Vec::new(),
     }
 }
 
@@ -401,7 +420,7 @@ fn main() -> Result<(), Error> {
                     }
                 },
                 _ => {
-                    if let Some(dev_evt) = device_event(sdl_evt) {
+                    for dev_evt in device_events(sdl_evt) {
                         ty.send(dev_evt).ok();
                     }
                 },
