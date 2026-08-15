@@ -72,7 +72,8 @@ pub fn transfer_notifications(view1: &mut dyn View, view2: &mut dyn View, rq: &m
 /// The predicate is a parameter so the filtering can be tested without a
 /// filesystem; production passes [`AppCmd::is_available`].
 pub fn application_entries(is_available: impl Fn(&AppCmd) -> bool) -> Vec<EntryKind> {
-    let apps = [("Dictionary", AppCmd::Dictionary { query: String::new(), language: String::new() }),
+    let apps = [("News", AppCmd::News),
+                ("Dictionary", AppCmd::Dictionary { query: String::new(), language: String::new() }),
                 ("Calculator", AppCmd::Calculator),
                 ("Sketch", AppCmd::Sketch),
                 ("Sync", AppCmd::Sync),
@@ -312,7 +313,7 @@ mod tests {
     #[test]
     fn every_app_is_offered_when_every_helper_is_installed() {
         assert_eq!(labels(&application_entries(|_| true)),
-                   ["Dictionary", "Calculator", "Sketch", "Sync", "Pair a Mac", "---",
+                   ["News", "Dictionary", "Calculator", "Sketch", "Sync", "Pair a Mac", "---",
                     "Touch Events", "Rotation Values"]);
     }
 
@@ -321,7 +322,7 @@ mod tests {
     fn an_app_with_a_missing_helper_is_not_offered() {
         let entries = application_entries(|cmd| *cmd != AppCmd::Calculator);
         assert_eq!(labels(&entries),
-                   ["Dictionary", "Sketch", "Sync", "Pair a Mac", "---",
+                   ["News", "Dictionary", "Sketch", "Sync", "Pair a Mac", "---",
                     "Touch Events", "Rotation Values"]);
     }
 

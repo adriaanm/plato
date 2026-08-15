@@ -420,6 +420,9 @@ pub enum AppCmd {
         query: String,
         language: String,
     },
+    /// Skim a few known sites -- Hacker News, and whatever feeds are
+    /// configured. Not a browser: see `news`.
+    News,
     TouchEvents,
     RotationValues,
     /// Mirror a folder from a computer on the LAN into the library.  Unlike

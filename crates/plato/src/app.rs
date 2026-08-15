@@ -17,6 +17,9 @@ use plato_core::view::common::{toggle_input_history_menu, toggle_keyboard_layout
 use plato_core::view::frontlight::FrontlightWindow;
 use plato_core::view::menu::{Menu, MenuKind};
 use plato_core::view::dictionary::Dictionary as DictionaryApp;
+use std::sync::Arc;
+use plato_core::view::news::News;
+use plato_net::client::NetClient;
 use plato_core::view::calculator::Calculator;
 use plato_core::view::sketch::Sketch;
 use plato_core::view::touch_events::TouchEvents;
@@ -573,9 +576,13 @@ pub fn run() -> Result<(), Error> {
                         let notif = Notification::new(msg, &tx, &mut rq, &mut context);
                         context.online = true;
                         view.children_mut().push(Box::new(notif) as Box<dyn View>);
-                        if view.is::<Home>() {
-                            view.handle_event(&evt, &tx, &mut bus, &mut rq, &mut context);
-                        } else if let Some(entry) = history.get_mut(0).filter(|entry| entry.view.is::<Home>()) {
+                        // The view on top hears it too, whatever it is: News
+                        // defers its first request when the radio is off and
+                        // waits for exactly this. Home is reached either way --
+                        // on top here, or buried below, which is where it is
+                        // whenever another view is open.
+                        view.handle_event(&evt, &tx, &mut bus, &mut rq, &mut context);
+                        if let Some(entry) = history.get_mut(0).filter(|entry| entry.view.is::<Home>()) {
                             let (tx, _rx) = mpsc::channel();
                             entry.view.handle_event(&evt, &tx, &mut VecDeque::new(), &mut RenderQueue::new(), &mut context);
                         }
@@ -1071,6 +1078,9 @@ pub fn run() -> Result<(), Error> {
             Event::NetUpFailed => {
                 context.settings.wifi = false;
                 context.online = false;
+                // Told, not only notified: a view that asked for the radio and
+                // is waiting on it needs to stop waiting.
+                view.handle_event(&evt, &tx, &mut bus, &mut rq, &mut context);
                 tx.send(Event::Notify("Couldn't bring WiFi up.".to_string())).ok();
             },
             Event::Select(EntryId::Launch(app_cmd)) => {
@@ -1101,6 +1111,9 @@ pub fn run() -> Result<(), Error> {
                     },
                     AppCmd::Dictionary { ref query, ref language } => Some(Box::new(DictionaryApp::new(context.fb.rect(), query,
                                                                                                        language, &tx, &mut rq, &mut context)) as Box<dyn View>),
+                    AppCmd::News => Some(Box::new(News::new(context.fb.rect(),
+                                                            Arc::new(NetClient::new()),
+                                                            &tx, &mut rq, &mut context)) as Box<dyn View>),
                     AppCmd::TouchEvents => {
                         Some(Box::new(TouchEvents::new(context.fb.rect(), &mut rq, &mut context)) as Box<dyn View>)
                     },

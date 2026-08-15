@@ -27,6 +27,9 @@ use plato_core::view::frontlight::FrontlightWindow;
 use plato_core::view::menu::{Menu, MenuKind};
 use plato_core::view::intermission::Intermission;
 use plato_core::view::dictionary::Dictionary;
+use std::sync::Arc;
+use plato_core::view::news::News;
+use plato_net::client::NetClient;
 use plato_core::view::calculator::Calculator;
 use plato_core::view::sketch::Sketch;
 use plato_core::view::touch_events::TouchEvents;
@@ -279,6 +282,13 @@ fn main() -> Result<(), Error> {
 
     let mut updating = Vec::new();
 
+    // The app measures the link at startup, because a session that begins with
+    // the radio already up sees no transition and would leave `online` false
+    // forever. Here there is no link to measure, so the setting is the answer.
+    if context.settings.wifi {
+        tx.send(Event::Device(DeviceEvent::NetUp)).ok();
+    }
+
     if context.settings.frontlight {
         let levels = context.settings.frontlight_levels;
         context.frontlight.set_intensity(levels.intensity);
@@ -486,6 +496,9 @@ fn main() -> Result<(), Error> {
                         AppCmd::Dictionary { ref query, ref language } => {
                             Some(Box::new(Dictionary::new(context.fb.rect(), query, language, &tx, &mut rq, &mut context)) as Box<dyn View>)
                         },
+                        AppCmd::News => Some(Box::new(News::new(context.fb.rect(),
+                                                                Arc::new(NetClient::new()),
+                                                                &tx, &mut rq, &mut context)) as Box<dyn View>),
                         AppCmd::TouchEvents => {
                             Some(Box::new(TouchEvents::new(context.fb.rect(), &mut rq, &mut context)) as Box<dyn View>)
                         },
@@ -625,7 +638,18 @@ fn main() -> Result<(), Error> {
                     let notif = Notification::new(msg, &tx, &mut rq, &mut context);
                     view.children_mut().push(Box::new(notif) as Box<dyn View>);
                 },
-                Event::Device(DeviceEvent::NetUp) |
+                // The app sets `online` here and hands the event to whatever is
+                // on top; without both, a view that waits for the network --
+                // News, which defers its first request when the radio is off --
+                // waits forever in the emulator and only there.
+                Event::Device(DeviceEvent::NetUp) => {
+                    context.online = true;
+                    view.handle_event(&evt, &tx, &mut bus, &mut rq, &mut context);
+                    if let Some(home) = history.get_mut(0).filter(|view| view.is::<Home>()) {
+                        let (tx, _rx) = mpsc::channel();
+                        home.handle_event(&evt, &tx, &mut VecDeque::new(), &mut RenderQueue::new(), &mut context);
+                    }
+                },
                 Event::CheckFetcher(..) |
                 Event::FetcherAddDocument(..) |
                 Event::FetcherRemoveDocument(..) |

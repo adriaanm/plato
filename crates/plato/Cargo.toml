@@ -12,5 +12,10 @@ path = "src/main.rs"
 if-addrs = "0.15.0"
 mdns-sd = { version = "0.21.0", default-features = false }
 plato-core = { path = "../core" }
+# The device's HTTPS client. Only the binary links both this and plato-core:
+# core declares what it needs from the network as a trait and stays free of a
+# TLS stack, plato-net answers it and stays free of MuPDF. See the `client`
+# module in crates/net/src/lib.rs.
+plato-net = { path = "../net", features = ["core-client"] }
 # The pairing protocol, compiled into both ends so the wire cannot mismatch.
 pairing = { path = "../pairing" }
