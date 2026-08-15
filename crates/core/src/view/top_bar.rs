@@ -5,6 +5,7 @@ use crate::view::{View, Event, Hub, Bus, Id, ID_FEEDER, RenderQueue, RenderData,
 use crate::view::icon::Icon;
 use crate::view::clock::Clock;
 use crate::view::battery::Battery;
+use crate::view::wifi::Wifi;
 use crate::view::label::Label;
 use crate::geom::{Rectangle};
 use crate::font::Fonts;
@@ -33,8 +34,11 @@ impl TopBar {
                                   root_event);
         children.push(Box::new(root_icon) as Box<dyn View>);
 
-        let mut clock_rect = rect![rect.max - pt!(4*side, side),
-                                   rect.max - pt!(3*side, 0)];
+        // Five fixed slots on the right, from the edge inwards: menu,
+        // frontlight, battery, WiFi, and then the clock, which is the only one
+        // whose width depends on its content.
+        let mut clock_rect = rect![rect.max - pt!(5*side, side),
+                                   rect.max - pt!(4*side, 0)];
         let clock_label = Clock::new(&mut clock_rect, context);
         let title_rect = rect![rect.min.x + side, rect.min.y,
                                clock_rect.min.x, rect.max.y];
@@ -42,6 +46,11 @@ impl TopBar {
                                 .event(Some(Event::ToggleNear(ViewId::TitleMenu, title_rect)));
         children.push(Box::new(title_label) as Box<dyn View>);
         children.push(Box::new(clock_label) as Box<dyn View>);
+
+        let wifi_widget = Wifi::new(rect![rect.max - pt!(4*side, side),
+                                          rect.max - pt!(3*side, 0)],
+                                    context);
+        children.push(Box::new(wifi_widget) as Box<dyn View>);
 
         let capacity = context.battery.capacity().map_or(0.0, |v| v[0]);
         let status = context.battery.status().map_or(crate::battery::Status::Discharging, |v| v[0]);
@@ -86,7 +95,7 @@ impl TopBar {
 
     pub fn update_frontlight_icon(&mut self, rq: &mut RenderQueue, context: &mut Context) {
         let name = if context.settings.frontlight { "frontlight" } else { "frontlight-disabled" };
-        let icon = self.child_mut(4).downcast_mut::<Icon>().unwrap();
+        let icon = self.child_mut(5).downcast_mut::<Icon>().unwrap();
         icon.name = name.to_string();
         rq.add(RenderData::new(icon.id(), *icon.rect(), UpdateMode::Gui));
     }
@@ -98,8 +107,14 @@ impl TopBar {
     }
 
     pub fn update_battery_widget(&mut self, rq: &mut RenderQueue, context: &mut Context) {
-        if let Some(battery_widget) = self.children[3].downcast_mut::<Battery>() {
+        if let Some(battery_widget) = self.children[4].downcast_mut::<Battery>() {
             battery_widget.update(rq, context);
+        }
+    }
+
+    pub fn update_wifi_widget(&mut self, rq: &mut RenderQueue, context: &mut Context) {
+        if let Some(wifi_widget) = self.children[3].downcast_mut::<Wifi>() {
+            wifi_widget.update(rq, context);
         }
     }
 
@@ -107,6 +122,7 @@ impl TopBar {
         self.update_frontlight_icon(rq, context);
         self.update_clock_label(rq);
         self.update_battery_widget(rq, context);
+        self.update_wifi_widget(rq, context);
     }
 }
 
@@ -128,21 +144,24 @@ impl View for TopBar {
         let side = rect.height() as i32;
         self.children[0].resize(rect![rect.min, rect.min+side], hub, rq, context);
         let clock_width = self.children[2].rect().width() as i32;
-        let clock_rect = rect![rect.max - pt!(3*side + clock_width, side),
-                               rect.max - pt!(3*side, 0)];
+        let clock_rect = rect![rect.max - pt!(4*side + clock_width, side),
+                               rect.max - pt!(4*side, 0)];
         self.children[1].resize(rect![rect.min.x + side,
                                       rect.min.y,
                                       clock_rect.min.x,
                                       rect.max.y],
                                 hub, rq, context);
         self.children[2].resize(clock_rect, hub, rq, context);
-        self.children[3].resize(rect![rect.max - pt!(3*side, side),
+        self.children[3].resize(rect![rect.max - pt!(4*side, side),
+                                      rect.max - pt!(3*side, 0)],
+                                hub, rq, context);
+        self.children[4].resize(rect![rect.max - pt!(3*side, side),
                                       rect.max - pt!(2*side, 0)],
                                 hub, rq, context);
-        self.children[4].resize(rect![rect.max - pt!(2*side, side),
+        self.children[5].resize(rect![rect.max - pt!(2*side, side),
                                       rect.max - pt!(side, 0)],
                                 hub, rq, context);
-        self.children[5].resize(rect![rect.max-side, rect.max],
+        self.children[6].resize(rect![rect.max-side, rect.max],
                                 hub, rq, context);
         self.rect = rect;
     }

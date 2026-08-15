@@ -74,6 +74,10 @@ const KOBO_UPDATE_BUNDLE: &str = "/mnt/onboard/.kobo/KoboRoot.tgz";
 const CLOCK_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const BATTERY_REFRESH_INTERVAL: Duration = Duration::from_secs(299);
 const AUTO_SUSPEND_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+// One frame of the top bar's WiFi sweep. Slow enough that the panel keeps up
+// -- a fast-waveform update of a slot-sized region costs well under this -- and
+// quick enough to read as motion rather than as a redraw.
+const WIFI_SPIN_INTERVAL: Duration = Duration::from_millis(600);
 const SUSPEND_WAIT_DELAY: Duration = Duration::from_secs(15);
 const PREPARE_SUSPEND_WAIT_DELAY: Duration = Duration::from_secs(3);
 
@@ -87,6 +91,7 @@ enum TaskId {
     CheckBattery,
     PrepareSuspend,
     Suspend,
+    WifiSpin,
 }
 
 struct HistoryItem {
@@ -190,7 +195,8 @@ fn resume(id: TaskId, tasks: &mut Vec<Task>, view: &mut dyn View, hub: &Sender<E
             // Kindle fork: report the link back, as at startup and in set_wifi.
             // On a thread: a wake that freezes for the whole association is a
             // wake the user reads as a crash.
-            spawn_wifi(true, hub);
+            context.wifi_busy = spawn_wifi(true, hub);
+            hub.send(Event::WifiTick).ok();
         }
     }
     if id == TaskId::Suspend || id == TaskId::PrepareSuspend {
@@ -250,10 +256,15 @@ static WIFI_BUSY: AtomicBool = AtomicBool::new(false);
 /// scripts over ssh -- still gets a responder. What this path contributes is
 /// the ordering the watcher cannot see: tear down BEFORE the radio goes, so
 /// the goodbye packets still have a link to leave by (crate::mdns).
-fn spawn_wifi(enable: bool, hub: &Sender<Event>) {
+///
+/// Returns whether the transition actually started, so the caller can light the
+/// top bar's indicator for exactly the window the script is running in -- a
+/// request that was dropped as mid-transition must not start an animation that
+/// nothing will ever stop.
+fn spawn_wifi(enable: bool, hub: &Sender<Event>) -> bool {
     if WIFI_BUSY.swap(true, Ordering::SeqCst) {
         hub.send(Event::Notify("WiFi is still changing state.".to_string())).ok();
-        return;
+        return false;
     }
 
     let hub = hub.clone();
@@ -278,7 +289,14 @@ fn spawn_wifi(enable: bool, hub: &Sender<Event>) {
             hub.send(if ok { Event::Device(DeviceEvent::NetUp) }
                      else { Event::NetUpFailed }).ok();
         }
+
+        // Last, and unconditional: the outcome events above are what the app
+        // acts on, this is only what stops the spinning. Sent after them so the
+        // indicator settles on a context that already knows the result.
+        hub.send(Event::WifiSettled).ok();
     });
+
+    true
 }
 
 fn set_wifi(enable: bool, hub: &Sender<Event>, context: &mut Context) {
@@ -291,7 +309,10 @@ fn set_wifi(enable: bool, hub: &Sender<Event>, context: &mut Context) {
     if !enable {
         context.online = false;
     }
-    spawn_wifi(enable, hub);
+    context.wifi_busy = spawn_wifi(enable, hub);
+    // Paint the first frame now rather than after the first interval: the whole
+    // point is that the tap has a visible consequence immediately.
+    hub.send(Event::WifiTick).ok();
 }
 
 #[derive(PartialEq)]
@@ -413,11 +434,16 @@ pub fn run() -> Result<(), Error> {
     // Kindle fork: same NetUp synthesis as set_wifi -- see its comment. Without
     // it, starting with wifi = true leaves context.online false forever, so the
     // UI never learns it is online even though the link is up.
-    if context.settings.wifi {
-        spawn_wifi(true, &tx);
+    context.wifi_busy = if context.settings.wifi {
+        spawn_wifi(true, &tx)
     } else {
-        spawn_wifi(false, &tx);
-    }
+        spawn_wifi(false, &tx)
+    };
+    // Queued, not dispatched: the view does not exist yet, and the loop that
+    // will deliver this does not start until it does. Starting the sweep here
+    // covers a session that opens mid-transition, which is the common case on
+    // this device -- the radio is usually brought up by the boot scripts.
+    tx.send(Event::WifiTick).ok();
 
     if context.settings.frontlight {
         let levels = context.settings.frontlight_levels;
@@ -1225,6 +1251,23 @@ pub fn run() -> Result<(), Error> {
             },
             Event::SetWifi(enable) => {
                 set_wifi(enable, &tx, &mut context);
+            },
+            Event::WifiSettled => {
+                context.wifi_busy = false;
+                // One last tick, to land the indicator on the settled state.
+                // Without it the icon would keep whatever frame the sweep
+                // happened to stop on until something else repainted it.
+                tx.send(Event::WifiTick).ok();
+            },
+            Event::WifiTick => {
+                handle_event(view.as_mut(), &evt, &tx, &mut bus, &mut rq, &mut context);
+                // The animation is self-driving: each frame schedules the next,
+                // and the chain simply stops when the transition ends. Nothing
+                // ticks while the radio is settled.
+                if context.wifi_busy {
+                    schedule_task(TaskId::WifiSpin, Event::WifiTick,
+                                  WIFI_SPIN_INTERVAL, &tx, &mut tasks);
+                }
             },
             Event::Select(EntryId::ToggleWifi) => {
                 set_wifi(!context.settings.wifi, &tx, &mut context);

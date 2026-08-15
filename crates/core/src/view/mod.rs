@@ -33,6 +33,7 @@ pub mod menu;
 pub mod menu_entry;
 pub mod clock;
 pub mod battery;
+pub mod wifi;
 pub mod keyboard;
 pub mod key;
 pub mod home;
@@ -359,10 +360,20 @@ pub enum Event {
     /// The link failed to come up.  Kindle fork: the enable path runs off the
     /// event loop, so its failure has to travel back as an event.
     NetUpFailed,
+    /// A WiFi transition finished, in either direction and whatever the
+    /// outcome.  Separate from `NetUp`/`NetUpFailed`, which report the *result*
+    /// of enabling: this reports only that the radio has stopped changing, and
+    /// is what stops the indicator's animation.  The disable path has no other
+    /// completion event at all.
+    WifiSettled,
     EndOfSearch,
     Finished,
     ClockTick,
     BatteryTick,
+    /// One frame of the top bar's WiFi indicator. Unlike the other two ticks
+    /// this is not on a timer of its own: the app schedules it only while a
+    /// transition is in flight, so a settled radio costs nothing.
+    WifiTick,
     ToggleFrontlight,
     Load(PathBuf),
     LoadPreset(usize),

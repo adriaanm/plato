@@ -46,6 +46,11 @@ pub struct Context {
     pub covered: bool,
     pub shared: bool,
     pub online: bool,
+    /// A WiFi transition is in flight. Distinct from `online`, which says
+    /// whether the link is up: between the request and the answer neither
+    /// `settings.wifi` nor `online` describes what the device is doing, and
+    /// that gap is exactly what the top bar's indicator animates over.
+    pub wifi_busy: bool,
 }
 
 impl Context {
@@ -60,7 +65,7 @@ impl Context {
                   keyboard_layouts: BTreeMap::new(), input_history: FxHashMap::default(),
                   battery, frontlight, lightsensor, notification_index: 0,
                   kb_rect: Rectangle::default(), rng, plugged: false, covered: false,
-                  shared: false, online: false }
+                  shared: false, online: false, wifi_busy: false }
     }
 
     pub fn batch_import(&mut self) {
