@@ -475,6 +475,7 @@ pub enum ViewId {
     Dictionary,
     News,
     NewsSourceMenu,
+    NewsToolBar,
     FontSizeMenu,
     TextAlignMenu,
     FontFamilyMenu,

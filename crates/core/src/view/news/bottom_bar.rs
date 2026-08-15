@@ -1,8 +1,10 @@
-//! Previous page, the source's name, next page.
+//! Previous page, font size, the source's name, next page.
 //!
-//! The dictionary's bottom bar with one difference: the label in the middle
+//! The dictionary's bottom bar with two differences: the label in the middle
 //! opens the source menu rather than the dictionary target menu, so switching
-//! from Hacker News to a feed is one tap from where you are reading.
+//! from Hacker News to a feed is one tap from where you are reading; and the
+//! reader's `font_size` icon sits beside the back arrow, because a two-finger
+//! tap turned out to be a gesture you can miss and a single tap never is.
 
 use crate::color::WHITE;
 use crate::context::Context;
@@ -34,7 +36,13 @@ impl BottomBar {
         let prev_rect = rect![rect.min, rect.min + side];
         children.push(page_child(prev_rect, has_prev, CycleDir::Previous));
 
-        let name_rect = rect![pt!(rect.min.x + side, rect.min.y),
+        let font_size_rect = rect![pt!(rect.min.x + side, rect.min.y),
+                                   pt!(rect.min.x + 2 * side, rect.max.y)];
+        let font_size_icon = Icon::new("font_size", font_size_rect,
+                                       Event::ToggleNear(ViewId::FontSizeMenu, font_size_rect));
+        children.push(Box::new(font_size_icon) as Box<dyn View>);
+
+        let name_rect = rect![pt!(rect.min.x + 2 * side, rect.min.y),
                               pt!(rect.max.x - side, rect.max.y)];
         let name_label = Label::new(name_rect, name.to_string(), Align::Center)
                                .event(Some(Event::ToggleNear(ViewId::NewsSourceMenu, name_rect)));
@@ -64,7 +72,7 @@ impl BottomBar {
     }
 
     pub fn update_name(&mut self, text: &str, rq: &mut RenderQueue) {
-        if let Some(label) = self.child_mut(1).downcast_mut::<Label>() {
+        if let Some(label) = self.child_mut(2).downcast_mut::<Label>() {
             label.update(text, rq);
         }
     }
@@ -102,8 +110,10 @@ impl View for BottomBar {
         let side = rect.height() as i32;
         self.children[0].resize(rect![rect.min, rect.min + side], hub, rq, context);
         self.children[1].resize(rect![pt!(rect.min.x + side, rect.min.y),
+                                      pt!(rect.min.x + 2 * side, rect.max.y)], hub, rq, context);
+        self.children[2].resize(rect![pt!(rect.min.x + 2 * side, rect.min.y),
                                       pt!(rect.max.x - side, rect.max.y)], hub, rq, context);
-        self.children[2].resize(rect![rect.max - side, rect.max], hub, rq, context);
+        self.children[3].resize(rect![rect.max - side, rect.max], hub, rq, context);
         self.rect = rect;
     }
 

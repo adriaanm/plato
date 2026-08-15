@@ -15,6 +15,7 @@
 //!   does with an external link in an EPUB). Nothing else is navigable.
 
 mod bottom_bar;
+mod tool_bar;
 
 use std::sync::Arc;
 use std::thread;
@@ -29,7 +30,7 @@ use crate::framebuffer::{Framebuffer, Pixmap, UpdateMode};
 use crate::font::Fonts;
 use crate::geom::{halves, CycleDir, Dir, Point, Rectangle};
 use crate::gesture::GestureEvent;
-use crate::input::{ButtonCode, ButtonStatus, DeviceEvent};
+use crate::input::{ButtonCode, ButtonStatus, DeviceEvent, FingerStatus};
 use crate::news::{self, feed::Feed, hn::HackerNews, HttpClient, Route, Source};
 use crate::settings::NewsSettings;
 use crate::unit::scale_by_dpi;
@@ -40,19 +41,14 @@ use crate::view::image::Image;
 use crate::view::menu::{Menu, MenuKind};
 use crate::view::notification::Notification;
 use crate::view::top_bar::TopBar;
-use crate::view::{Bus, Event, Hub, Id, RenderData, RenderQueue, View, ViewId, ID_FEEDER};
+use crate::view::{Bus, Event, Hub, Id, RenderData, RenderQueue, SliderId, View, ViewId, ID_FEEDER};
 use crate::view::{EntryId, EntryKind, SMALL_BAR_HEIGHT, THICKNESS_MEDIUM};
 use self::bottom_bar::BottomBar;
+use self::tool_bar::ToolBar;
 
 const VIEWER_STYLESHEET: &str = "css/news.css";
 const USER_STYLESHEET: &str = "css/news-user.css";
 
-/// The range this screen is legible at, not a preference -- the same reasoning
-/// as the reader's bounds, with numbers that suit a page of headlines rather
-/// than a novel: below 8 the metadata line under a headline is a grey smear at
-/// 300 dpi, and above 16 a single headline owns the page.
-const MIN_FONT_SIZE: f32 = 8.0;
-const MAX_FONT_SIZE: f32 = 16.0;
 
 pub struct News {
     id: Id,
@@ -391,12 +387,9 @@ impl News {
         self.load(Route::Index, hub, rq, context);
     }
 
-    /// The reader's font size menu, with the reader's encoding: twenty-one
-    /// steps of a tenth around the current size, so `EntryId::SetFontSize`
-    /// means the same thing in both places.
-    fn toggle_font_size_menu(&mut self, rect: Rectangle, enable: Option<bool>, rq: &mut RenderQueue,
-                             context: &mut Context) {
-        if let Some(index) = locate_by_id(self, ViewId::FontSizeMenu) {
+    /// Show or hide the font size slider, floating over the foot of the page.
+    fn toggle_tool_bar(&mut self, enable: Option<bool>, rq: &mut RenderQueue, context: &mut Context) {
+        if let Some(index) = locate_by_id(self, ViewId::NewsToolBar) {
             if let Some(true) = enable {
                 return;
             }
@@ -406,18 +399,23 @@ impl News {
             if let Some(false) = enable {
                 return;
             }
-            let font_size = context.settings.news.font_size;
-            let entries = (0..=20).filter_map(|v| {
-                let fs = font_size - 1.0 + v as f32 / 10.0;
-                (MIN_FONT_SIZE..=MAX_FONT_SIZE).contains(&fs).then(|| {
-                    EntryKind::RadioButton(format!("{fs:.1}"),
-                                           EntryId::SetFontSize(v),
-                                           (fs - font_size).abs() < 0.05)
-                })
-            }).collect();
-            let menu = Menu::new(rect, ViewId::FontSizeMenu, MenuKind::Contextual, entries, context);
-            rq.add(RenderData::new(menu.id(), *menu.rect(), UpdateMode::Gui));
-            self.children.push(Box::new(menu) as Box<dyn View>);
+            let dpi = CURRENT_DEVICE.dpi;
+            let small_height = scale_by_dpi(SMALL_BAR_HEIGHT, dpi) as i32;
+            let thickness = scale_by_dpi(THICKNESS_MEDIUM, dpi) as i32;
+            let (small_thickness, _) = halves(thickness);
+            // Sitting on the bottom bar's separator, so the two read as one
+            // block of controls rather than a bar with a gap under it.
+            let bottom = self.rect.max.y - small_height - small_thickness;
+            let rect = rect![self.rect.min.x, bottom - ToolBar::height(),
+                             self.rect.max.x, bottom];
+            // The reader's range, not one of this view's own: 5.5 to 16.5 is
+            // what "font size" means everywhere else in this app, and a news
+            // page is the same text engine at the same dpi.
+            let tool_bar = ToolBar::new(rect, context.settings.news.font_size,
+                                        context.settings.reader.min_font_size,
+                                        context.settings.reader.max_font_size);
+            rq.add(RenderData::new(tool_bar.id(), *tool_bar.rect(), UpdateMode::Gui));
+            self.children.push(Box::new(tool_bar) as Box<dyn View>);
         }
     }
 
@@ -426,7 +424,8 @@ impl News {
     /// relayout -- the same move `resize` makes when the geometry changes
     /// under a page.
     fn set_font_size(&mut self, font_size: f32, rq: &mut RenderQueue, context: &mut Context) {
-        let font_size = font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        let font_size = font_size.clamp(context.settings.reader.min_font_size,
+                                        context.settings.reader.max_font_size);
         if (font_size - context.settings.news.font_size).abs() < 0.05 {
             return;
         }
@@ -565,6 +564,15 @@ impl View for News {
                 }
                 true
             },
+            // A tap anywhere else dismisses the slider, and does only that --
+            // the same bargain a menu makes, so putting the bar away never
+            // costs you a page turn or an article you did not mean to open.
+            Event::Gesture(GestureEvent::Tap(center))
+                    if self.rect.includes(center) &&
+                       locate_by_id(self, ViewId::NewsToolBar).is_some() => {
+                self.toggle_tool_bar(Some(false), rq, context);
+                true
+            },
             Event::Gesture(GestureEvent::Tap(center)) if self.rect.includes(center) => {
                 self.follow_link(center, hub, rq, context);
                 true
@@ -579,18 +587,17 @@ impl View for News {
                 if !points.iter().all(|pt| page.includes(*pt)) {
                     return false;
                 }
-                let center = (points[0] + points[1]) / 2;
-                let radius = scale_by_dpi(24.0, CURRENT_DEVICE.dpi) as i32;
-                self.toggle_font_size_menu(Rectangle::from_disk(center, radius), None, rq, context);
+                self.toggle_tool_bar(None, rq, context);
                 true
             },
-            Event::Select(EntryId::SetFontSize(v)) => {
-                self.set_font_size(context.settings.news.font_size - 1.0 + v as f32 / 10.0,
-                                   rq, context);
+            // Only on release. Every motion sample would otherwise repaginate
+            // the whole page, which on this CPU is seconds of work per drag.
+            Event::Slider(SliderId::FontSize, font_size, FingerStatus::Up) => {
+                self.set_font_size(font_size, rq, context);
                 true
             },
-            Event::ToggleNear(ViewId::FontSizeMenu, rect) => {
-                self.toggle_font_size_menu(rect, None, rq, context);
+            Event::ToggleNear(ViewId::NewsToolBar, ..) => {
+                self.toggle_tool_bar(None, rq, context);
                 true
             },
             // The two ways out, and they mean the same thing: up one level,
