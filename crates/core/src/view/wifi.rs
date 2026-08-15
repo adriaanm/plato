@@ -18,7 +18,7 @@ use crate::color::{Color, BLACK, WHITE};
 use crate::context::Context;
 use crate::font::Fonts;
 use crate::framebuffer::{Framebuffer, UpdateMode};
-use crate::geom::{surface_area, Rectangle};
+use crate::geom::{nearest_segment_point, surface_area, Rectangle};
 use crate::gesture::GestureEvent;
 use crate::view::icon::ICONS_PIXMAPS;
 use crate::view::{Bus, Event, Hub, Id, RenderData, RenderQueue, View, ViewId, ID_FEEDER};
@@ -156,6 +156,13 @@ impl Wifi {
     }
 }
 
+/// The dot's ink. Solid means "there is a radio, and this is its signal" --
+/// with no arcs lit that is the *poor signal* glyph, which is why the Off state
+/// must dim the dot as well as the arcs and say so with the strike instead.
+fn dot_color(state: WifiState) -> Color {
+    if state == WifiState::Off { DIM } else { BLACK }
+}
+
 /// How many arcs are lit, outwards from the dot.
 fn lit(state: WifiState, frame: usize) -> usize {
     match state {
@@ -189,6 +196,31 @@ fn next_frame(current: WifiState, next: WifiState, frame: usize) -> Option<usize
     } else {
         1
     })
+}
+
+/// Rasterize the strike-through: a round-capped segment, anti-aliased the same
+/// way the arcs are.
+///
+/// `draw_segment` on the framebuffer would do this without the anti-aliasing,
+/// and a bare diagonal at this size is a visible staircase next to arcs that
+/// are smooth.
+fn draw_strike(fb: &mut dyn Framebuffer, start: (f32, f32), end: (f32, f32),
+               thickness: f32, color: Color, clip: &Rectangle) {
+    let half = thickness / 2.0;
+    let a = vec2!(start.0, start.1);
+    let b = vec2!(end.0, end.1);
+
+    for y in clip.min.y..clip.max.y {
+        for x in clip.min.x..clip.max.x {
+            let p = vec2!(x as f32 + 0.5, y as f32 + 0.5);
+            let (nearest, _) = nearest_segment_point(p, a, b);
+            let offset = nearest - p;
+            let alpha = surface_area(offset.length() - half, offset.angle());
+            if alpha > 0.0 {
+                fb.set_blended_pixel(x as u32, y as u32, color, alpha);
+            }
+        }
+    }
 }
 
 /// Rasterize one arc of the fan: a circular stroke of `thickness`, centered on
@@ -268,18 +300,43 @@ impl View for Wifi {
 
         let (center, scale, thickness) = self.geometry();
         let lit = lit(self.state, self.frame);
+        let off = self.state == WifiState::Off;
+        let outer = RADII[RADII.len() - 1];
 
         for (index, fraction) in RADII.iter().enumerate() {
             let color = if index < lit { BLACK } else { DIM };
             draw_arc(fb, center, fraction * scale, thickness, color, &self.rect);
         }
 
-        // The dot is always solid: it is the one part that says "there is a
-        // radio here at all", and it doubles as the target the eye returns to
-        // while the arcs sweep.
         fb.draw_disk(pt!(center.0 as i32, center.1 as i32),
                      (DOT_RADIUS * scale).max(2.0) as i32,
-                     BLACK);
+                     dot_color(self.state));
+
+        if off {
+            // Corner to corner of the glyph's own box, top-left to
+            // bottom-right. The ends run through empty space either side of
+            // the fan's wedge, which is what makes it read as struck through
+            // rather than as another arc.
+            // A true 45 degree line through the middle of the glyph, not the
+            // diagonal of its bounding box: the fan is a wedge, so the box's
+            // top-left corner is where the outer arc *ends* and its bottom
+            // right is empty. A corner-to-corner line therefore sliced the arc
+            // tips and then left the glyph entirely, reading as a slash beside
+            // the fan rather than across it.
+            let half_width = outer * scale * HALF_SPAN.sin() + thickness / 2.0;
+            let top = center.1 - (outer * scale + thickness / 2.0);
+            let bottom = center.1 + DOT_RADIUS * scale;
+            let middle = (top + bottom) / 2.0;
+            let reach = (2.0 * half_width).max(bottom - top) / 2.0;
+            let start = (center.0 - reach, middle - reach);
+            let end = (center.0 + reach, middle + reach);
+
+            // No white knockout under it. That is the usual way to separate a
+            // strike from what it crosses, but here the fan is already dimmed
+            // and the strike is solid, so they separate tonally on their own --
+            // and the knockout's gap cost more of the fan than the overlap did.
+            draw_strike(fb, start, end, thickness, BLACK, &self.rect);
+        }
     }
 
     fn rect(&self) -> &Rectangle {
@@ -391,6 +448,20 @@ mod tests {
             assert_eq!(next_frame(state, state, 0), None,
                        "{state:?} must not repaint while unchanged");
         }
+    }
+
+    /// A solid dot means "there is a radio and this is its signal". With no
+    /// arcs lit that is the poor-signal glyph, so Off may not draw one -- it
+    /// dims the whole fan and says it with the strike instead. Off was drawing
+    /// a solid dot under dim arcs, which is exactly the poor-signal picture.
+    #[test]
+    fn only_the_off_state_dims_the_dot() {
+        assert_eq!(dot_color(WifiState::Off), DIM);
+        for state in [WifiState::Connecting, WifiState::On, WifiState::Online] {
+            assert_eq!(dot_color(state), BLACK, "{state:?}");
+        }
+        // The state that would collide: a lit dot with nothing above it.
+        assert_eq!(lit(WifiState::Off, 0), 0);
     }
 
     /// The three settled states must be distinguishable, or the icon says
