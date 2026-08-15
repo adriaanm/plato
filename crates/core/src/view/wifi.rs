@@ -108,9 +108,13 @@ impl Wifi {
             Some(frame) => {
                 self.state = state;
                 self.frame = frame;
-                // Fast, not Gui: a small region redrawn repeatedly is exactly
-                // what the fast waveform is for. A Gui update here flashes.
-                rq.add(RenderData::new(self.id, self.rect, UpdateMode::Fast));
+                // Gui, as Clock and Battery use for the same slot. NOT Fast:
+                // on this device Fast is DU (framebuffer::kindle), a two-level
+                // waveform that cannot render the dim arcs' Gray(186) or any
+                // of the anti-aliasing -- which is why the first cut of this
+                // animated invisibly on the panel while being correct in a
+                // PNG. GC16_FAST is the UI waveform and does not flash.
+                rq.add(RenderData::new(self.id, self.rect, UpdateMode::Gui));
             },
         }
     }
@@ -177,11 +181,13 @@ fn next_frame(current: WifiState, next: WifiState, frame: usize) -> Option<usize
         return if next == current { None } else { Some(0) };
     }
     Some(if next == current {
-        (frame + 1) % (RADII.len() + 1)
+        // 1..=len, never 0: a frame with no arcs lit is pixel-identical to the
+        // Off state, so a sweep that began there looked like the tap had done
+        // nothing -- worst at the very first frame, which is the one moment the
+        // feedback matters most.
+        frame % RADII.len() + 1
     } else {
-        // Entering the transition: start the sweep at the dot, so it always
-        // reads outwards.
-        0
+        1
     })
 }
 
@@ -359,20 +365,20 @@ mod tests {
         println!("{}", out.display());
     }
 
-    /// The sweep starts at the dot, lights every arc in turn, and wraps -- a
-    /// frame past the last arc would index nothing and read as a stall.
+    /// The sweep lights every arc in turn and wraps -- and never shows the
+    /// zero-arc frame, which would be indistinguishable from Off.
     #[test]
     fn the_sweep_lights_every_arc_in_turn_and_wraps() {
         let mut frame = next_frame(WifiState::Off, WifiState::Connecting, 7).unwrap();
-        assert_eq!(frame, 0, "entering a transition restarts the sweep");
 
         let mut seen = Vec::new();
-        for _ in 0..=RADII.len() {
+        for _ in 0..2 * RADII.len() {
             seen.push(lit(WifiState::Connecting, frame));
             frame = next_frame(WifiState::Connecting, WifiState::Connecting, frame).unwrap();
         }
-        assert_eq!(seen, vec![0, 1, 2, 3]);
-        assert_eq!(frame, 0, "the sweep wraps rather than running past RADII");
+        assert_eq!(seen, vec![1, 2, 3, 1, 2, 3]);
+        assert!(!seen.contains(&0),
+                "a frame with no arcs lit is the Off glyph exactly");
     }
 
     /// A settled radio must stop repainting. This is the check that keeps the
