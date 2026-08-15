@@ -1189,6 +1189,20 @@ pub fn run() -> Result<(), Error> {
                 rq.add(RenderData::new(flw.id(), *flw.rect(), UpdateMode::Gui));
                 view.children_mut().push(Box::new(flw) as Box<dyn View>);
             },
+            Event::Show(ViewId::WifiDialog) => {
+                // Named for what it will do, not for what the switch is called,
+                // so the answer to the question is unambiguous at a glance --
+                // "Turn WiFi off?" is not a checkbox whose state you have to
+                // read first.
+                let enable = !context.settings.wifi;
+                let text = if enable { "Turn WiFi on?" } else { "Turn WiFi off?" };
+                let dialog = Dialog::new(ViewId::WifiDialog,
+                                         Some(Event::SetWifi(enable)),
+                                         text.to_string(),
+                                         &mut context);
+                rq.add(RenderData::new(dialog.id(), *dialog.rect(), UpdateMode::Gui));
+                view.children_mut().push(Box::new(dialog) as Box<dyn View>);
+            },
             Event::ToggleInputHistoryMenu(id, rect) => {
                 toggle_input_history_menu(view.as_mut(), id, rect, None, &mut rq, &mut context);
             },

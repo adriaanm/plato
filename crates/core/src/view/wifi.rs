@@ -21,7 +21,7 @@ use crate::framebuffer::{Framebuffer, UpdateMode};
 use crate::geom::{surface_area, Rectangle};
 use crate::gesture::GestureEvent;
 use crate::view::icon::ICONS_PIXMAPS;
-use crate::view::{Bus, Event, Hub, Id, RenderData, RenderQueue, View, ID_FEEDER};
+use crate::view::{Bus, Event, Hub, Id, RenderData, RenderQueue, View, ViewId, ID_FEEDER};
 use std::f32::consts::FRAC_PI_2;
 
 /// The unlit arcs. Light enough to read as absent, dark enough to keep the
@@ -242,11 +242,15 @@ impl View for Wifi {
                 true
             },
             Event::Gesture(GestureEvent::Tap(center)) if self.rect.includes(center) => {
-                // Straight to the toggle rather than to a menu: this icon
-                // exists because the menu round trip was the problem. The app
-                // ignores a request that arrives mid-transition, so a double
-                // tap cannot get the radio into a confused state.
-                bus.push_back(Event::SetWifi(!context.settings.wifi));
+                // Through a confirmation, not straight to the toggle. This sits
+                // a thumb's width from the menu button in a bar that is tapped
+                // constantly, and both directions are expensive to get by
+                // accident: turning the radio on costs battery and up to 13 s,
+                // turning it off drops whatever was using it, ssh included.
+                //
+                // The app owns the dialog because a dialog belongs to the root
+                // view, not to a child of the top bar.
+                bus.push_back(Event::Show(ViewId::WifiDialog));
                 true
             },
             _ => false,

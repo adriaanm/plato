@@ -490,6 +490,7 @@ pub enum ViewId {
     Keyboard,
     AboutDialog,
     ShareDialog,
+    WifiDialog,
     MarginCropper,
     TopBottomBars,
     TableOfContents,

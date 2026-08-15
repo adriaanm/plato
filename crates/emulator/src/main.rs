@@ -635,18 +635,49 @@ fn main() -> Result<(), Error> {
                         home.handle_event(&evt, &tx, &mut VecDeque::new(), &mut RenderQueue::new(), &mut context);
                     }
                 },
+                // Same shape as the app's, so the top bar's WiFi indicator has
+                // something to animate over here too: the simulated link takes
+                // 2 s to come up, which is the typical real one.
+                Event::Show(ViewId::WifiDialog) => {
+                    let enable = !context.settings.wifi;
+                    let text = if enable { "Turn WiFi on?" } else { "Turn WiFi off?" };
+                    let dialog = Dialog::new(ViewId::WifiDialog,
+                                             Some(Event::SetWifi(enable)),
+                                             text.to_string(),
+                                             &mut context);
+                    rq.add(RenderData::new(dialog.id(), *dialog.rect(), UpdateMode::Gui));
+                    view.children_mut().push(Box::new(dialog) as Box<dyn View>);
+                },
                 Event::SetWifi(enable) => {
                     if context.settings.wifi != enable {
                         context.settings.wifi = enable;
-                        if enable {
-                            let tx2 = tx.clone();
-                            thread::spawn(move || {
-                                thread::sleep(Duration::from_secs(2));
+                        context.wifi_busy = true;
+                        let tx2 = tx.clone();
+                        thread::spawn(move || {
+                            thread::sleep(Duration::from_secs(2));
+                            if enable {
                                 tx2.send(Event::Device(DeviceEvent::NetUp)).ok();
-                            });
-                        } else {
+                            }
+                            tx2.send(Event::WifiSettled).ok();
+                        });
+                        if !enable {
                             context.online = false;
                         }
+                        tx.send(Event::WifiTick).ok();
+                    }
+                },
+                Event::WifiSettled => {
+                    context.wifi_busy = false;
+                    tx.send(Event::WifiTick).ok();
+                },
+                Event::WifiTick => {
+                    handle_event(view.as_mut(), &evt, &tx, &mut bus, &mut rq, &mut context);
+                    if context.wifi_busy {
+                        let tx2 = tx.clone();
+                        thread::spawn(move || {
+                            thread::sleep(Duration::from_millis(600));
+                            tx2.send(Event::WifiTick).ok();
+                        });
                     }
                 },
                 Event::Device(DeviceEvent::RotateScreen(n)) => {
