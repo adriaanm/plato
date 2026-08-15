@@ -953,7 +953,15 @@ pub fn run() -> Result<(), Error> {
                             (Region::Corner(DiagDir::NorthWest), Region::Corner(DiagDir::SouthEast)) => {
                                 tx.send(Event::Select(EntryId::TakeScreenshot)).ok();
                             },
-                            _ => (),
+                            // Anything that is not one of the two corner
+                            // combinations belongs to the view. This arm used
+                            // to end the event's life here, which made a
+                            // two-finger tap the one gesture no view could
+                            // ever answer -- the news view's font size menu
+                            // was sent twelve of them and saw none.
+                            _ => {
+                                handle_event(view.as_mut(), &evt, &tx, &mut bus, &mut rq, &mut context);
+                            },
                         }
                     },
                     _ => {
