@@ -327,7 +327,10 @@ impl View for Wifi {
             let top = center.1 - (outer * scale + thickness / 2.0);
             let bottom = center.1 + DOT_RADIUS * scale;
             let middle = (top + bottom) / 2.0;
-            let reach = (2.0 * half_width).max(bottom - top) / 2.0;
+            // 90% of the glyph's own span, trimmed symmetrically: at full
+            // length the ends overshot the fan far enough to read as their own
+            // mark rather than as a line drawn across it.
+            let reach = 0.9 * (2.0 * half_width).max(bottom - top) / 2.0;
             let start = (center.0 - reach, middle - reach);
             let end = (center.0 + reach, middle + reach);
 

@@ -675,7 +675,10 @@ fn main() -> Result<(), Error> {
                     if context.wifi_busy {
                         let tx2 = tx.clone();
                         thread::spawn(move || {
-                            thread::sleep(Duration::from_millis(600));
+                            // Same cadence as the app's WIFI_SPIN_INTERVAL,
+                            // whose value is chosen against the panel's fence
+                            // threshold -- see the comment on it there.
+                            thread::sleep(Duration::from_millis(400));
                             tx2.send(Event::WifiTick).ok();
                         });
                     }

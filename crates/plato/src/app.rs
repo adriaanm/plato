@@ -11,7 +11,7 @@ use plato_core::anyhow::{Error, Context as ResultExt, format_err};
 use plato_core::chrono::Local;
 use plato_core::framebuffer::{Framebuffer, KoboFramebuffer1, KoboFramebuffer2, KindleFramebuffer, UpdateMode};
 use plato_core::view::{View, Event, EntryId, EntryKind, ViewId, AppCmd, RenderData, RenderQueue, UpdateData};
-use plato_core::view::{handle_event, process_render_queue, wait_for_all};
+use plato_core::view::{handle_event, process_render_queue, wait_for_all, MAX_UPDATE_DELAY};
 use plato_core::view::common::{locate, locate_by_id, transfer_notifications, overlapping_rectangle};
 use plato_core::view::common::{toggle_input_history_menu, toggle_keyboard_layout_menu};
 use plato_core::view::frontlight::FrontlightWindow;
@@ -74,10 +74,22 @@ const KOBO_UPDATE_BUNDLE: &str = "/mnt/onboard/.kobo/KoboRoot.tgz";
 const CLOCK_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const BATTERY_REFRESH_INTERVAL: Duration = Duration::from_secs(299);
 const AUTO_SUSPEND_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-// One frame of the top bar's WiFi sweep. Slow enough that the panel keeps up
-// -- a fast-waveform update of a slot-sized region costs well under this -- and
-// quick enough to read as motion rather than as a redraw.
-const WIFI_SPIN_INTERVAL: Duration = Duration::from_millis(600);
+// One frame of the top bar's WiFi sweep.
+//
+// This must stay clear of MAX_UPDATE_DELAY, and that is the whole of why it is
+// 400 and not 600. A repaint queued with `wait` fences against any in-flight
+// panel update it overlaps -- but only one that has not "completed", and
+// `UpdateData::has_completed` is a stopwatch, not the panel: elapsed() >=
+// MAX_UPDATE_DELAY. At 600 every frame landed exactly on that threshold, so
+// whether it fenced or skipped flipped from frame to frame and the sweep beat
+// against the panel's own cadence -- Adriaan saw it as an interference
+// pattern, "like watching a spinning wheel through a camera".
+//
+// Below the threshold the answer is always the same: fence, on the real token.
+// The cadence is then the panel's own, which is what it should have been.
+const WIFI_SPIN_INTERVAL: Duration = Duration::from_millis(400);
+const _: () = assert!(WIFI_SPIN_INTERVAL.as_millis() < MAX_UPDATE_DELAY.as_millis(),
+                      "the sweep must fence deterministically; see above");
 const SUSPEND_WAIT_DELAY: Duration = Duration::from_secs(15);
 const PREPARE_SUSPEND_WAIT_DELAY: Duration = Duration::from_secs(3);
 
