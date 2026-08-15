@@ -47,6 +47,13 @@ use self::bottom_bar::BottomBar;
 const VIEWER_STYLESHEET: &str = "css/news.css";
 const USER_STYLESHEET: &str = "css/news-user.css";
 
+/// The range this screen is legible at, not a preference -- the same reasoning
+/// as the reader's bounds, with numbers that suit a page of headlines rather
+/// than a novel: below 8 the metadata line under a headline is a grey smear at
+/// 300 dpi, and above 16 a single headline owns the page.
+const MIN_FONT_SIZE: f32 = 8.0;
+const MAX_FONT_SIZE: f32 = 16.0;
+
 pub struct News {
     id: Id,
     rect: Rectangle,
@@ -375,6 +382,61 @@ impl News {
         self.load(Route::Index, hub, rq, context);
     }
 
+    /// The reader's font size menu, with the reader's encoding: twenty-one
+    /// steps of a tenth around the current size, so `EntryId::SetFontSize`
+    /// means the same thing in both places.
+    fn toggle_font_size_menu(&mut self, rect: Rectangle, enable: Option<bool>, rq: &mut RenderQueue,
+                             context: &mut Context) {
+        if let Some(index) = locate_by_id(self, ViewId::FontSizeMenu) {
+            if let Some(true) = enable {
+                return;
+            }
+            rq.add(RenderData::expose(*self.child(index).rect(), UpdateMode::Gui));
+            self.children.remove(index);
+        } else {
+            if let Some(false) = enable {
+                return;
+            }
+            let font_size = context.settings.news.font_size;
+            let entries = (0..=20).filter_map(|v| {
+                let fs = font_size - 1.0 + v as f32 / 10.0;
+                (MIN_FONT_SIZE..=MAX_FONT_SIZE).contains(&fs).then(|| {
+                    EntryKind::RadioButton(format!("{fs:.1}"),
+                                           EntryId::SetFontSize(v),
+                                           (fs - font_size).abs() < 0.05)
+                })
+            }).collect();
+            let menu = Menu::new(rect, ViewId::FontSizeMenu, MenuKind::Contextual, entries, context);
+            rq.add(RenderData::new(menu.id(), *menu.rect(), UpdateMode::Gui));
+            self.children.push(Box::new(menu) as Box<dyn View>);
+        }
+    }
+
+    /// Re-lay out at a new size and stay where you were reading. The position
+    /// is a byte offset into markup that has not changed, so it survives the
+    /// relayout -- the same move `resize` makes when the geometry changes
+    /// under a page.
+    fn set_font_size(&mut self, font_size: f32, rq: &mut RenderQueue, context: &mut Context) {
+        let font_size = font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        if (font_size - context.settings.news.font_size).abs() < 0.05 {
+            return;
+        }
+        // Kept in the settings, not in the view: Plato writes Settings.toml on
+        // exit, so a size chosen here is the size the next session opens at.
+        context.settings.news.font_size = font_size;
+
+        let image_rect = *self.child(2).rect();
+        self.doc.layout(image_rect.width(), image_rect.height(), font_size, CURRENT_DEVICE.dpi);
+        if let Some(image) = self.children[2].downcast_mut::<Image>() {
+            if let Some((pixmap, loc)) = self.doc.pixmap(Location::Exact(self.location), 1.0,
+                                                         CURRENT_DEVICE.color_samples()) {
+                image.update(pixmap, rq);
+                self.location = loc;
+            }
+        }
+        self.update_bottom_bar(rq);
+    }
+
     fn toggle_source_menu(&mut self, rect: Rectangle, enable: Option<bool>, rq: &mut RenderQueue,
                           context: &mut Context) {
         if let Some(index) = locate_by_id(self, ViewId::NewsSourceMenu) {
@@ -496,6 +558,30 @@ impl View for News {
             },
             Event::Gesture(GestureEvent::Tap(center)) if self.rect.includes(center) => {
                 self.follow_link(center, hub, rq, context);
+                true
+            },
+            // Two fingers, because one is already spoken for: every single tap
+            // on this page is either a link or a page turn, and there is no
+            // corner left to spare. A two-finger tap collides with nothing, so
+            // it is taken anywhere on the page -- a middle region would only be
+            // something to miss -- and the menu opens between the fingers.
+            Event::Gesture(GestureEvent::MultiTap(points)) => {
+                let page = *self.child(2).rect();
+                if !points.iter().all(|pt| page.includes(*pt)) {
+                    return false;
+                }
+                let center = (points[0] + points[1]) / 2;
+                let radius = scale_by_dpi(24.0, CURRENT_DEVICE.dpi) as i32;
+                self.toggle_font_size_menu(Rectangle::from_disk(center, radius), None, rq, context);
+                true
+            },
+            Event::Select(EntryId::SetFontSize(v)) => {
+                self.set_font_size(context.settings.news.font_size - 1.0 + v as f32 / 10.0,
+                                   rq, context);
+                true
+            },
+            Event::ToggleNear(ViewId::FontSizeMenu, rect) => {
+                self.toggle_font_size_menu(rect, None, rq, context);
                 true
             },
             // The two ways out, and they mean the same thing: up one level,
