@@ -15,6 +15,7 @@ pub mod document;
 pub mod library;
 pub mod view;
 pub mod metadata;
+pub mod news;
 pub mod rtc;
 pub mod settings;
 pub mod font;

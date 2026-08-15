@@ -165,6 +165,7 @@ pub struct Settings {
     pub reader: ReaderSettings,
     pub import: ImportSettings,
     pub dictionary: DictionarySettings,
+    pub news: NewsSettings,
     pub sketch: SketchSettings,
     pub calculator: CalculatorSettings,
     pub sync: SyncSettings,
@@ -251,6 +252,52 @@ pub struct ImportSettings {
     pub sync_metadata: bool,
     pub metadata_kinds: FxHashSet<String>,
     pub allowed_kinds: FxHashSet<String>,
+}
+
+/// Which sites the news reader offers, and how it renders them.
+///
+/// Hacker News is built in and always present. Everything else is a feed named
+/// here, which is what "a few dedicated sites" means in practice: adding one is
+/// an edit to `Settings.toml`, not a build.
+///
+/// ```toml
+/// [[news.feeds]]
+/// id = "simonw"
+/// title = "Simon Willison"
+/// url = "https://simonwillison.net/atom/everything/"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct NewsSettings {
+    pub margin_width: i32,
+    pub font_size: f32,
+    /// How much of a feed entry's blurb to show, in characters.
+    pub blurb_chars: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub feeds: Vec<FeedSettings>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct FeedSettings {
+    /// Short and stable: it names the source in the link scheme and in the
+    /// saved position, so renaming one loses your place in it.
+    pub id: String,
+    pub title: String,
+    pub url: String,
+}
+
+impl Default for NewsSettings {
+    fn default() -> Self {
+        NewsSettings {
+            // The dictionary's numbers, for the same reason: this is a screen
+            // of short paragraphs read at arm's length, not a novel.
+            font_size: 11.0,
+            margin_width: 4,
+            blurb_chars: crate::news::feed::DEFAULT_BLURB_CHARS,
+            feeds: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -719,6 +766,7 @@ impl Default for Settings {
             reader: ReaderSettings::default(),
             import: ImportSettings::default(),
             dictionary: DictionarySettings::default(),
+            news: NewsSettings::default(),
             sketch: SketchSettings::default(),
             calculator: CalculatorSettings::default(),
             sync: SyncSettings::default(),
