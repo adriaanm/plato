@@ -1,20 +1,20 @@
 mod preset;
 
-use std::env;
-use std::ops::Index;
-use std::fmt::{self, Debug};
-use std::path::PathBuf;
-use std::collections::{BTreeMap, HashMap};
-use fxhash::FxHashSet;
-use lazy_static::lazy_static;
-use serde::{Serialize, Deserialize};
-use crate::metadata::{SortMethod, TextAlign};
-use crate::frontlight::LightLevels;
 use crate::color::{Color, BLACK};
 use crate::device::CURRENT_DEVICE;
+use crate::frontlight::LightLevels;
+use crate::metadata::{SortMethod, TextAlign};
 use crate::unit::mm_to_px;
+use fxhash::FxHashSet;
+use lazy_static::lazy_static;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
+use std::env;
+use std::fmt::{self, Debug};
+use std::ops::Index;
+use std::path::PathBuf;
 
-pub use self::preset::{LightPreset, guess_frontlight};
+pub use self::preset::{guess_frontlight, LightPreset};
 
 pub const SETTINGS_PATH: &str = "Settings.toml";
 
@@ -230,8 +230,9 @@ impl Default for LibrarySettings {
     fn default() -> Self {
         LibrarySettings {
             name: "Unnamed".to_string(),
-            path: env::current_dir().ok()
-                      .unwrap_or_else(|| PathBuf::from("/")),
+            path: env::current_dir()
+                .ok()
+                .unwrap_or_else(|| PathBuf::from("/")),
             mode: LibraryMode::Database,
             sort_method: SortMethod::Opened,
             first_column: FirstColumn::TitleAndAuthor,
@@ -383,7 +384,6 @@ pub struct HomeSettings {
     pub max_trash_size: u64,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct RefreshRateSettings {
@@ -461,7 +461,8 @@ pub struct ReaderSettings {
 impl ReaderSettings {
     /// The size a freshly opened document of this kind is laid out at.
     pub fn font_size_for(&self, kind: &str) -> f32 {
-        self.kinds.get(kind)
+        self.kinds
+            .get(kind)
             .and_then(|k| k.font_size)
             .unwrap_or(self.font_size)
     }
@@ -469,7 +470,8 @@ impl ReaderSettings {
     /// The margin, in millimeters, a freshly opened document of this kind is
     /// laid out with.
     pub fn margin_width_for(&self, kind: &str) -> i32 {
-        self.kinds.get(kind)
+        self.kinds
+            .get(kind)
             .and_then(|k| k.margin_width)
             .unwrap_or(self.margin_width)
     }
@@ -547,7 +549,10 @@ pub enum WestStripAction {
 impl Default for RefreshRateSettings {
     fn default() -> Self {
         RefreshRateSettings {
-            global: RefreshRatePair { regular: 8, inverted: 2 },
+            global: RefreshRatePair {
+                regular: 8,
+                inverted: 2,
+            },
             by_kind: HashMap::new(),
         }
     }
@@ -600,15 +605,23 @@ impl Default for ReaderSettings {
             auto_columns: true,
             scroll_overlap_lines: 2,
             ignore_document_css: false,
-            dithered_kinds: ["cbz", "png", "jpg", "jpeg"].iter().map(|k| k.to_string()).collect(),
+            dithered_kinds: ["cbz", "png", "jpg", "jpeg"]
+                .iter()
+                .map(|k| k.to_string())
+                .collect(),
             // Markdown is what `platonic` pushes off the Mac -- plans, notes,
             // source files -- and it is read as reference, not as prose. It
             // wants as much on the page as the screen will carry, where an
             // EPUB wants a comfortable measure.
-            kinds: [("md".to_string(), KindSettings {
-                        font_size: Some(8.5),
-                        margin_width: Some(2),
-                    })].into_iter().collect(),
+            kinds: [(
+                "md".to_string(),
+                KindSettings {
+                    font_size: Some(8.5),
+                    margin_width: Some(2),
+                },
+            )]
+            .into_iter()
+            .collect(),
             paragraph_breaker: ParagraphBreakerSettings::default(),
             refresh_rate: RefreshRateSettings::default(),
         }
@@ -621,9 +634,16 @@ impl Default for ImportSettings {
             unshare_trigger: true,
             startup_trigger: true,
             sync_metadata: true,
-            metadata_kinds: ["epub", "pdf", "djvu"].iter().map(|k| k.to_string()).collect(),
-            allowed_kinds: ["pdf", "djvu", "epub", "fb2", "txt", "md",
-                            "xps", "oxps", "mobi", "cbz"].iter().map(|k| k.to_string()).collect(),
+            metadata_kinds: ["epub", "pdf", "djvu"]
+                .iter()
+                .map(|k| k.to_string())
+                .collect(),
+            allowed_kinds: [
+                "pdf", "djvu", "epub", "fb2", "txt", "md", "xps", "oxps", "mobi", "cbz",
+            ]
+            .iter()
+            .map(|k| k.to_string())
+            .collect(),
         }
     }
 }
@@ -645,31 +665,29 @@ impl Default for Settings {
                 LibrarySettings {
                     name: "On Board".to_string(),
                     path: PathBuf::from(*INTERNAL_CARD_ROOT),
-                    hooks: vec![
-                        Hook {
-                            path: PathBuf::from("Articles"),
-                            program: PathBuf::from("bin/article_fetcher/article_fetcher"),
-                            sort_method: Some(SortMethod::Added),
-                            first_column: Some(FirstColumn::TitleAndAuthor),
-                            second_column: Some(SecondColumn::Progress),
-                        }
-                    ],
-                    .. Default::default()
+                    hooks: vec![Hook {
+                        path: PathBuf::from("Articles"),
+                        program: PathBuf::from("bin/article_fetcher/article_fetcher"),
+                        sort_method: Some(SortMethod::Added),
+                        first_column: Some(FirstColumn::TitleAndAuthor),
+                        second_column: Some(SecondColumn::Progress),
+                    }],
+                    ..Default::default()
                 },
                 LibrarySettings {
                     name: "Removable".to_string(),
                     path: PathBuf::from(*EXTERNAL_CARD_ROOT),
-                    .. Default::default()
+                    ..Default::default()
                 },
                 LibrarySettings {
                     name: "Dropbox".to_string(),
                     path: PathBuf::from("/mnt/onboard/.kobo/dropbox"),
-                    .. Default::default()
+                    ..Default::default()
                 },
                 LibrarySettings {
                     name: "KePub".to_string(),
                     path: PathBuf::from("/mnt/onboard/.kobo/kepub"),
-                    .. Default::default()
+                    ..Default::default()
                 },
             ],
             external_urls_queue: Some(PathBuf::from("bin/article_fetcher/urls.txt")),
@@ -724,11 +742,14 @@ mod tests {
         // The upgrade case: every Settings.toml already on a device predates
         // `[reader.kinds]` and spells out `[reader]` in full, because Plato
         // rewrites the file on exit.
-        let settings: Settings = toml::from_str("\
+        let settings: Settings = toml::from_str(
+            "\
             [reader]\n\
             font-size = 11.0\n\
             margin-width = 8\n\
-        ").unwrap();
+        ",
+        )
+        .unwrap();
         assert_eq!(settings.reader.font_size_for("md"), 8.5);
         assert_eq!(settings.reader.margin_width_for("md"), 2);
     }
@@ -738,10 +759,13 @@ mod tests {
         // Note the shape of this: `kinds` is one field, so naming *any* kind
         // in the file displaces the default map entirely. Hand-editing a file
         // that has no `[reader.kinds]` yet has to restate `md` to keep it.
-        let settings: Settings = toml::from_str("\
+        let settings: Settings = toml::from_str(
+            "\
             [reader.kinds.md]\n\
             font-size = 9.0\n\
-        ").unwrap();
+        ",
+        )
+        .unwrap();
         assert_eq!(settings.reader.font_size_for("md"), 9.0);
         // Absent within a kind that *is* named means "fall back to [reader]".
         assert_eq!(settings.reader.margin_width_for("md"), DEFAULT_MARGIN_WIDTH);
