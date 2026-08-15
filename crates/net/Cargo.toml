@@ -1,0 +1,39 @@
+[package]
+name = "plato-net"
+version = "0.1.0"
+edition = "2021"
+description = "The one HTTPS client on the device: blocking, rustls, no async runtime"
+
+# Why ureq and not reqwest, which the workspace already resolves (crates/fetcher):
+# reqwest pulls tokio, and `plato` is deliberately threads-only -- the same
+# reasoning that rejected quinn/iroh for pairing (platokin docs/pairing-candidates.md).
+# ureq is blocking on top of the same rustls, so the reader keeps its shape and
+# the fetch just happens on a worker thread.
+#
+# TLS on this device (platokin docs/device.md, "why TLS to the public internet
+# is broken"): the CA store is EMPTY, so roots have to be bundled in the binary
+# -- `RootCerts::WebPki`, never the platform verifier. The other half of that
+# page, the ~3-years-slow clock, is fixed at boot by scripts/clock-sync.sh.
+[features]
+# The `news::HttpClient` implementation, and with it a dependency on
+# plato-core -- whose build links MuPDF and its seven C libraries. Off by
+# default so that `xbuild.py kindle --package plato-net` stays a pure-Rust
+# build that finishes in seconds, which is what makes net-smoke usable as the
+# on-device network check. The two front ends (plato, emulator) turn it on.
+core-client = ["dep:plato-core"]
+
+[dependencies]
+plato-core = { path = "../core", optional = true }
+ureq = { version = "3.4.0", default-features = false, features = ["rustls", "gzip"] }
+anyhow = "1.0.100"
+
+[lib]
+name = "plato_net"
+path = "src/lib.rs"
+
+# The hardware gate for the whole networking plan: does rustls+ring actually
+# *run* on an armv7 soft-float musl device? platokin's iroh spike proved it
+# compiles and links, and said so explicitly: "not yet run on hardware".
+[[bin]]
+name = "net-smoke"
+path = "src/bin/net-smoke.rs"
