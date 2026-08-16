@@ -9,6 +9,7 @@ members = [
   "crates/fetcher",
   "crates/foldersync",
   "crates/net",
+  "crates/article",
   "crates/pairing",
   "crates/platonic",
   "crates/platonic-recv",
