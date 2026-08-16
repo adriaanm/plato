@@ -36,10 +36,11 @@ impl Fetched {
 /// arithmetic, so this is generous by desktop standards on purpose.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Everything worth reading here is tens of kilobytes; the largest thing this
-/// project knowingly fetches is a big Hacker News thread, ~384 KB of JSON.
-/// The ceiling exists so a redirect into something enormous cannot exhaust a
-/// 256 MB device -- it is a safety rail, not a tuning knob.
+/// Everything worth reading here is well under a megabyte: a big Hacker News
+/// thread is ~384 KB of JSON, and an article page -- fetched whole, scripts
+/// and all, before readability strips it -- is a few hundred KB more often
+/// than not. The ceiling exists so a redirect into something enormous cannot
+/// exhaust a 256 MB device -- it is a safety rail, not a tuning knob.
 const MAX_BODY: u64 = 4 * 1024 * 1024;
 
 const USER_AGENT: &str = concat!("plato-net/", env!("CARGO_PKG_VERSION"),

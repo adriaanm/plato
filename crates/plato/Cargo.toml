@@ -17,5 +17,8 @@ plato-core = { path = "../core" }
 # TLS stack, plato-net answers it and stays free of MuPDF. See the `client`
 # module in crates/net/src/lib.rs.
 plato-net = { path = "../net", features = ["core-client"] }
+# The readability engine, joined to core the same way: core asks through its
+# `news::ArticleExtractor` trait, this crate answers with dom_smoothie.
+plato-article = { path = "../article", features = ["core-client"] }
 # The pairing protocol, compiled into both ends so the wire cannot mismatch.
 pairing = { path = "../pairing" }

@@ -5,14 +5,20 @@
 //! into the same engine, and page through it. What differs is where the
 //! fragment comes from, and that difference is the whole design:
 //!
-//! * The markup is ours (`crate::news`), so nothing here parses a stranger's
-//!   page. This is not a browser and does not grow into one.
+//! * The markup is ours (`crate::news`) -- built from structured data, or,
+//!   for an article opened from a link, extracted by the injected readability
+//!   engine and scrubbed down to our vocabulary by the sanitizer. Either way
+//!   nothing reaches the layout engine that `news` did not write or scrub;
+//!   this is still not a browser, because nothing here lays out a stranger's
+//!   page as that stranger designed it.
 //! * The fetch happens on a worker thread. A page is one or two HTTPS requests
 //!   over a radio that takes seconds to wake, and the event loop cannot wait
 //!   for that -- so `load` spawns, and the answer arrives as `Event::NewsLoaded`.
-//! * A link is either ours (`news:<source>/thread/<id>`, followed here) or the
-//!   open web (queued to `external_urls_queue`, exactly as the reader already
-//!   does with an external link in an EPUB). Nothing else is navigable.
+//! * A link is ours (`news:<source>/thread/<id>`, followed here), or an
+//!   http(s) article (opened right here through the hidden article source), or
+//!   something only another machine can use -- `mailto:` and friends, queued
+//!   to `external_urls_queue` exactly as the reader already does with such
+//!   links in an EPUB. Nothing else is navigable.
 
 mod bottom_bar;
 mod tool_bar;
@@ -31,7 +37,8 @@ use crate::font::Fonts;
 use crate::geom::{halves, CycleDir, Dir, Point, Rectangle};
 use crate::gesture::GestureEvent;
 use crate::input::{ButtonCode, ButtonStatus, DeviceEvent, FingerStatus};
-use crate::news::{self, feed::Feed, hn::HackerNews, HttpClient, Route, Source};
+use crate::news::{self, article, article::ArticleSource, feed::Feed, hn::HackerNews};
+use crate::news::{ArticleExtractor, HttpClient, Route, Source};
 use crate::settings::NewsSettings;
 use crate::unit::scale_by_dpi;
 use crate::view::common::locate_by_id;
@@ -64,6 +71,10 @@ pub struct News {
     /// thread does not re-fetch it -- the rendered body is kept with it.
     history: Vec<(usize, Route, String, usize)>,
     http: Arc<dyn HttpClient>,
+    /// Kept alongside `sources` because the worker-thread copy in
+    /// [`sources_for`] rebuilds the article source around this same engine --
+    /// an `Arc` clone, where a feed is rebuilt from its three strings.
+    extractor: Arc<dyn ArticleExtractor>,
     /// The markup currently shown, kept because `HtmlDocument` does not hand
     /// it back and going back must not re-fetch.
     body: String,
@@ -84,8 +95,8 @@ fn sources(settings: &NewsSettings) -> Vec<Box<dyn Source>> {
 }
 
 impl News {
-    pub fn new(rect: Rectangle, http: Arc<dyn HttpClient>, hub: &Hub, rq: &mut RenderQueue,
-               context: &mut Context) -> News {
+    pub fn new(rect: Rectangle, http: Arc<dyn HttpClient>, extractor: Arc<dyn ArticleExtractor>,
+               hub: &Hub, rq: &mut RenderQueue, context: &mut Context) -> News {
         let id = ID_FEEDER.next();
         let mut children = Vec::new();
         let dpi = CURRENT_DEVICE.dpi;
@@ -93,7 +104,10 @@ impl News {
         let thickness = scale_by_dpi(THICKNESS_MEDIUM, dpi) as i32;
         let (small_thickness, big_thickness) = halves(thickness);
 
-        let sources = sources(&context.settings.news);
+        let mut sources = sources(&context.settings.news);
+        // Last and hidden: the article source answers link taps, not the
+        // source menu, and it has no front page to switch to.
+        sources.push(Box::new(ArticleSource::new(Arc::clone(&extractor))));
         let name = sources[0].title().to_string();
 
         let top_bar = TopBar::new(rect![rect.min.x, rect.min.y,
@@ -144,6 +158,7 @@ impl News {
             blurb_chars: context.settings.news.blurb_chars,
             pending: None,
             http,
+            extractor,
         };
 
         news.load(Route::Index, hub, rq, context);
@@ -158,6 +173,10 @@ impl News {
         match self.route {
             Route::Index => format!("Loading {}…",
                                     news::escape_text(self.sources[self.current].title())),
+            // An article fetch is the slowest load this view makes -- an
+            // arbitrary site instead of a JSON API -- so it earns a word.
+            Route::Thread(_) if self.sources[self.current].id() == article::ID =>
+                "Loading article…".to_string(),
             Route::Thread(_) => "Loading…".to_string(),
         }
     }
@@ -200,7 +219,7 @@ impl News {
         let source_id = self.sources[self.current].id().to_string();
         let source = self.current;
         let http = Arc::clone(&self.http);
-        let sources = sources_for(&self.sources, source, self.blurb_chars);
+        let sources = sources_for(&self.sources, source, self.blurb_chars, &self.extractor);
         let hub = hub.clone();
         let now = Local::now().timestamp();
 
@@ -335,6 +354,8 @@ impl News {
         match target {
             Some(uri) => match news::parse_route_uri(&uri) {
                 Some((_, route)) => self.go_to_route(route, hub, rq, context),
+                None if uri.starts_with("http://") || uri.starts_with("https://") =>
+                    self.open_article(uri, hub, rq, context),
                 None => self.queue_external(&uri, hub, rq, context),
             },
             None => {
@@ -353,6 +374,20 @@ impl News {
                            self.body.clone(), self.location));
         self.route = route.clone();
         self.load(route, hub, rq, context);
+    }
+
+    /// An http(s) link opens as an article, right here: the hidden article
+    /// source takes the URL as its route, and Back returns to the page the
+    /// link was on, like any other step into `history`.
+    fn open_article(&mut self, url: String, hub: &Hub, rq: &mut RenderQueue, context: &mut Context) {
+        let Some(index) = self.sources.iter().position(|s| s.id() == article::ID) else {
+            return self.queue_external(&url, hub, rq, context);
+        };
+        self.history.push((self.current, self.route.clone(),
+                           self.body.clone(), self.location));
+        self.current = index;
+        self.route = Route::Thread(url);
+        self.load(self.route.clone(), hub, rq, context);
     }
 
     /// Going back is free: the page that was left is kept with the history
@@ -385,10 +420,11 @@ impl News {
         true
     }
 
-    /// An article link. This reader does not fetch articles -- that was the
-    /// scope decision, and it is what keeps `news` free of readability
-    /// heuristics -- so the URL goes where an external link in an EPUB already
-    /// goes, and the Mac deals with it.
+    /// A link only another machine can use -- `mailto:`, mostly. Articles
+    /// landed here too, back when this reader refused to fetch them; they now
+    /// open in-reader through the article source, and this queue keeps only
+    /// what genuinely cannot be read on e-ink. The URL goes where an external
+    /// link in an EPUB already goes, and the Mac deals with it.
     fn queue_external(&mut self, url: &str, hub: &Hub, rq: &mut RenderQueue, context: &mut Context) {
         use std::fs::OpenOptions;
         use std::io::Write;
@@ -499,7 +535,10 @@ impl News {
             if let Some(false) = enable {
                 return;
             }
+            // The article source is not on offer: switching to it would mean
+            // asking it for a front page it does not have.
             let entries = self.sources.iter().enumerate()
+                              .filter(|(_, source)| source.id() != article::ID)
                               .map(|(index, source)| {
                                   EntryKind::RadioButton(source.title().to_string(),
                                                          EntryId::SetNewsSource(source.id().to_string()),
@@ -523,12 +562,18 @@ impl News {
 /// The source a worker thread needs, as something it can own.
 ///
 /// `Box<dyn Source>` in the view cannot cross a thread boundary by reference,
-/// and the sources are cheap descriptions -- an empty struct, or three strings
-/// -- so the thread gets its own.
-fn sources_for(sources: &[Box<dyn Source>], index: usize, blurb_chars: usize) -> Box<dyn Source> {
+/// and the sources are cheap to reproduce -- an empty struct, three strings,
+/// or, for the article source, another handle on the shared extractor -- so
+/// the thread gets its own.
+fn sources_for(sources: &[Box<dyn Source>], index: usize, blurb_chars: usize,
+               extractor: &Arc<dyn ArticleExtractor>) -> Box<dyn Source> {
     let source = &sources[index];
     if source.id() == HackerNews.id() {
         Box::new(HackerNews)
+    } else if source.id() == article::ID {
+        // The extractor is machinery, not description: it is shared, and the
+        // clone is of the `Arc`.
+        Box::new(ArticleSource::new(Arc::clone(extractor)))
     } else {
         // Only feeds are configurable, and a feed is exactly (id, title, url).
         Box::new(Feed::new(source.id(), source.title(),
@@ -771,9 +816,26 @@ mod tests {
         ];
         let sources = sources(&settings);
         assert_eq!(sources.len(), 2);
+        // The article source is not configurable and not listed here: it is
+        // appended, hidden, by `News::new`.
+        assert!(sources.iter().all(|s| s.id() != article::ID));
         assert_eq!(sources[1].id(), "simonw");
         assert_eq!(sources[1].url(&Route::Index).unwrap(),
                    "https://simonwillison.net/atom/everything/");
+    }
+
+    /// A stand-in for `plato-article`, close enough for identity checks.
+    struct Verbatim;
+
+    impl ArticleExtractor for Verbatim {
+        fn extract(&self, raw: &[u8], _url: &str) -> Result<crate::news::ExtractedArticle, anyhow::Error> {
+            Ok(crate::news::ExtractedArticle {
+                title: "t".to_string(),
+                byline: None,
+                site: None,
+                html: String::from_utf8_lossy(raw).into_owned(),
+            })
+        }
     }
 
     /// The worker thread's copy has to be the same source, or it fetches the
@@ -781,20 +843,29 @@ mod tests {
     /// silent.
     #[test]
     fn a_source_survives_being_copied_for_a_thread() {
+        let extractor: Arc<dyn ArticleExtractor> = Arc::new(Verbatim);
         let sources: Vec<Box<dyn Source>> = vec![
             Box::new(HackerNews),
             Box::new(Feed::new("verge", "The Verge", "https://www.theverge.com/rss/index.xml")),
+            Box::new(ArticleSource::new(Arc::clone(&extractor))),
         ];
 
-        let hn = sources_for(&sources, 0, 280);
+        let hn = sources_for(&sources, 0, 280, &extractor);
         assert_eq!(hn.id(), "hn");
         assert_eq!(hn.url(&Route::Thread("1".into())).unwrap(),
                    "https://hn.algolia.com/api/v1/items/1");
 
-        let verge = sources_for(&sources, 1, 280);
+        let verge = sources_for(&sources, 1, 280, &extractor);
         assert_eq!(verge.id(), "verge");
         assert_eq!(verge.title(), "The Verge");
         assert_eq!(verge.url(&Route::Index).unwrap(), "https://www.theverge.com/rss/index.xml");
+
+        // The copy is built around the same engine, and it still renders.
+        let article = sources_for(&sources, 2, 280, &extractor);
+        assert_eq!(article.id(), article::ID);
+        let page = article.render(&Route::Thread("https://example.com/a".into()),
+                                  b"<p>body</p>", 0).unwrap();
+        assert!(page.body.contains("<p>body</p>"));
     }
 
     #[test]

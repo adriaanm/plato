@@ -517,6 +517,7 @@ fn main() -> Result<(), Error> {
                         },
                         AppCmd::News => Some(Box::new(News::new(context.fb.rect(),
                                                                 Arc::new(NetClient::new()),
+                                                                Arc::new(plato_article::client::Readability),
                                                                 &tx, &mut rq, &mut context)) as Box<dyn View>),
                         AppCmd::TouchEvents => {
                             Some(Box::new(TouchEvents::new(context.fb.rect(), &mut rq, &mut context)) as Box<dyn View>)

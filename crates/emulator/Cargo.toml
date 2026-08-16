@@ -13,4 +13,5 @@ plato-core = { path = "../core" }
 # The same HTTPS client the device uses, so the news reader can be developed
 # here rather than over ssh.
 plato-net = { path = "../net", features = ["core-client"] }
+plato-article = { path = "../article", features = ["core-client"] }
 sdl2 = "0.38.0"
