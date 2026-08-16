@@ -181,9 +181,9 @@ fn render_index(search: Search, order: &[String], now: i64) -> Result<Page, Erro
         let comments = hit.num_comments.unwrap_or(0);
         meta.push(format!("<a href=\"{}\">{comments} comment{}</a>",
                           escape_attribute(&thread), if comments == 1 { "" } else { "s" }));
-        // The article itself is the *secondary* link: it leaves this reader
-        // (the existing external-URL queue takes it), whereas the discussion
-        // is what we came for.
+        // The article itself is the *secondary* link -- the discussion is
+        // what we came for -- but it no longer leaves this reader: the view
+        // opens it through the article source.
         if let Some(url) = hit.url.as_deref() {
             meta.push(format!("<a href=\"{}\">{}</a>",
                               escape_attribute(url), escape_text(host_of(url))));

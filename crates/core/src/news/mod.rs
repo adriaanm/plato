@@ -1,18 +1,24 @@
-//! Superlight reading of a few known sites -- and never more than that.
+//! Superlight reading of a few known sites -- and of the articles they point
+//! at.
 //!
-//! This is not a browser and is not a step towards one. Every source here
-//! returns *structured* data -- Hacker News as JSON, feeds as XML -- which this
-//! module turns into markup **we** wrote, for `document::html` to render. The
-//! reader therefore never lays out a stranger's page: no tables, no floats, no
-//! JavaScript, no readability heuristics, and no surprises when a site
-//! redesigns. A source that cannot be read that way is a source this does not
-//! support, on purpose.
+//! This is not a browser and is not a step towards one. Every listing source
+//! here returns *structured* data -- Hacker News as JSON, feeds as XML --
+//! which this module turns into markup **we** wrote, for `document::html` to
+//! render: no tables, no floats, no JavaScript, and no surprises when a site
+//! redesigns. The original scope line went further -- "no readability
+//! heuristics" -- and that line has been deliberately crossed, once, by
+//! [`article`]: the story a headline links to has no structured form, so it
+//! goes through an injected readability engine and comes back as untrusted
+//! HTML that `sanitize_fragment` reduces to the same small vocabulary as
+//! everything else. Structured data where it exists, Readability where it
+//! doesn't, and the sanitizer as the unbreached boundary either way.
 //!
 //! Adding a site means implementing [`Source`]: say which URL a route needs,
 //! and turn the bytes into a [`Page`]. Fetching is a separate trait so that
 //! every renderer is a pure function of (bytes, clock) and can be tested
 //! without a network.
 
+pub mod article;
 pub mod feed;
 pub mod hn;
 mod sanitize;
@@ -26,6 +32,27 @@ use anyhow::Error;
 /// the `plato` binary injects at startup.
 pub trait HttpClient: Send + Sync {
     fn get(&self, url: &str) -> Result<Vec<u8>, Error>;
+}
+
+/// What `plato-core` needs from a readability engine, as a trait for the same
+/// reason [`HttpClient`] is one: the engine (html5ever and the Readability
+/// scoring, in `plato-article`) stays out of core, and the front ends inject
+/// it at startup. What comes back is *untrusted* markup -- the extractor's
+/// idea of the article, still written in the site's own HTML -- and it goes
+/// through `sanitize_fragment` like every other stranger's fragment before it
+/// can reach the layout engine.
+pub trait ArticleExtractor: Send + Sync {
+    fn extract(&self, raw: &[u8], url: &str) -> Result<ExtractedArticle, Error>;
+}
+
+/// A readability engine's answer: metadata worth a head block, and the article
+/// body as HTML that has been *found* but not yet made trustworthy.
+#[derive(Debug, Clone)]
+pub struct ExtractedArticle {
+    pub title: String,
+    pub byline: Option<String>,
+    pub site: Option<String>,
+    pub html: String,
 }
 
 /// Where you are within a source. Two shapes cover everything this reader is
@@ -69,8 +96,8 @@ pub fn load(source: &dyn Source, route: &Route, http: &dyn HttpClient, now: i64)
     source.load(route, http, now)
 }
 
-/// Links the view intercepts, distinguishable from an external `https:` link,
-/// which keeps its existing behaviour of being queued for the Mac.
+/// Links the view intercepts, distinguishable from an `https:` link -- which
+/// the view now opens in-reader through the article source.
 pub fn route_uri(source_id: &str, route: &Route) -> String {
     match route {
         Route::Index => format!("news:{source_id}/index"),

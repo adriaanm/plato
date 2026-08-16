@@ -90,12 +90,59 @@
 .d6 { margin-left: 6.6em; }
 .d7 { margin-left: 7.7em; }
 
-/* Quoted code in a comment. Wrapping is not optional on a screen this narrow:
- * a long line has nowhere to go. */
-.comment pre, .storytext pre {
+/* Quoted code, in a comment or an article. Wrapping is not optional on a
+ * screen this narrow: a long line has nowhere to go. */
+.comment pre, .storytext pre, .article pre {
 	font-size: 0.85em;
 	margin-left: 0.8em;
 	margin-top: 0.4em;
+}
+
+/* ── An article, readability-extracted ──────────────────────────────────── */
+
+/* The body of an article: a stranger's prose reduced by the sanitizer to the
+ * vocabulary above, so these rules are the whole of its design. Headings step
+ * up only a little -- the page title in .head already holds 1.3em, and at
+ * 1072 px size is expensive; inside the text, "new section" is said with
+ * weight and a modest bump, not a shout. */
+
+.article {
+	margin-top: 0.4em;
+}
+
+.article p {
+	margin-top: 0.6em;
+	margin-bottom: 0;
+}
+
+.article h1, .article h2 {
+	font-size: 1.1em;
+	font-weight: bold;
+	line-height: 1.2;
+	margin-top: 1.1em;
+	margin-bottom: 0;
+}
+
+.article h3, .article h4, .article h5, .article h6 {
+	font-size: 1em;
+	font-weight: bold;
+	margin-top: 1em;
+	margin-bottom: 0;
+}
+
+/* A section break. The engine draws no borders, so the thin line an hr means
+ * on paper is carried here by white space alone: an empty block given real
+ * height, which the layout honours even for a childless element. */
+.article hr {
+	height: 1.2em;
+}
+
+/* Quoted matter: indented like a reply, slightly smaller like a blurb. */
+.article blockquote {
+	font-size: 0.92em;
+	margin-top: 0.6em;
+	margin-bottom: 0.6em;
+	margin-left: 1.1em;
 }
 
 /* ── Status ─────────────────────────────────────────────────────────────── */

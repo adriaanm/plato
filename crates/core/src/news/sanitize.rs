@@ -1,19 +1,25 @@
 //! Turn a source's HTML fragment into something `document::html` can parse.
 //!
-//! Both sources hand us small islands of HTML written by someone else: Hacker
-//! News comment bodies, and the `description`/`summary` of a feed entry. Two
-//! properties have to hold before that can reach [`XmlParser`], which is a
-//! *XML* parser with no implicit closing and no void-element table:
+//! Every source hands us HTML written by someone else: Hacker News comment
+//! bodies, the `description`/`summary` of a feed entry, and -- since articles
+//! opened in-reader -- whatever the readability extractor pulled out of an
+//! arbitrary page. Two properties have to hold before any of that can reach
+//! [`XmlParser`], which is a *XML* parser with no implicit closing and no
+//! void-element table:
 //!
 //! 1. **Every element closes.** Measured on a real HN item page: `<p>` occurs
 //!    40 times and `</p>` zero times -- HN uses `<p>` as a separator, the way
 //!    HTML lets you. Unclosed, the parser nests every following paragraph one
 //!    level deeper.
-//! 2. **Nothing unexpected gets through.** The vocabulary inside HN comment
-//!    bodies is exactly `a, code, i, p, pre` (checked across a 724-comment
-//!    thread); feeds are looser. Rather than trust either, this keeps an
-//!    allowlist and drops the rest -- which also means no `<script>`, no
-//!    styling and no remote `<img>` can arrive from a stranger's comment.
+//! 2. **Nothing unexpected gets through.** The vocabulary began as HN's --
+//!    comment bodies contain exactly `a, code, i, p, pre`, checked across a
+//!    724-comment thread -- and grew the headings and `hr` an article needs
+//!    when whole articles started arriving. Feeds and extracted articles are
+//!    looser than HN; rather than trust any of them, this keeps an allowlist
+//!    and drops the rest -- which also means no `<script>`, no styling and no
+//!    remote `<img>` can arrive from a stranger's page. A few elements
+//!    ([`DROPPED_WHOLE`]) take their contents with them: a script body or an
+//!    image caption must not surface as article text.
 //!
 //! Text is passed through as-is: it arrives already escaped from both sources,
 //! and `decode_entities` runs later during layout. The one exception is a
@@ -26,24 +32,29 @@ use std::fmt::Write;
 /// keeping its children* -- a `<div>` wrapper in a feed blurb should not take
 /// the blurb with it.
 const ALLOWED: &[&str] = &[
-    "a", "b", "blockquote", "code", "em", "i", "li", "ol", "p", "pre", "strong", "ul",
+    "a", "b", "blockquote", "code", "em", "h1", "h2", "h3", "h4", "h5", "h6",
+    "i", "li", "ol", "p", "pre", "strong", "ul",
 ];
 
 /// Kept, but as empty elements. `img` is deliberately *not* here: nothing in
 /// this reader fetches remote images, and a blurb full of tracking pixels is
 /// exactly what an e-ink reader does not need.
-const VOID: &[&str] = &["br"];
+const VOID: &[&str] = &["br", "hr"];
 
 /// Block-level elements. An open `<p>` closes when any of these starts, which
 /// is HTML's own rule and the whole of the implicit-close story we need: HN
 /// writes `first<p>second<p><pre>code</pre>`, and without this the `<pre>`
 /// would end up inside the paragraph.
-const BLOCKS: &[&str] = &["blockquote", "li", "ol", "p", "pre", "ul"];
+const BLOCKS: &[&str] = &[
+    "blockquote", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "li", "ol", "p", "pre", "ul",
+];
 
-/// Elements whose *contents* go too, in a blurb. A feed that ships article
+/// Elements whose *contents* go too, everywhere. A feed that ships article
 /// HTML ships its image captions with it, and since no image is drawn here the
 /// caption arrives as a non-sequitur at the top of the blurb -- The Verge opens
-/// every entry with "…pop music. | Image: Daniel Randall".
+/// every entry with "…pop music. | Image: Daniel Randall". The same holds for
+/// a whole article, with `script` as the sharper case: its body is code, and
+/// dropping only the tags would print it as prose.
 const DROPPED_WHOLE: &[&str] = &["caption", "figcaption", "figure", "script", "style"];
 
 /// An open element, and where its tag sits in the output -- so that an element
@@ -66,19 +77,23 @@ pub fn sanitize_fragment(input: &str) -> String {
 
         match parse_tag(rest) {
             Some((tag, closing, after)) => {
+                let lower = tag.name.to_ascii_lowercase();
+                if !closing && DROPPED_WHOLE.contains(&lower.as_str()) {
+                    rest = skip_dropped(&lower, after);
+                    continue;
+                }
                 rest = after;
                 if let Some(name) = allowed_name(tag.name) {
                     if closing {
                         close_through(&mut out, &mut open, name);
                     } else if VOID.contains(&name) {
-                        out.push_str("<br/>");
+                        if BLOCKS.contains(&name) {
+                            close_implicit(&mut out, &mut open, name);
+                        }
+                        let _ = write!(out, "<{name}/>");
                     } else {
                         if BLOCKS.contains(&name) {
-                            if let Some(top) = open.last().map(|o| o.name) {
-                                if top == "p" || (top == name && name == "li") {
-                                    close_through(&mut out, &mut open, top);
-                                }
-                            }
+                            close_implicit(&mut out, &mut open, name);
                         }
                         let tag_start = out.len();
                         let _ = write!(out, "<{name}");
@@ -178,6 +193,29 @@ fn allowed_name(name: &str) -> Option<&'static str> {
     ALLOWED.iter().chain(VOID).find(|&&a| a == lower).copied()
 }
 
+/// HTML's implicit-close rule, or the slice of it this vocabulary needs: a
+/// starting block closes an open `<p>`, and a new `<li>` closes the previous
+/// one.
+fn close_implicit(out: &mut String, open: &mut Vec<Open>, name: &str) {
+    if let Some(top) = open.last().map(|o| o.name) {
+        if top == "p" || (top == name && name == "li") {
+            close_through(out, open, top);
+        }
+    }
+}
+
+/// Everything up to and including `</name>` -- or nothing at all, when the
+/// close never comes. An unclosed `<figure>` therefore swallows the rest of
+/// the input rather than letting its caption pose as body text, which is the
+/// safe direction: markup broken enough to leave a dropped element open is
+/// markup whose remainder cannot be told apart from that element's contents.
+fn skip_dropped<'a>(name: &str, after: &'a str) -> &'a str {
+    let close = format!("</{name}");
+    after.find(&close)
+         .and_then(|at| after[at..].find('>').map(|end| &after[at + end + 1..]))
+         .unwrap_or("")
+}
+
 /// Close `name`, and anything opened inside it that never closed. Without the
 /// "and anything inside it" part, one stray `<i>` in a comment would swallow
 /// the rest of the thread.
@@ -272,15 +310,7 @@ pub fn text_only(input: &str, max_chars: usize) -> String {
             Some((tag, closing, after)) => {
                 let lower = tag.name.to_ascii_lowercase();
                 if !closing && DROPPED_WHOLE.contains(&lower.as_str()) {
-                    // Skip to the matching close, or to the end if the feed
-                    // never wrote one.
-                    let close = format!("</{lower}");
-                    rest = match after.find(&close).and_then(|at| {
-                        after[at..].find('>').map(|end| &after[at + end + 1..])
-                    }) {
-                        Some(after_close) => after_close,
-                        None => "",
-                    };
+                    rest = skip_dropped(&lower, after);
                     text.push(' ');
                     continue;
                 }
@@ -373,9 +403,48 @@ mod tests {
     #[test]
     fn disallowed_elements_lose_the_tag_and_keep_the_text() {
         assert_eq!(sanitize_fragment("<div class=\"x\">kept</div>"), "kept");
-        assert_eq!(sanitize_fragment("<script>alert(1)</script>"), "alert(1)");
         assert_eq!(sanitize_fragment("<img src=\"http://tracker/x.gif\">no pixels"),
                    "no pixels");
+    }
+
+    /// A `<script>` body is code, not prose: dropping only the tags would
+    /// print it. It goes whole, like everything in `DROPPED_WHOLE`.
+    #[test]
+    fn a_script_vanishes_contents_included() {
+        assert_eq!(sanitize_fragment("before<script>alert(1)</script>after"),
+                   "beforeafter");
+        assert_eq!(sanitize_fragment("<style>p { display: none }</style>text"), "text");
+    }
+
+    #[test]
+    fn article_headings_survive_and_close_an_open_paragraph() {
+        assert_eq!(sanitize_fragment("<h2>Section</h2><p>body</p>"),
+                   "<h2>Section</h2><p>body</p>");
+        // Readability output can leave a `<p>` open before a heading; HTML's
+        // own rule is that the heading closes it.
+        assert_eq!(sanitize_fragment("<p>intro<h3>Next</h3>"),
+                   "<p>intro</p><h3>Next</h3>");
+    }
+
+    #[test]
+    fn hr_is_closed_like_br() {
+        assert_eq!(sanitize_fragment("one<hr>two"), "one<hr/>two");
+        assert_eq!(sanitize_fragment("<p>one<hr>two"), "<p>one</p><hr/>two");
+    }
+
+    #[test]
+    fn a_figure_and_its_caption_vanish_from_a_fragment() {
+        let input = "<p>seen</p><figure><img src=\"x.jpg\"/>\
+                     <figcaption>Photo: A. Nobody</figcaption></figure><p>also seen</p>";
+        assert_eq!(sanitize_fragment(input), "<p>seen</p><p>also seen</p>");
+    }
+
+    /// The documented trade in `skip_dropped`: an unclosed dropped element
+    /// truncates the rest of the input instead of letting its contents leak.
+    #[test]
+    fn an_unclosed_figure_swallows_what_follows_rather_than_leaking_its_caption() {
+        assert_eq!(sanitize_fragment("<p>seen</p><figure><figcaption>leak?"),
+                   "<p>seen</p>");
     }
 
     #[test]
