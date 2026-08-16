@@ -310,8 +310,15 @@ pub enum Event {
     /// answers it -- an open News view takes it in place, any other view is
     /// pushed onto history under a News opened straight at the article, so
     /// Back leaves to wherever the user was rather than to a front page
-    /// nobody visited.
-    OpenUrl(String),
+    /// nobody visited.  `stamp` is the Mac's clock when it came along: it
+    /// asks the News view to keep the fetched article in `inbox/` under that
+    /// mtime, offline and expiring like any pushed document.
+    OpenUrl { url: String, stamp: Option<i64> },
+    /// The News view kept a pushed article: this path now exists under
+    /// `inbox/`, stamped and complete.  The app loop answers with the same
+    /// re-scan a pushed document gets, so the library shows the article
+    /// without waiting for the next import trigger.
+    ArticleSaved(PathBuf),
     // Also from the FIFO, but poked by the device's own WiFi scripts rather
     // than from the Mac: the radio came up / is about to go down. They carry
     // the mDNS responder's lifecycle.

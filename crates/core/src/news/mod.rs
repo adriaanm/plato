@@ -21,6 +21,7 @@
 pub mod article;
 pub mod feed;
 pub mod hn;
+pub mod save;
 mod sanitize;
 
 pub use sanitize::{escape_attribute, escape_text, sanitize_article_fragment,

@@ -39,8 +39,10 @@ pub trait Link {
     fn open(&mut self, folder: &str, name: &str) -> Result<(), String>;
     /// Open a web URL in the reader's article view.  Unlike `open` there is
     /// no document behind it: the reader fetches and readability-extracts the
-    /// page itself, so the only thing that travels is the URL.
-    fn open_url(&mut self, url: &str) -> Result<(), String>;
+    /// page itself, then files what it fetched into `inbox/` for offline
+    /// reading -- stamped with `mtime`, the Mac's clock, because the sweep
+    /// judges inbox lifetimes against it and the device's clock reads 2023.
+    fn open_url(&mut self, url: &str, mtime: i64) -> Result<(), String>;
     fn import(&mut self) -> Result<(), String>;
     fn list(&mut self) -> Result<Vec<Entry>, String>;
     /// Names deleted from `inbox/`.
@@ -201,13 +203,13 @@ impl Link for RecvLink {
         }, None).map(|_| ())
     }
 
-    fn open_url(&mut self, url: &str) -> Result<(), String> {
+    fn open_url(&mut self, url: &str, mtime: i64) -> Result<(), String> {
         // Validated here too, like PUT's names: politeness, not the check --
         // the check that counts runs on the device.  An OLD receiver answers
         // this op with Unsupported and `describe` names the redeploy, so the
         // failure is one visible line, never a hang.
         proto::validate_url(url)?;
-        self.call(Request::OpenUrl { url: url.to_string() }, None).map(|_| ())
+        self.call(Request::OpenUrl { url: url.to_string(), mtime }, None).map(|_| ())
     }
 
     fn import(&mut self) -> Result<(), String> {
@@ -298,8 +300,8 @@ impl<'a> Link for ShellLink<'a> {
     /// Plato from before `open-url` logs "Unknown command" on the device and
     /// nothing opens.  The receiver path does not have this blind spot, which
     /// is one more reason it is the preferred transport.
-    fn open_url(&mut self, url: &str) -> Result<(), String> {
-        self.poke(&format!("open-url {}", url))
+    fn open_url(&mut self, url: &str, mtime: i64) -> Result<(), String> {
+        self.poke(&format!("open-url {} {}", mtime, url))
     }
 
     fn import(&mut self) -> Result<(), String> {
@@ -351,8 +353,8 @@ impl Link for DryLink {
         self.echo(format!("OPEN {}/{}", folder, name));
         Ok(())
     }
-    fn open_url(&mut self, url: &str) -> Result<(), String> {
-        self.echo(format!("OPEN_URL {}", url));
+    fn open_url(&mut self, url: &str, mtime: i64) -> Result<(), String> {
+        self.echo(format!("OPEN_URL {}  mtime {}", url, mtime));
         Ok(())
     }
     fn import(&mut self) -> Result<(), String> {

@@ -121,7 +121,7 @@ impl<R: Read, W: Write> Session<R, W> {
             Request::List => self.list(),
             Request::Sweep { cutoff } => self.sweep(cutoff),
             Request::Quit => Response::Done,
-            Request::OpenUrl { url } => self.open_url(&url),
+            Request::OpenUrl { url, mtime } => self.open_url(&url, mtime),
         }
     }
 
@@ -285,16 +285,19 @@ impl<R: Read, W: Write> Session<R, W> {
         self.fifo_line(&line)
     }
 
-    /// The Mac names a URL; the reader's News view fetches and extracts it.
+    /// The Mac names a URL; the reader's News view fetches and extracts it,
+    /// and files what it fetched into `inbox/` stamped with the Mac's clock.
     /// Nothing lands on disk here -- the whole op is one FIFO line -- but the
     /// validation still runs on the DEVICE, because the line is written by a
-    /// root program and a newline in it would be a second command.
-    fn open_url(&mut self, url: &str) -> Response {
+    /// root program and a newline in it would be a second command.  The mtime
+    /// needs no validating: it renders as one decimal number, which cannot
+    /// smuggle anything into the line.
+    fn open_url(&mut self, url: &str, mtime: i64) -> Response {
         if let Err(e) = validate_url(url) {
             return refuse(Status::Invalid, format!("{} {}", e, quote_for_log(url)));
         }
         log(&format!("OPEN_URL {}", quote_for_log(url)));
-        self.fifo_line(&format!("open-url {}", url))
+        self.fifo_line(&format!("open-url {} {}", mtime, url))
     }
 
     /// One line into Plato's command FIFO.  The FIFO is created by `plato.sh`;
@@ -693,7 +696,7 @@ mod tests {
         for bad in ["file:///etc/passwd", "javascript:alert(1)",
                     "https://example.com/a\nimport", "not a url"] {
             let resp = converse(scratch.cfg(), vec![
-                (Request::OpenUrl { url: bad.into() }, Vec::new())]);
+                (Request::OpenUrl { url: bad.into(), mtime: 0 }, Vec::new())]);
             assert!(matches!(resp[0], Response::Err { status: Status::Invalid, .. }),
                     "{:?} was not refused: {:?}", bad, resp[0]);
         }
@@ -705,7 +708,7 @@ mod tests {
         // reading the FIFO must come back as an answer, not a block.
         let scratch = Scratch::new("url-no-fifo");
         let resp = converse(scratch.cfg(), vec![
-            (Request::OpenUrl { url: "https://example.com/essay".into() },
+            (Request::OpenUrl { url: "https://example.com/essay".into(), mtime: 0 },
              Vec::new())]);
         assert!(matches!(resp[0], Response::Err { status: Status::NotFound, .. }),
                 "{:?}", resp[0]);

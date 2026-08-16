@@ -4,8 +4,13 @@
 //!
 //! Five verbs. `import` re-scans the library, `open <path>` re-scans and
 //! then opens the document exactly as a tap on its row would, and
-//! `open-url <url>` opens a web page in the News view's article reader --
-//! all three driven by `platonic` from the Mac.
+//! `open-url [MTIME] <url>` opens a web page in the News view's article
+//! reader -- all three driven by `platonic` from the Mac. The optional
+//! leading integer is the Mac's clock, and it is what asks the reader to
+//! *keep* the article: the fetched page is filed into `inbox/` with that
+//! mtime, so it reads offline and expires under the ordinary sweep. Without
+//! it the page only opens -- the right meaning for a line typed by hand,
+//! which has no trustworthy clock to offer.
 //!
 //! `wifi-up [ADDR]` and `wifi-down` are driven by the DEVICE's own WiFi
 //! scripts, and exist because the scripts are the chokepoint: every path that
@@ -34,10 +39,11 @@ pub const DEFAULT_FIFO_PATH: &str = "/tmp/plato.cmd";
 pub enum Command {
     Import,
     Open(PathBuf),
-    /// `open-url <url>`: show a web page in the News view's article reader.
-    /// Driven by `platonic URL` from the Mac; nothing was pushed, so there is
-    /// no path and no import -- the reader fetches the page itself.
-    OpenUrl(String),
+    /// `open-url [MTIME] <url>`: show a web page in the News view's article
+    /// reader. Driven by `platonic URL` from the Mac; nothing was pushed --
+    /// the reader fetches the page itself, and, when the Mac's clock came
+    /// along as `stamp`, files what it fetched into `inbox/` under it.
+    OpenUrl { url: String, stamp: Option<i64> },
     /// The radio came up (or reassociated, or changed address).
     WifiUp(Option<String>),
     /// The radio is about to go down. Sent BEFORE the teardown, so the
@@ -69,8 +75,20 @@ pub fn parse_command(line: &str) -> Option<Command> {
     // the URL verbatim, same rule as `open`'s path.
     if let Some(rest) = line.strip_prefix("open-url ") {
         let rest = rest.trim();
+        // `MTIME <url>` or bare `<url>`: a URL cannot begin with a digit-run
+        // token (validation upstream refuses whitespace in one), so a first
+        // token that parses as an integer can only be the clock.
+        if let Some((first, url)) = rest.split_once(' ') {
+            if let Ok(stamp) = first.parse::<i64>() {
+                let url = url.trim();
+                if !url.is_empty() {
+                    return Some(Command::OpenUrl { url: url.to_string(),
+                                                   stamp: Some(stamp) });
+                }
+            }
+        }
         if !rest.is_empty() {
-            return Some(Command::OpenUrl(rest.to_string()));
+            return Some(Command::OpenUrl { url: rest.to_string(), stamp: None });
         }
     }
     if line == "wifi-down" {
@@ -128,7 +146,9 @@ pub fn spawn_fifo_listener(path: PathBuf, tx: Sender<Event>) {
             match parse_command(&line) {
                 Some(Command::Import) => { tx.send(Event::ImportLibrary).ok(); },
                 Some(Command::Open(path)) => { tx.send(Event::OpenByPath(path)).ok(); },
-                Some(Command::OpenUrl(url)) => { tx.send(Event::OpenUrl(url)).ok(); },
+                Some(Command::OpenUrl { url, stamp }) => {
+                    tx.send(Event::OpenUrl { url, stamp }).ok();
+                },
                 Some(Command::WifiUp(addr)) => { tx.send(Event::WifiUp(addr)).ok(); },
                 Some(Command::WifiDown) => { tx.send(Event::WifiDown).ok(); },
                 None => {
@@ -166,7 +186,21 @@ mod tests {
     #[test]
     fn parse_open_url() {
         assert_eq!(parse_command("open-url https://example.com/essay?a=1&b=2\n"),
-                   Some(Command::OpenUrl("https://example.com/essay?a=1&b=2".to_string())));
+                   Some(Command::OpenUrl {
+                       url: "https://example.com/essay?a=1&b=2".to_string(),
+                       stamp: None,
+                   }));
+        assert_eq!(parse_command("open-url 1786527005 https://example.com/essay\n"),
+                   Some(Command::OpenUrl {
+                       url: "https://example.com/essay".to_string(),
+                       stamp: Some(1786527005),
+                   }));
+        // A clock with no URL behind it names nothing to open.
+        assert_eq!(parse_command("open-url 1786527005"),
+                   Some(Command::OpenUrl {
+                       url: "1786527005".to_string(),
+                       stamp: None,
+                   }));
         // A bare verb points at nothing, same as a bare `open`.
         assert_eq!(parse_command("open-url"), None);
         assert_eq!(parse_command("open-url   "), None);
@@ -179,7 +213,8 @@ mod tests {
         assert_eq!(parse_command("open /mnt/us/documents/https-notes.md"),
                    Some(Command::Open(PathBuf::from("/mnt/us/documents/https-notes.md"))));
         assert_eq!(parse_command("open-url https://a.b/c"),
-                   Some(Command::OpenUrl("https://a.b/c".to_string())));
+                   Some(Command::OpenUrl { url: "https://a.b/c".to_string(),
+                                           stamp: None }));
     }
 
     #[test]

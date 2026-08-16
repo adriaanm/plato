@@ -1076,10 +1076,12 @@ pub fn run() -> Result<(), Error> {
                     tx.send(Event::Notify(format!("Can't find {}.", path.display()))).ok();
                 }
             },
-            Event::OpenUrl(ref url) => {
+            Event::OpenUrl { ref url, stamp } => {
                 // The FIFO's `open-url`: a link pushed from the Mac. Same
                 // arrival contract as a pushed document -- it interrupts and
-                // opens -- but nothing landed on disk, so there is no import.
+                // opens -- but nothing lands on disk until the News view has
+                // fetched the page, so there is no import here; the stamp
+                // rides along and `ArticleSaved` below answers the landing.
                 // An open News view takes it in place (one step into its own
                 // history); any other view goes onto the app history under a
                 // News opened straight at the article, so the first Back
@@ -1088,7 +1090,7 @@ pub fn run() -> Result<(), Error> {
                     view.handle_event(&evt, &tx, &mut bus, &mut rq, &mut context);
                 } else {
                     view.children_mut().retain(|child| !child.is::<Menu>());
-                    let news = News::new_at_article(context.fb.rect(), url.clone(),
+                    let news = News::new_at_article(context.fb.rect(), url.clone(), stamp,
                                                     Arc::new(NetClient::new()),
                                                     Arc::new(plato_article::client::Readability),
                                                     &tx, &mut rq, &mut context);
@@ -1102,6 +1104,17 @@ pub fn run() -> Result<(), Error> {
                     });
                     view = next_view;
                 }
+            },
+            Event::ArticleSaved(ref path) => {
+                // The pushed article landed in `inbox/`: the same re-scan a
+                // pushed document's `open` gets, minus the opening -- the
+                // article is already on screen.
+                context.library.reload();
+                context.batch_import();
+                view.handle_event(&Event::Reseed, &tx, &mut bus, &mut rq, &mut context);
+                let name = path.file_name().map(|name| name.to_string_lossy().into_owned())
+                               .unwrap_or_default();
+                tx.send(Event::Notify(format!("Kept in inbox as {}.", name))).ok();
             },
             Event::Select(EntryId::About) => {
                 let dialog = Dialog::new(ViewId::AboutDialog,

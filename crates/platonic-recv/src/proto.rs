@@ -90,14 +90,18 @@ pub enum Op {
     List = 4,
     Sweep = 5,
     Quit = 6,
-    /// "Open this URL in the reader's article view."  Added after 1..=6
-    /// shipped; there is no version negotiation to bump, because the existing
-    /// compat story already covers it: a receiver that predates this op reads
-    /// an unknown op byte, answers [`Status::Unsupported`] ("protocol error:
-    /// unknown op byte 7") and ends the session -- the Mac reads that refusal
-    /// as a response, so the failure is one visible line naming the redeploy,
-    /// never a hang.
-    OpenUrl = 7,
+    /// "Open this URL in the reader's article view, and keep it."  Added
+    /// after 1..=6 shipped as op 7, which carried the URL alone; when the
+    /// reader learned to save the article into `inbox/` it needed the Mac's
+    /// clock too (the device's reads 2023 -- the sweep would judge a stamp
+    /// from it as ancient), and rather than reshape op 7's frame, 7 was
+    /// retired and 8 took its place.  There is no version negotiation to
+    /// bump, because the existing compat story covers both directions: the
+    /// mismatched end reads an unknown op byte, answers
+    /// [`Status::Unsupported`] ("protocol error: unknown op byte ...") and
+    /// ends the session -- one visible line naming the redeploy, never a
+    /// hang, and never a frame misread as another frame.
+    OpenUrl = 8,
 }
 
 impl Op {
@@ -109,7 +113,7 @@ impl Op {
             4 => Some(Op::List),
             5 => Some(Op::Sweep),
             6 => Some(Op::Quit),
-            7 => Some(Op::OpenUrl),
+            8 => Some(Op::OpenUrl),
             _ => None,
         }
     }
@@ -160,10 +164,13 @@ pub enum Request {
     /// the Mac's clock.
     Sweep { cutoff: i64 },
     Quit,
-    /// Open a web URL in the reader's article view.  Nothing lands on disk:
-    /// the receiver's whole job here is one validated `open-url` line into
-    /// Plato's FIFO, the same seam PUT's open already uses.
-    OpenUrl { url: String },
+    /// Open a web URL in the reader's article view.  The receiver's whole
+    /// job is one validated `open-url` line into Plato's FIFO, the same seam
+    /// PUT's open already uses; the reader does the fetching, and saves what
+    /// it fetched into `inbox/` stamped with this mtime -- the **Mac's**
+    /// clock, for the same reason PUT's is: the sweep judges inbox lifetimes
+    /// against it, and the device's own clock reads 2023.
+    OpenUrl { url: String, mtime: i64 },
 }
 
 impl Request {
@@ -400,7 +407,10 @@ pub fn write_request(w: &mut impl Write, req: &Request) -> io::Result<()> {
             write_str(w, MAX_COMPONENT, filename)?;
         }
         Request::Sweep { cutoff } => write_i64(w, *cutoff)?,
-        Request::OpenUrl { url } => write_str(w, MAX_URL, url)?,
+        Request::OpenUrl { url, mtime } => {
+            write_str(w, MAX_URL, url)?;
+            write_i64(w, *mtime)?;
+        }
         Request::Import | Request::List | Request::Quit => {}
     }
     Ok(())
@@ -442,7 +452,10 @@ pub fn read_request(r: &mut impl Read) -> io::Result<Option<Request>> {
         Op::List => Request::List,
         Op::Sweep => Request::Sweep { cutoff: read_i64(r)? },
         Op::Quit => Request::Quit,
-        Op::OpenUrl => Request::OpenUrl { url: read_str(r, MAX_URL)? },
+        Op::OpenUrl => Request::OpenUrl {
+            url: read_str(r, MAX_URL)?,
+            mtime: read_i64(r)?,
+        },
     };
     Ok(Some(req))
 }
@@ -566,6 +579,7 @@ mod tests {
         roundtrip(Request::Quit);
         roundtrip(Request::OpenUrl {
             url: "https://example.com/essay?a=1&b=2#top".into(),
+            mtime: 1_786_527_005,
         });
     }
 
@@ -575,7 +589,7 @@ mod tests {
         // would refuse mid-stream...
         let long = format!("https://example.com/{}", "a".repeat(MAX_URL));
         let mut buf = Vec::new();
-        assert!(write_request(&mut buf, &Request::OpenUrl { url: long }).is_err());
+        assert!(write_request(&mut buf, &Request::OpenUrl { url: long, mtime: 0 }).is_err());
         // ...and at decode time, before any allocation follows the header.
         let mut buf = vec![Op::OpenUrl as u8];
         buf.extend_from_slice(&((MAX_URL + 1) as u16).to_be_bytes());
@@ -628,6 +642,9 @@ mod tests {
 
     #[test]
     fn unknown_op_byte_is_rejected() {
+        // 7 is the retired clock-less OPEN_URL: an old Mac talking to this
+        // receiver must get the loud unknown-op refusal, not a reinterpreted
+        // frame.
         for b in [0u8, 7, 200, 255] {
             assert!(read_request(&mut &[b][..]).is_err(), "op {} accepted", b);
         }

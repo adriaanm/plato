@@ -486,15 +486,15 @@ fn main() -> Result<(), Error> {
                         tx.send(Event::Notify(format!("Can't find {}.", path.display()))).ok();
                     }
                 },
-                Event::OpenUrl(ref url) => {
+                Event::OpenUrl { ref url, stamp } => {
                     // The FIFO's `open-url`: same arrival contract as a pushed
-                    // document -- it interrupts and opens -- but nothing landed
-                    // on disk, so there is no import. See app.rs.
+                    // document -- it interrupts and opens -- and the stamp asks
+                    // the News view to keep the article. See app.rs.
                     if view.is::<News>() {
                         view.handle_event(&evt, &tx, &mut bus, &mut rq, &mut context);
                     } else {
                         view.children_mut().retain(|child| !child.is::<Menu>());
-                        let news = News::new_at_article(context.fb.rect(), url.clone(),
+                        let news = News::new_at_article(context.fb.rect(), url.clone(), stamp,
                                                         Arc::new(NetClient::new()),
                                                         Arc::new(plato_article::client::Readability),
                                                         &tx, &mut rq, &mut context);
@@ -503,6 +503,15 @@ fn main() -> Result<(), Error> {
                         history.push(view as Box<dyn View>);
                         view = next_view;
                     }
+                },
+                Event::ArticleSaved(ref path) => {
+                    // The pushed article landed in `inbox/`. See app.rs.
+                    context.library.reload();
+                    context.batch_import();
+                    view.handle_event(&Event::Reseed, &tx, &mut bus, &mut rq, &mut context);
+                    let name = path.file_name().map(|name| name.to_string_lossy().into_owned())
+                                   .unwrap_or_default();
+                    tx.send(Event::Notify(format!("Kept in inbox as {}.", name))).ok();
                 },
                 Event::OpenHtml(ref html, ref link_uri) => {
                     view.children_mut().retain(|child| !child.is::<Menu>());

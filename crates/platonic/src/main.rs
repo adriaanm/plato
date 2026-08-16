@@ -50,8 +50,8 @@ usage: platonic [FILE ... | URL] [--to NAME] [--quiet] [--title T] [--open FILE]
 push a document to the Kindle and start reading it (docs/platonic.md)
 
   FILE          documents to push ('-' reads stdin)
-  URL           an http(s) link: nothing is pushed — the reader fetches it
-                and opens it in its article view
+  URL           an http(s) link: nothing is pushed — the reader fetches it,
+                opens it in its article view, and keeps a copy in inbox
   --to NAME     destination folder under documents/ (default: inbox, which
                 expires; named folders do not)
   --quiet       deliver and refresh the library, don't open
@@ -548,9 +548,12 @@ fn cmd_push(ctx: &Ctx, args: &Args, now: f64) {
 }
 
 /// `platonic <url>`: no bytes move.  The reader's News view fetches the page,
-/// readability-extracts it and lays it out itself, so the Mac's whole job is
-/// one validated OPEN_URL over whichever transport the probe chose.
-fn cmd_open_url(ctx: &Ctx, args: &Args, url: &str) {
+/// readability-extracts it, lays it out and files it into `inbox/` for
+/// offline reading, so the Mac's whole job is one validated OPEN_URL over
+/// whichever transport the probe chose.  The Mac's clock rides along to
+/// become the saved article's mtime -- inbox lifetimes are judged against
+/// it, never against the device's clock.
+fn cmd_open_url(ctx: &Ctx, args: &Args, url: &str, now: f64) {
     // The prefix already read as a URL; this checks the rest (length, control
     // characters) before any network is touched, with the same rules the
     // device will re-check it against.
@@ -564,7 +567,7 @@ fn cmd_open_url(ctx: &Ctx, args: &Args, url: &str) {
         Ok(link) => link,
         Err(e) => die(e),
     };
-    match link.open_url(url) {
+    match link.open_url(url, now as i64) {
         Ok(()) => println!("sent {} — the reader is opening it", url),
         Err(e) => {
             link.finish();
@@ -656,7 +659,7 @@ fn main() {
                     arg_error("--to/--title/--open/--quiet describe pushed \
                                documents; a URL pushes nothing");
                 }
-                cmd_open_url(&ctx, &args, url);
+                cmd_open_url(&ctx, &args, url, now);
             }
             _ => arg_error("one URL at a time: the reader shows one article"),
         }

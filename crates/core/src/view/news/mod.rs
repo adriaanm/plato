@@ -87,6 +87,11 @@ pub struct News {
     blurb_chars: usize,
     /// A route waiting for the radio, resumed on `NetUp`. See [`News::load`].
     pending: Option<Route>,
+    /// A pushed article to file into `inbox/` once it loads: the URL it was
+    /// pushed as, and the Mac's clock to stamp the file with. Set only from
+    /// `Event::OpenUrl` -- an article *tapped* into being is browsing, and
+    /// browsing must not silt up the inbox.
+    keep: Option<(String, i64)>,
 }
 
 /// One step of Back: everything needed to re-show the page that was left
@@ -120,19 +125,21 @@ impl News {
     }
 
     /// A pushed link's entry point (`Event::OpenUrl`): open straight at the
-    /// article, with an EMPTY internal history.  A link sent from the Mac was
+    /// article, with an EMPTY internal history. `stamp` is the Mac's clock
+    /// when the push carried one, and marks the article to be kept (see
+    /// [`News::keep`]).  A link sent from the Mac was
     /// never reached through a front page, so faking one behind it would give
     /// Back a destination the user has not been to; instead the first Back
     /// falls through `go_back` to `Event::Back` and leaves the News view for
     /// wherever the user was.
-    pub fn new_at_article(rect: Rectangle, url: String, http: Arc<dyn HttpClient>,
-                          extractor: Arc<dyn ArticleExtractor>,
+    pub fn new_at_article(rect: Rectangle, url: String, stamp: Option<i64>,
+                          http: Arc<dyn HttpClient>, extractor: Arc<dyn ArticleExtractor>,
                           hub: &Hub, rq: &mut RenderQueue, context: &mut Context) -> News {
-        News::build(rect, http, extractor, Some(url), hub, rq, context)
+        News::build(rect, http, extractor, Some((url, stamp)), hub, rq, context)
     }
 
     fn build(rect: Rectangle, http: Arc<dyn HttpClient>, extractor: Arc<dyn ArticleExtractor>,
-             article_url: Option<String>, hub: &Hub, rq: &mut RenderQueue,
+             article: Option<(String, Option<i64>)>, hub: &Hub, rq: &mut RenderQueue,
              context: &mut Context) -> News {
         let id = ID_FEEDER.next();
         let mut children = Vec::new();
@@ -148,9 +155,10 @@ impl News {
         // Starting at an article means starting ON the hidden source; its
         // "Article" title holds the bars until `NewsLoaded` brings the real
         // one, the same hand-off a tapped link gets.
-        let (current, route) = match article_url {
-            Some(url) => (sources.len() - 1, Route::Thread(url)),
-            None => (0, Route::Index),
+        let (current, route, keep) = match article {
+            Some((url, stamp)) => (sources.len() - 1, Route::Thread(url.clone()),
+                                   stamp.map(|stamp| (url, stamp))),
+            None => (0, Route::Index, None),
         };
         let name = sources[current].title().to_string();
 
@@ -205,6 +213,7 @@ impl News {
             history: Vec::new(),
             blurb_chars: context.settings.news.blurb_chars,
             pending: None,
+            keep,
             http,
             extractor,
         };
@@ -418,7 +427,7 @@ impl News {
             Some(uri) => match news::parse_route_uri(&uri) {
                 Some((_, route)) => self.go_to_route(route, hub, rq, context),
                 None if uri.starts_with("http://") || uri.starts_with("https://") =>
-                    self.open_article(uri, hub, rq, context),
+                    self.open_article(uri, None, hub, rq, context),
                 None => self.queue_external(&uri, hub, rq, context),
             },
             None => {
@@ -441,8 +450,13 @@ impl News {
 
     /// An http(s) link opens as an article, right here: the hidden article
     /// source takes the URL as its route, and Back returns to the page the
-    /// link was on, like any other step into `history`.
-    fn open_article(&mut self, url: String, hub: &Hub, rq: &mut RenderQueue, context: &mut Context) {
+    /// link was on, like any other step into `history`. Only a *pushed* link
+    /// carries a stamp; it marks the article to be kept in `inbox/` once
+    /// loaded, and navigating on to anything else withdraws the mark -- what
+    /// would be saved then is no longer what was pushed.
+    fn open_article(&mut self, url: String, stamp: Option<i64>,
+                    hub: &Hub, rq: &mut RenderQueue, context: &mut Context) {
+        self.keep = stamp.map(|stamp| (url.clone(), stamp));
         let Some(index) = self.sources.iter().position(|s| s.id() == article::ID) else {
             return self.queue_external(&url, hub, rq, context);
         };
@@ -662,6 +676,21 @@ impl View for News {
                 };
                 self.set_title(&title, rq);
                 self.show(&page.body, page.images.clone(), rq);
+                // A pushed article, now fully fetched: file it in `inbox/`
+                // under the Mac's clock, exactly once -- `take` also covers a
+                // re-push of the same URL while it is on screen.
+                if let Route::Thread(ref url) = *route {
+                    if self.keep.as_ref().is_some_and(|(kept, _)| kept == url) {
+                        let (_, stamp) = self.keep.take().unwrap();
+                        match news::save::save(page, url, stamp, &context.library.home) {
+                            Ok(path) => { hub.send(Event::ArticleSaved(path)).ok(); },
+                            Err(e) => {
+                                hub.send(Event::Notify(
+                                    format!("Couldn't keep the article: {e:#}"))).ok();
+                            },
+                        }
+                    }
+                }
                 true
             },
             // The radio answered. `load` deferred a route rather than spend the
@@ -764,8 +793,8 @@ impl View for News {
             // A link pushed from the Mac while News is already up: take it in
             // place, exactly as if the article had been tapped on the page
             // being read -- one step into `history`, so Back returns there.
-            Event::OpenUrl(ref url) => {
-                self.open_article(url.clone(), hub, rq, context);
+            Event::OpenUrl { ref url, stamp } => {
+                self.open_article(url.clone(), stamp, hub, rq, context);
                 true
             },
             Event::Select(EntryId::SetNewsSource(ref id)) => {
