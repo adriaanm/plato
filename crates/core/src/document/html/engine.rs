@@ -9,6 +9,7 @@ use percent_encoding::percent_decode_str;
 use septem::Roman;
 use crate::helpers::{Normalize, decode_entities};
 use crate::framebuffer::{Framebuffer, Pixmap};
+use crate::framebuffer::dither::dither_g16_stucki;
 use crate::font::{FontOpener, FontFamily};
 use crate::document::{Document, Location};
 use crate::document::pdf::PdfOpener;
@@ -62,6 +63,10 @@ pub struct Engine {
     pub dims: (u32, u32),
     // Device DPI.
     pub dpi: u16,
+    // Error-diffuse images to the panel's sixteen grays at draw time. Off by
+    // default: an EPUB's look predates this and stays under the reader's own
+    // dither toggle; the news view opts its articles in.
+    pub dither_images: bool,
 }
 
 impl Engine {
@@ -79,6 +84,7 @@ impl Engine {
             line_height,
             dims: (DEFAULT_WIDTH, DEFAULT_HEIGHT),
             dpi: DEFAULT_DPI,
+            dither_images: false,
         }
     }
 
@@ -1690,11 +1696,21 @@ impl Engine {
                 },
                 DrawCommand::Image(ImageCommand { position, path, scale, .. }) => {
                     if let Ok(buf) = resource_fetcher.fetch(path) {
-                        if let Some((pixmap, _)) = PdfOpener::new().and_then(|opener| {
+                        if let Some((mut pixmap, _)) = PdfOpener::new().and_then(|opener| {
                             opener.open_memory(path, &buf)
                         }).and_then(|mut doc| {
                             doc.pixmap(Location::Exact(0), scale_factor * *scale, samples)
                         }) {
+                            // Here and not earlier: dithering has to happen at
+                            // final scale, or the resampling would average the
+                            // pattern back into the very gray it encoded.
+                            // Stucki, because the A/B (examples/dither_ab.rs)
+                            // showed Floyd–Steinberg's dots aligning into
+                            // faint columns on smooth ramps, at essentially
+                            // the same cost.
+                            if self.dither_images && samples == 1 {
+                                dither_g16_stucki(&mut pixmap);
+                            }
                             let position = Point::from(scale_factor * Vec2::from(*position));
                             fb.draw_pixmap(&pixmap, position);
                         }

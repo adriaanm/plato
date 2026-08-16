@@ -5,6 +5,7 @@ mod kindle_mxcfb_sys;
 mod sunxi_sys;
 mod image;
 mod transform;
+pub mod dither;
 mod kobo1;
 mod kobo2;
 mod kindle;
