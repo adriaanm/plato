@@ -1520,6 +1520,7 @@ name = "plato-article"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dom_query",
  "dom_smoothie",
  "encoding_rs",
  "plato-core",

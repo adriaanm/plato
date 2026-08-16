@@ -20,6 +20,8 @@
 //! Pure function of bytes: no network, no I/O, so every test here runs on
 //! hand-written fixtures.
 
+mod flatten;
+
 use std::borrow::Cow;
 
 use anyhow::{bail, format_err, Error};
@@ -42,6 +44,12 @@ pub struct Extracted {
 /// after the page is long gone from context.
 pub fn extract(raw: &[u8], url: &str) -> Result<Extracted, Error> {
     let html = decode(raw);
+    // Grid scaffolding hides parts of an article from readability's
+    // sibling-joining (see `flatten`); take it down before scoring.
+    let html = match flatten::flatten_grid(html.as_ref()) {
+        Some(flat) => Cow::Owned(flat),
+        None => html,
+    };
 
     let mut readability = Readability::new(html.as_ref(), Some(url), Some(Config::default()))
         .map_err(|e| format_err!("{url}: {e}"))?;
@@ -249,6 +257,64 @@ mod tests {
         bytes.extend_from_slice(page.as_bytes());
         let article = extract(&bytes, "https://example.com/bom").unwrap();
         assert!(article.html.contains("caf\u{e9} fox"));
+    }
+
+    /// The saltfatacidheat.com ragù page, reduced to its skeleton: an
+    /// ingredient list of short lines in one text block, and the long-prose
+    /// instructions in another -- but the instructions sit one level deeper,
+    /// sharing a grid row with an image column. Without the grid flattening,
+    /// readability picks the instructions as its top candidate and looks for
+    /// the rest of the article among their *siblings*; the ingredient block,
+    /// an aunt in the grid, never gets visited, and the recipe comes out with
+    /// no ingredients (verified against the live page, 2026-08-16).
+    #[test]
+    fn a_grid_layout_does_not_hide_part_of_the_article() {
+        let step = "Set a large pot over high heat and add enough olive oil \
+                    to coat the bottom, then crumble the beef into the pot in \
+                    walnut-size pieces, stirring and breaking up the meat \
+                    until it sizzles, browns and smells like dinner.";
+        let ingredients: String = [
+            "Approximately 1 cup (200 grams) extra-virgin olive oil",
+            "1 pound (450 grams) coarsely ground beef chuck",
+            "1 pound (450 grams) coarsely ground pork shoulder",
+            "2 medium yellow onions, minced", "1 large carrot, minced",
+            "2 large celery stalks, minced", "2 cups (450 grams) whole milk",
+            "2 bay leaves", "5 tablespoons (80 grams) tomato paste",
+            "Parmesan rind", "Salt", "Freshly ground black pepper",
+        ].map(|line| format!("<p>{line}</p>")).concat();
+        let page = format!(r#"<!DOCTYPE html>
+<html><head><title>Benedetta's Ragú - Example Kitchen</title></head>
+<body>
+<nav><a href="/">Home</a> <a href="/recipes">Recipes</a></nav>
+<div class="layout grid-12 columns-12">
+  <div class="row">
+    <div class="col-12">
+      <div class="block html-block">
+        <div class="block-content"><div class="html-content">{ingredients}</div></div>
+      </div>
+      <div class="row">
+        <div class="col-8">
+          <div class="block html-block">
+            <div class="block-content"><div class="html-content">
+              <p>{step}</p><p>{step}</p><p>{step}</p><p>{step}</p><p>{step}</p>
+            </div></div>
+          </div>
+        </div>
+        <div class="col-4"><div class="block image-block"></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+<footer>Copyright 2026. Subscribe to the newsletter.</footer>
+</body></html>"#);
+        let article = extract(page.as_bytes(), "https://example.com/ragu").unwrap();
+        assert!(article.html.contains("walnut-size pieces"),
+                "instructions lost: {}", article.html);
+        assert!(article.html.contains("extra-virgin olive oil"),
+                "ingredients lost: {}", article.html);
+        assert!(article.html.contains("Freshly ground black pepper"),
+                "ingredient tail lost: {}", article.html);
+        assert!(!article.html.contains("newsletter"), "footer survived: {}", article.html);
     }
 
     #[test]
