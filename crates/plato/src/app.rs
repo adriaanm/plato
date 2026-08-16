@@ -211,7 +211,6 @@ fn resume(id: TaskId, tasks: &mut Vec<Task>, view: &mut dyn View, hub: &Sender<E
             // On a thread: a wake that freezes for the whole association is a
             // wake the user reads as a crash.
             context.wifi_busy = spawn_wifi(true, hub);
-            hub.send(Event::WifiTick).ok();
         }
     }
     if id == TaskId::Suspend || id == TaskId::PrepareSuspend {
@@ -223,6 +222,12 @@ fn resume(id: TaskId, tasks: &mut Vec<Task>, view: &mut dyn View, hub: &Sender<E
         }
         hub.send(Event::ClockTick).ok();
         hub.send(Event::BatteryTick).ok();
+        // Unconditionally, like the clock and the battery -- not just when the
+        // radio is coming back up. Suspend turned WiFi off *after* the fan last
+        // painted, so the expose above would otherwise re-show the pre-sleep
+        // state: a full fan over a radio that is in fact off, until some
+        // unrelated event happened to reseed the bar.
+        hub.send(Event::WifiTick).ok();
     }
 }
 
@@ -1069,6 +1074,33 @@ pub fn run() -> Result<(), Error> {
                     tx.send(Event::Open(Box::new(info))).ok();
                 } else {
                     tx.send(Event::Notify(format!("Can't find {}.", path.display()))).ok();
+                }
+            },
+            Event::OpenUrl(ref url) => {
+                // The FIFO's `open-url`: a link pushed from the Mac. Same
+                // arrival contract as a pushed document -- it interrupts and
+                // opens -- but nothing landed on disk, so there is no import.
+                // An open News view takes it in place (one step into its own
+                // history); any other view goes onto the app history under a
+                // News opened straight at the article, so the first Back
+                // returns exactly here -- book, home, wherever.
+                if view.is::<News>() {
+                    view.handle_event(&evt, &tx, &mut bus, &mut rq, &mut context);
+                } else {
+                    view.children_mut().retain(|child| !child.is::<Menu>());
+                    let news = News::new_at_article(context.fb.rect(), url.clone(),
+                                                    Arc::new(NetClient::new()),
+                                                    Arc::new(plato_article::client::Readability),
+                                                    &tx, &mut rq, &mut context);
+                    let mut next_view = Box::new(news) as Box<dyn View>;
+                    transfer_notifications(view.as_mut(), next_view.as_mut(), &mut rq, &mut context);
+                    history.push(HistoryItem {
+                        view,
+                        rotation: context.display.rotation,
+                        monochrome: context.fb.monochrome(),
+                        dithered: context.fb.dithered(),
+                    });
+                    view = next_view;
                 }
             },
             Event::Select(EntryId::About) => {
