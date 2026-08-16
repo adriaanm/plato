@@ -121,6 +121,7 @@ impl<R: Read, W: Write> Session<R, W> {
             Request::List => self.list(),
             Request::Sweep { cutoff } => self.sweep(cutoff),
             Request::Quit => Response::Done,
+            Request::OpenUrl { url } => self.open_url(&url),
         }
     }
 
@@ -282,6 +283,18 @@ impl<R: Read, W: Write> Session<R, W> {
         }
         let line = format!("open {}", path.display());
         self.fifo_line(&line)
+    }
+
+    /// The Mac names a URL; the reader's News view fetches and extracts it.
+    /// Nothing lands on disk here -- the whole op is one FIFO line -- but the
+    /// validation still runs on the DEVICE, because the line is written by a
+    /// root program and a newline in it would be a second command.
+    fn open_url(&mut self, url: &str) -> Response {
+        if let Err(e) = validate_url(url) {
+            return refuse(Status::Invalid, format!("{} {}", e, quote_for_log(url)));
+        }
+        log(&format!("OPEN_URL {}", quote_for_log(url)));
+        self.fifo_line(&format!("open-url {}", url))
     }
 
     /// One line into Plato's command FIFO.  The FIFO is created by `plato.sh`;
@@ -670,6 +683,32 @@ mod tests {
             assert!(matches!(r, Response::Err { status: Status::NotFound, .. }),
                     "{:?}", r);
         }
+    }
+
+    #[test]
+    fn a_hostile_url_is_refused_before_the_fifo_is_touched() {
+        // The FIFO stage answers NotFound in this config; Invalid therefore
+        // proves the refusal happened at validation, not at the pipe.
+        let scratch = Scratch::new("badurl");
+        for bad in ["file:///etc/passwd", "javascript:alert(1)",
+                    "https://example.com/a\nimport", "not a url"] {
+            let resp = converse(scratch.cfg(), vec![
+                (Request::OpenUrl { url: bad.into() }, Vec::new())]);
+            assert!(matches!(resp[0], Response::Err { status: Status::Invalid, .. }),
+                    "{:?} was not refused: {:?}", bad, resp[0]);
+        }
+    }
+
+    #[test]
+    fn open_url_reports_a_missing_listener_rather_than_hanging() {
+        // Same contract as OPEN and IMPORT: a URL sent while Plato is not
+        // reading the FIFO must come back as an answer, not a block.
+        let scratch = Scratch::new("url-no-fifo");
+        let resp = converse(scratch.cfg(), vec![
+            (Request::OpenUrl { url: "https://example.com/essay".into() },
+             Vec::new())]);
+        assert!(matches!(resp[0], Response::Err { status: Status::NotFound, .. }),
+                "{:?}", resp[0]);
     }
 
     #[test]

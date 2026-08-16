@@ -305,6 +305,13 @@ pub enum Event {
     // which is Home's menu entry.
     ImportLibrary,
     OpenByPath(PathBuf),
+    /// Also from the FIFO (`open-url`), pushed by `platonic URL` on the Mac:
+    /// show this web page in the News view's article reader.  The app loop
+    /// answers it -- an open News view takes it in place, any other view is
+    /// pushed onto history under a News opened straight at the article, so
+    /// Back leaves to wherever the user was rather than to a front page
+    /// nobody visited.
+    OpenUrl(String),
     // Also from the FIFO, but poked by the device's own WiFi scripts rather
     // than from the Mac: the radio came up / is about to go down. They carry
     // the mDNS responder's lifecycle.

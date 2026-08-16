@@ -37,6 +37,10 @@ pub trait Link {
     fn put(&mut self, folder: &str, name: &str, data: &[u8], mtime: i64)
            -> Result<u64, String>;
     fn open(&mut self, folder: &str, name: &str) -> Result<(), String>;
+    /// Open a web URL in the reader's article view.  Unlike `open` there is
+    /// no document behind it: the reader fetches and readability-extracts the
+    /// page itself, so the only thing that travels is the URL.
+    fn open_url(&mut self, url: &str) -> Result<(), String>;
     fn import(&mut self) -> Result<(), String>;
     fn list(&mut self) -> Result<Vec<Entry>, String>;
     /// Names deleted from `inbox/`.
@@ -197,6 +201,15 @@ impl Link for RecvLink {
         }, None).map(|_| ())
     }
 
+    fn open_url(&mut self, url: &str) -> Result<(), String> {
+        // Validated here too, like PUT's names: politeness, not the check --
+        // the check that counts runs on the device.  An OLD receiver answers
+        // this op with Unsupported and `describe` names the redeploy, so the
+        // failure is one visible line, never a hang.
+        proto::validate_url(url)?;
+        self.call(Request::OpenUrl { url: url.to_string() }, None).map(|_| ())
+    }
+
     fn import(&mut self) -> Result<(), String> {
         self.call(Request::Import, None).map(|_| ())
     }
@@ -281,6 +294,14 @@ impl<'a> Link for ShellLink<'a> {
         self.poke(&format!("open {}/{}/{}", DOCROOT, folder, name))
     }
 
+    /// The FIFO write proves a listener exists, not that it knows the verb: a
+    /// Plato from before `open-url` logs "Unknown command" on the device and
+    /// nothing opens.  The receiver path does not have this blind spot, which
+    /// is one more reason it is the preferred transport.
+    fn open_url(&mut self, url: &str) -> Result<(), String> {
+        self.poke(&format!("open-url {}", url))
+    }
+
     fn import(&mut self) -> Result<(), String> {
         self.poke("import")
     }
@@ -328,6 +349,10 @@ impl Link for DryLink {
     }
     fn open(&mut self, folder: &str, name: &str) -> Result<(), String> {
         self.echo(format!("OPEN {}/{}", folder, name));
+        Ok(())
+    }
+    fn open_url(&mut self, url: &str) -> Result<(), String> {
+        self.echo(format!("OPEN_URL {}", url));
         Ok(())
     }
     fn import(&mut self) -> Result<(), String> {

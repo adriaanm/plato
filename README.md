@@ -37,8 +37,11 @@
 > nothing to install … only packages with binaries can be installed"*, because
 > the root package has no binary.
 >
-> Then `platonic FILE` pushes a document to the reader and opens it, and
-> `platonic --pair --code …` pairs a new Mac using the code the reader shows.
+> Then `platonic FILE` pushes a document to the reader and opens it,
+> `platonic https://…` sends a link the reader opens in its built-in article
+> view (fetched and readability-extracted on the device — nothing is pushed),
+> and `platonic --pair --code …` pairs a new Mac using the code the reader
+> shows.
 >
 > ### The sibling repo
 >

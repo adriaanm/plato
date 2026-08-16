@@ -2,9 +2,10 @@
 //! reading a FIFO and maps each line to an event, the same shape as the input
 //! threads.
 //!
-//! Four verbs. `import` re-scans the library and `open <path>` re-scans and
-//! then opens the document exactly as a tap on its row would -- both driven by
-//! `platonic` from the Mac.
+//! Five verbs. `import` re-scans the library, `open <path>` re-scans and
+//! then opens the document exactly as a tap on its row would, and
+//! `open-url <url>` opens a web page in the News view's article reader --
+//! all three driven by `platonic` from the Mac.
 //!
 //! `wifi-up [ADDR]` and `wifi-down` are driven by the DEVICE's own WiFi
 //! scripts, and exist because the scripts are the chokepoint: every path that
@@ -33,6 +34,10 @@ pub const DEFAULT_FIFO_PATH: &str = "/tmp/plato.cmd";
 pub enum Command {
     Import,
     Open(PathBuf),
+    /// `open-url <url>`: show a web page in the News view's article reader.
+    /// Driven by `platonic URL` from the Mac; nothing was pushed, so there is
+    /// no path and no import -- the reader fetches the page itself.
+    OpenUrl(String),
     /// The radio came up (or reassociated, or changed address).
     WifiUp(Option<String>),
     /// The radio is about to go down. Sent BEFORE the teardown, so the
@@ -57,6 +62,15 @@ pub fn parse_command(line: &str) -> Option<Command> {
         let rest = rest.trim();
         if !rest.is_empty() {
             return Some(Command::Open(PathBuf::from(rest)));
+        }
+    }
+    // Before `open`? No -- `open-url ` and `open ` cannot shadow each other,
+    // the space after the verb keeps them distinct.  The rest of the line is
+    // the URL verbatim, same rule as `open`'s path.
+    if let Some(rest) = line.strip_prefix("open-url ") {
+        let rest = rest.trim();
+        if !rest.is_empty() {
+            return Some(Command::OpenUrl(rest.to_string()));
         }
     }
     if line == "wifi-down" {
@@ -114,6 +128,7 @@ pub fn spawn_fifo_listener(path: PathBuf, tx: Sender<Event>) {
             match parse_command(&line) {
                 Some(Command::Import) => { tx.send(Event::ImportLibrary).ok(); },
                 Some(Command::Open(path)) => { tx.send(Event::OpenByPath(path)).ok(); },
+                Some(Command::OpenUrl(url)) => { tx.send(Event::OpenUrl(url)).ok(); },
                 Some(Command::WifiUp(addr)) => { tx.send(Event::WifiUp(addr)).ok(); },
                 Some(Command::WifiDown) => { tx.send(Event::WifiDown).ok(); },
                 None => {
@@ -146,6 +161,25 @@ mod tests {
     fn parse_open_relative() {
         assert_eq!(parse_command("open inbox/foo.md\n"),
                    Some(Command::Open(PathBuf::from("inbox/foo.md"))));
+    }
+
+    #[test]
+    fn parse_open_url() {
+        assert_eq!(parse_command("open-url https://example.com/essay?a=1&b=2\n"),
+                   Some(Command::OpenUrl("https://example.com/essay?a=1&b=2".to_string())));
+        // A bare verb points at nothing, same as a bare `open`.
+        assert_eq!(parse_command("open-url"), None);
+        assert_eq!(parse_command("open-url   "), None);
+    }
+
+    #[test]
+    fn open_and_open_url_do_not_shadow_each_other() {
+        // A path that merely mentions a scheme is still a path, and a URL is
+        // never mistaken for a document named `-url ...`.
+        assert_eq!(parse_command("open /mnt/us/documents/https-notes.md"),
+                   Some(Command::Open(PathBuf::from("/mnt/us/documents/https-notes.md"))));
+        assert_eq!(parse_command("open-url https://a.b/c"),
+                   Some(Command::OpenUrl("https://a.b/c".to_string())));
     }
 
     #[test]

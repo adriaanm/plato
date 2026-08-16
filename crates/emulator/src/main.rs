@@ -486,6 +486,24 @@ fn main() -> Result<(), Error> {
                         tx.send(Event::Notify(format!("Can't find {}.", path.display()))).ok();
                     }
                 },
+                Event::OpenUrl(ref url) => {
+                    // The FIFO's `open-url`: same arrival contract as a pushed
+                    // document -- it interrupts and opens -- but nothing landed
+                    // on disk, so there is no import. See app.rs.
+                    if view.is::<News>() {
+                        view.handle_event(&evt, &tx, &mut bus, &mut rq, &mut context);
+                    } else {
+                        view.children_mut().retain(|child| !child.is::<Menu>());
+                        let news = News::new_at_article(context.fb.rect(), url.clone(),
+                                                        Arc::new(NetClient::new()),
+                                                        Arc::new(plato_article::client::Readability),
+                                                        &tx, &mut rq, &mut context);
+                        let mut next_view = Box::new(news) as Box<dyn View>;
+                        transfer_notifications(view.as_mut(), next_view.as_mut(), &mut rq, &mut context);
+                        history.push(view as Box<dyn View>);
+                        view = next_view;
+                    }
+                },
                 Event::OpenHtml(ref html, ref link_uri) => {
                     view.children_mut().retain(|child| !child.is::<Menu>());
                     let r = Reader::from_html(context.fb.rect(), html, link_uri.as_deref(), &tx, &mut context);

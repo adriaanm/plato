@@ -71,6 +71,10 @@ pub const SWEEP_FOLDER: &str = "inbox";
 pub const MAX_COMPONENT: usize = 128;
 pub const MAX_PUT: u32 = 64 * 1024 * 1024;
 pub const MAX_MESSAGE: usize = 512;
+/// A URL for OPEN_URL.  2 KiB is the customary practical ceiling for a URL a
+/// person shares; anything longer is more likely an attack on the FIFO line
+/// than a link somebody wants to read.
+pub const MAX_URL: usize = 2048;
 /// A name the receiver *reports* (LIST, SWEEP), which is not a name it was
 /// asked to accept: files already on the library can be longer than
 /// [`MAX_COMPONENT`] and need not be ASCII, and dropping them from a listing
@@ -86,6 +90,14 @@ pub enum Op {
     List = 4,
     Sweep = 5,
     Quit = 6,
+    /// "Open this URL in the reader's article view."  Added after 1..=6
+    /// shipped; there is no version negotiation to bump, because the existing
+    /// compat story already covers it: a receiver that predates this op reads
+    /// an unknown op byte, answers [`Status::Unsupported`] ("protocol error:
+    /// unknown op byte 7") and ends the session -- the Mac reads that refusal
+    /// as a response, so the failure is one visible line naming the redeploy,
+    /// never a hang.
+    OpenUrl = 7,
 }
 
 impl Op {
@@ -97,6 +109,7 @@ impl Op {
             4 => Some(Op::List),
             5 => Some(Op::Sweep),
             6 => Some(Op::Quit),
+            7 => Some(Op::OpenUrl),
             _ => None,
         }
     }
@@ -147,6 +160,10 @@ pub enum Request {
     /// the Mac's clock.
     Sweep { cutoff: i64 },
     Quit,
+    /// Open a web URL in the reader's article view.  Nothing lands on disk:
+    /// the receiver's whole job here is one validated `open-url` line into
+    /// Plato's FIFO, the same seam PUT's open already uses.
+    OpenUrl { url: String },
 }
 
 impl Request {
@@ -158,6 +175,7 @@ impl Request {
             Request::List => Op::List,
             Request::Sweep { .. } => Op::Sweep,
             Request::Quit => Op::Quit,
+            Request::OpenUrl { .. } => Op::OpenUrl,
         }
     }
 }
@@ -231,6 +249,34 @@ pub fn validate_component(what: &str, value: &str) -> Result<(), String> {
         }
         if !allowed(c) {
             return Err(format!("{}: character {:?} is not allowed", what, c));
+        }
+    }
+    Ok(())
+}
+
+/// A URL fit to travel one line of Plato's FIFO and, from there, one HTTPS
+/// request.  The rules, and what each one stops:
+///
+/// * non-empty, and at most [`MAX_URL`] bytes
+/// * must begin with `http://` or `https://` -- the reader's article source
+///   makes the same check (`news/article.rs`), so `file:`, `javascript:` and
+///   every other scheme is refused before it crosses the wire, not after
+/// * no whitespace and no control character -- a newline would smuggle a
+///   second command into the FIFO line, and a space would at best be a URL
+///   somebody forgot to percent-encode
+pub fn validate_url(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("url: empty".to_string());
+    }
+    if value.len() > MAX_URL {
+        return Err(format!("url: longer than {} bytes", MAX_URL));
+    }
+    if !value.starts_with("http://") && !value.starts_with("https://") {
+        return Err("url: must start with http:// or https://".to_string());
+    }
+    for c in value.chars() {
+        if c.is_whitespace() || (c as u32) < 0x20 || c as u32 == 0x7F {
+            return Err("url: whitespace or control character".to_string());
         }
     }
     Ok(())
@@ -354,6 +400,7 @@ pub fn write_request(w: &mut impl Write, req: &Request) -> io::Result<()> {
             write_str(w, MAX_COMPONENT, filename)?;
         }
         Request::Sweep { cutoff } => write_i64(w, *cutoff)?,
+        Request::OpenUrl { url } => write_str(w, MAX_URL, url)?,
         Request::Import | Request::List | Request::Quit => {}
     }
     Ok(())
@@ -395,6 +442,7 @@ pub fn read_request(r: &mut impl Read) -> io::Result<Option<Request>> {
         Op::List => Request::List,
         Op::Sweep => Request::Sweep { cutoff: read_i64(r)? },
         Op::Quit => Request::Quit,
+        Op::OpenUrl => Request::OpenUrl { url: read_str(r, MAX_URL)? },
     };
     Ok(Some(req))
 }
@@ -449,7 +497,7 @@ pub fn read_response(r: &mut impl Read, op: Op) -> io::Result<Response> {
     }
     let resp = match op {
         Op::Put => Response::Put { written: read_u64(r)? },
-        Op::Open | Op::Import | Op::Quit => Response::Done,
+        Op::Open | Op::Import | Op::Quit | Op::OpenUrl => Response::Done,
         Op::List => {
             let n = read_u32(r)?;
             if n > MAX_ENTRIES {
@@ -516,6 +564,23 @@ mod tests {
         roundtrip(Request::List);
         roundtrip(Request::Sweep { cutoff: -1 });
         roundtrip(Request::Quit);
+        roundtrip(Request::OpenUrl {
+            url: "https://example.com/essay?a=1&b=2#top".into(),
+        });
+    }
+
+    #[test]
+    fn an_oversized_url_is_refused_at_both_ends() {
+        // At encode time, so a client bug cannot emit a frame the receiver
+        // would refuse mid-stream...
+        let long = format!("https://example.com/{}", "a".repeat(MAX_URL));
+        let mut buf = Vec::new();
+        assert!(write_request(&mut buf, &Request::OpenUrl { url: long }).is_err());
+        // ...and at decode time, before any allocation follows the header.
+        let mut buf = vec![Op::OpenUrl as u8];
+        buf.extend_from_slice(&((MAX_URL + 1) as u16).to_be_bytes());
+        buf.extend_from_slice(&vec![b'a'; MAX_URL + 1]);
+        assert!(read_request(&mut &buf[..]).is_err());
     }
 
     #[test]
@@ -633,6 +698,24 @@ mod tests {
         assert!(validate_component("filename", &"a".repeat(MAX_COMPONENT + 1))
                 .is_err());
         validate_component("filename", &"a".repeat(MAX_COMPONENT)).unwrap();
+    }
+
+    #[test]
+    fn only_web_urls_pass_validation() {
+        for good in ["https://example.com", "http://example.com/a?b=c&d=e#f",
+                     "https://example.com/percent%20encoded"] {
+            validate_url(good).unwrap();
+        }
+        for bad in [
+            "", "example.com", "ftp://example.com", "file:///etc/passwd",
+            "javascript:alert(1)", "https://example.com/a b",
+            "https://example.com/a\nopen-url https://evil",
+            "https://example.com/a\tb", "https://example.com/\x07",
+        ] {
+            assert!(validate_url(bad).is_err(), "{:?} should be refused", bad);
+        }
+        assert!(validate_url(&format!("https://e.com/{}", "a".repeat(MAX_URL)))
+                .is_err());
     }
 
     #[test]

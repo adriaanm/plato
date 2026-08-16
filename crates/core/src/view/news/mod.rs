@@ -113,8 +113,27 @@ fn sources(settings: &NewsSettings) -> Vec<Box<dyn Source>> {
 }
 
 impl News {
+    /// The menu's entry point: open at the first source's front page.
     pub fn new(rect: Rectangle, http: Arc<dyn HttpClient>, extractor: Arc<dyn ArticleExtractor>,
                hub: &Hub, rq: &mut RenderQueue, context: &mut Context) -> News {
+        News::build(rect, http, extractor, None, hub, rq, context)
+    }
+
+    /// A pushed link's entry point (`Event::OpenUrl`): open straight at the
+    /// article, with an EMPTY internal history.  A link sent from the Mac was
+    /// never reached through a front page, so faking one behind it would give
+    /// Back a destination the user has not been to; instead the first Back
+    /// falls through `go_back` to `Event::Back` and leaves the News view for
+    /// wherever the user was.
+    pub fn new_at_article(rect: Rectangle, url: String, http: Arc<dyn HttpClient>,
+                          extractor: Arc<dyn ArticleExtractor>,
+                          hub: &Hub, rq: &mut RenderQueue, context: &mut Context) -> News {
+        News::build(rect, http, extractor, Some(url), hub, rq, context)
+    }
+
+    fn build(rect: Rectangle, http: Arc<dyn HttpClient>, extractor: Arc<dyn ArticleExtractor>,
+             article_url: Option<String>, hub: &Hub, rq: &mut RenderQueue,
+             context: &mut Context) -> News {
         let id = ID_FEEDER.next();
         let mut children = Vec::new();
         let dpi = CURRENT_DEVICE.dpi;
@@ -126,7 +145,14 @@ impl News {
         // Last and hidden: the article source answers link taps, not the
         // source menu, and it has no front page to switch to.
         sources.push(Box::new(ArticleSource::new(Arc::clone(&extractor))));
-        let name = sources[0].title().to_string();
+        // Starting at an article means starting ON the hidden source; its
+        // "Article" title holds the bars until `NewsLoaded` brings the real
+        // one, the same hand-off a tapped link gets.
+        let (current, route) = match article_url {
+            Some(url) => (sources.len() - 1, Route::Thread(url)),
+            None => (0, Route::Index),
+        };
+        let name = sources[current].title().to_string();
 
         let top_bar = TopBar::new(rect![rect.min.x, rect.min.y,
                                         rect.max.x, rect.min.y + small_height - small_thickness],
@@ -172,8 +198,8 @@ impl News {
             doc,
             location: 0,
             sources,
-            current: 0,
-            route: Route::Index,
+            current,
+            route: route.clone(),
             body: String::new(),
             images: FxHashMap::default(),
             history: Vec::new(),
@@ -183,7 +209,7 @@ impl News {
             extractor,
         };
 
-        news.load(Route::Index, hub, rq, context);
+        news.load(route, hub, rq, context);
         news
     }
 
@@ -733,6 +759,13 @@ impl View for News {
                 if !self.go_back(rq) {
                     hub.send(Event::Back).ok();
                 }
+                true
+            },
+            // A link pushed from the Mac while News is already up: take it in
+            // place, exactly as if the article had been tapped on the page
+            // being read -- one step into `history`, so Back returns there.
+            Event::OpenUrl(ref url) => {
+                self.open_article(url.clone(), hub, rq, context);
                 true
             },
             Event::Select(EntryId::SetNewsSource(ref id)) => {

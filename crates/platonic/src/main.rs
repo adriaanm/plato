@@ -44,12 +44,14 @@ use pure::*;
 use session::{arp_sweep, probe, resolve_all, Probe, Session};
 
 const USAGE: &str = "\
-usage: platonic [FILE ...] [--to NAME] [--quiet] [--title T] [--open FILE]
+usage: platonic [FILE ... | URL] [--to NAME] [--quiet] [--title T] [--open FILE]
                 [--list] [--pair] [--days N] [--host H] [--dry-run]
 
 push a document to the Kindle and start reading it (docs/platonic.md)
 
   FILE          documents to push ('-' reads stdin)
+  URL           an http(s) link: nothing is pushed — the reader fetches it
+                and opens it in its article view
   --to NAME     destination folder under documents/ (default: inbox, which
                 expires; named folders do not)
   --quiet       deliver and refresh the library, don't open
@@ -545,6 +547,33 @@ fn cmd_push(ctx: &Ctx, args: &Args, now: f64) {
     link.finish();
 }
 
+/// `platonic <url>`: no bytes move.  The reader's News view fetches the page,
+/// readability-extracts it and lays it out itself, so the Mac's whole job is
+/// one validated OPEN_URL over whichever transport the probe chose.
+fn cmd_open_url(ctx: &Ctx, args: &Args, url: &str) {
+    // The prefix already read as a URL; this checks the rest (length, control
+    // characters) before any network is touched, with the same rules the
+    // device will re-check it against.
+    if let Err(e) = platonic_recv::proto::validate_url(url) {
+        die(format!("{}: {}", url, e));
+    }
+    let (host, probe) = ctx.discover(&args.host);
+    let sess = ctx.session(&host);
+    let mut link = match open_link(&sess, ctx.transport, &probe,
+                                   ctx.restricted_key()) {
+        Ok(link) => link,
+        Err(e) => die(e),
+    };
+    match link.open_url(url) {
+        Ok(()) => println!("sent {} — the reader is opening it", url),
+        Err(e) => {
+            link.finish();
+            die(format!("open of {} failed: {}", url, e));
+        }
+    }
+    link.finish();
+}
+
 fn cmd_list(ctx: &Ctx, args: &Args, now: f64) {
     let (host, probe) = ctx.discover(&args.host);
     let sess = ctx.session(&host);
@@ -604,6 +633,32 @@ fn main() {
     } else if args.pair {
         pair::cmd_pair(&ctx, &args);
     } else {
-        cmd_push(&ctx, &args, now);
+        // File or link is decided per argument, here at the edge, so both
+        // command bodies stay single-minded.  '-' is stdin, never a URL.
+        let mut urls: Vec<&str> = Vec::new();
+        let mut any_file = false;
+        for source in &args.files {
+            let exists = source != "-" && Path::new(source).exists();
+            match classify_input(source, exists) {
+                Ok(InputKind::Url) => urls.push(source),
+                Ok(InputKind::File) => any_file = true,
+                Err(e) => die(e),
+            }
+        }
+        match urls.as_slice() {
+            [] => cmd_push(&ctx, &args, now),
+            _ if any_file => arg_error(
+                "FILEs and a URL cannot travel together — a push delivers \
+                 documents, a link-send only points"),
+            [url] => {
+                if args.to != "inbox" || args.title.is_some()
+                        || args.open.is_some() || args.quiet {
+                    arg_error("--to/--title/--open/--quiet describe pushed \
+                               documents; a URL pushes nothing");
+                }
+                cmd_open_url(&ctx, &args, url);
+            }
+            _ => arg_error("one URL at a time: the reader shows one article"),
+        }
     }
 }

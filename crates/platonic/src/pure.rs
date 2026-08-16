@@ -54,6 +54,37 @@ pub fn dns_names(alias: &str) -> Vec<String> {
 }
 
 //
+// ------------------------------------------------------------ file, or link?
+//
+
+/// What one positional argument turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputKind {
+    /// Push the bytes and open the document -- what `platonic FILE` always did.
+    File,
+    /// Send only the URL; the reader fetches and extracts the article itself.
+    Url,
+}
+
+/// Classify one positional argument.  The rule is the prefix -- `http://` or
+/// `https://` reads as a link -- because that prefix is also exactly what the
+/// reader's article source accepts, so the two ends agree by construction.
+///
+/// `exists` is injected (the same move as [`choose_key`]) so the ambiguous
+/// case is testable without laying down a file named `https:`: an argument
+/// that reads as a URL *and* names something on disk gets an error rather
+/// than a guess, and the error says how to spell each meaning unambiguously.
+pub fn classify_input(arg: &str, exists: bool) -> Result<InputKind, String> {
+    let looks_like_url = arg.starts_with("http://") || arg.starts_with("https://");
+    if looks_like_url && exists {
+        return Err(format!(
+            "{}: reads as a URL but also names a local file — use ./{} to \
+             push the file, or rename it to send the link", arg, arg));
+    }
+    Ok(if looks_like_url { InputKind::Url } else { InputKind::File })
+}
+
+//
 // ------------------------------------------------------------------ identity
 //
 // The ssh key is NOT fixed (Adriaan, 2026-08-12).  `platokin_ed25519` is the
@@ -608,6 +639,35 @@ mod tests {
         let names = dns_names(ALIAS);
         assert!(!names.iter().any(|n| n == USB_ADDR));
         assert_eq!(names.last().unwrap(), "platokin.local");
+    }
+
+    // ---- file, or link?
+
+    #[test]
+    fn a_web_url_is_a_link_send() {
+        assert_eq!(classify_input("https://example.com/essay", false).unwrap(),
+                   InputKind::Url);
+        assert_eq!(classify_input("http://example.com", false).unwrap(),
+                   InputKind::Url);
+    }
+
+    #[test]
+    fn ordinary_paths_are_file_pushes() {
+        for arg in ["docs/plan.md", "/tmp/a.pdf", "httpd.conf", "http-notes.md",
+                    "./https://weird", "-"] {
+            // `http-notes.md` and `httpd.conf` are the near-misses: the
+            // prefix rule must be the whole scheme, not the four letters.
+            assert_eq!(classify_input(arg, false).unwrap(), InputKind::File,
+                       "{:?}", arg);
+        }
+    }
+
+    #[test]
+    fn a_url_shadowed_by_a_local_file_is_an_error_not_a_guess() {
+        let err = classify_input("https://example.com/essay", true).unwrap_err();
+        assert!(err.contains("./"), "the error must say how to disambiguate: {}", err);
+        // Existence only matters when the spelling is ambiguous.
+        assert_eq!(classify_input("docs/plan.md", true).unwrap(), InputKind::File);
     }
 
     // ---- --to validation
