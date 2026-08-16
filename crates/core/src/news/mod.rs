@@ -23,9 +23,11 @@ pub mod feed;
 pub mod hn;
 mod sanitize;
 
-pub use sanitize::{escape_attribute, escape_text, sanitize_fragment, text_only};
+pub use sanitize::{escape_attribute, escape_text, sanitize_article_fragment,
+                   sanitize_fragment, text_only};
 
 use anyhow::Error;
+use fxhash::FxHashMap;
 
 /// The one thing `plato-core` needs from the network, kept as a trait so core
 /// stays network-free: rustls, roots and timeouts live in `plato-net`, which
@@ -70,6 +72,20 @@ pub enum Route {
 pub struct Page {
     pub title: String,
     pub body: String,
+    /// The bytes behind the body's `<img src="img-0"/>` references, keyed by
+    /// those names. Only an article ever fills this -- comments and blurbs
+    /// drop `img` in the sanitizer -- and the map rides along rather than
+    /// touching disk, so history-back re-shows a complete page and there is
+    /// no cache directory to clean.
+    pub images: FxHashMap<String, Vec<u8>>,
+}
+
+impl Page {
+    /// A page of markup alone -- what every source except the article source
+    /// produces.
+    pub fn text(title: String, body: String) -> Page {
+        Page { title, body, images: FxHashMap::default() }
+    }
 }
 
 pub trait Source: Send + Sync {

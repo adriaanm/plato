@@ -26,6 +26,8 @@ mod tool_bar;
 use std::sync::Arc;
 use std::thread;
 
+use fxhash::FxHashMap;
+
 use crate::chrono::Local;
 use crate::color::BLACK;
 use crate::context::Context;
@@ -69,7 +71,7 @@ pub struct News {
     /// Where Back goes: the routes walked to get here, innermost last. A thread
     /// entered from the index leaves the index on this stack, so leaving the
     /// thread does not re-fetch it -- the rendered body is kept with it.
-    history: Vec<(usize, Route, String, usize)>,
+    history: Vec<HistoryEntry>,
     http: Arc<dyn HttpClient>,
     /// Kept alongside `sources` because the worker-thread copy in
     /// [`sources_for`] rebuilds the article source around this same engine --
@@ -78,9 +80,25 @@ pub struct News {
     /// The markup currently shown, kept because `HtmlDocument` does not hand
     /// it back and going back must not re-fetch.
     body: String,
+    /// The images behind that markup, kept for the same reason: a history
+    /// entry that saved the body without them would come back with holes
+    /// where the article's figures were.
+    images: FxHashMap<String, Vec<u8>>,
     blurb_chars: usize,
     /// A route waiting for the radio, resumed on `NetUp`. See [`News::load`].
     pending: Option<Route>,
+}
+
+/// One step of Back: everything needed to re-show the page that was left
+/// without a request. The body's images come too -- an article's `<img>`
+/// srcs point into this map, so a kept body without it would re-show with
+/// holes where the figures were.
+struct HistoryEntry {
+    source: usize,
+    route: Route,
+    body: String,
+    images: FxHashMap<String, Vec<u8>>,
+    location: usize,
 }
 
 /// Hacker News, then whatever `Settings.toml` names. Takes the settings rather
@@ -141,6 +159,9 @@ impl News {
         doc.set_margin_width(context.settings.news.margin_width);
         doc.set_viewer_stylesheet(VIEWER_STYLESHEET);
         doc.set_user_stylesheet(USER_STYLESHEET);
+        // An article's photographs deserve better than 16 bare gray levels:
+        // error diffusion, once per image at final scale (framebuffer::dither).
+        doc.set_image_dither(true);
 
         rq.add(RenderData::new(id, rect, UpdateMode::Gui));
 
@@ -154,6 +175,7 @@ impl News {
             current: 0,
             route: Route::Index,
             body: String::new(),
+            images: FxHashMap::default(),
             history: Vec::new(),
             blurb_chars: context.settings.news.blurb_chars,
             pending: None,
@@ -209,12 +231,12 @@ impl News {
                 hub.send(Event::SetWifi(true)).ok();
                 "Turning WiFi on…"
             };
-            self.show(&format!("<p class=\"info\">{message}</p>"), rq);
+            self.show(&format!("<p class=\"info\">{message}</p>"), FxHashMap::default(), rq);
             return;
         }
 
         let label = self.loading_label();
-        self.show(&format!("<p class=\"info\">{label}</p>"), rq);
+        self.show(&format!("<p class=\"info\">{label}</p>"), FxHashMap::default(), rq);
 
         let source_id = self.sources[self.current].id().to_string();
         let source = self.current;
@@ -238,8 +260,23 @@ impl News {
         });
     }
 
-    fn show(&mut self, body: &str, rq: &mut RenderQueue) {
+    /// The page being shown, as a history entry. The images move rather than
+    /// clone -- they can be megabytes -- which is safe because every caller
+    /// immediately loads another page, and `show` will restock the fields.
+    fn here(&mut self) -> HistoryEntry {
+        HistoryEntry {
+            source: self.current,
+            route: self.route.clone(),
+            body: self.body.clone(),
+            images: std::mem::take(&mut self.images),
+            location: self.location,
+        }
+    }
+
+    fn show(&mut self, body: &str, images: FxHashMap<String, Vec<u8>>, rq: &mut RenderQueue) {
         self.body = body.to_string();
+        self.doc.set_resources(images.clone());
+        self.images = images;
         self.doc.update(body);
         self.location = 0;
         if let Some(image) = self.children[2].downcast_mut::<Image>() {
@@ -370,8 +407,8 @@ impl News {
     }
 
     fn go_to_route(&mut self, route: Route, hub: &Hub, rq: &mut RenderQueue, context: &mut Context) {
-        self.history.push((self.current, self.route.clone(),
-                           self.body.clone(), self.location));
+        let entry = self.here();
+        self.history.push(entry);
         self.route = route.clone();
         self.load(route, hub, rq, context);
     }
@@ -383,8 +420,8 @@ impl News {
         let Some(index) = self.sources.iter().position(|s| s.id() == article::ID) else {
             return self.queue_external(&url, hub, rq, context);
         };
-        self.history.push((self.current, self.route.clone(),
-                           self.body.clone(), self.location));
+        let entry = self.here();
+        self.history.push(entry);
         self.current = index;
         self.route = Route::Thread(url);
         self.load(self.route.clone(), hub, rq, context);
@@ -394,7 +431,7 @@ impl News {
     /// entry, so returning from a thread to the front page costs no request
     /// and no radio time.
     fn go_back(&mut self, rq: &mut RenderQueue) -> bool {
-        let Some((source, route, body, location)) = self.history.pop() else {
+        let Some(HistoryEntry { source, route, body, images, location }) = self.history.pop() else {
             return false;
         };
         // Leaving the page a route was waiting for cancels the wait: the answer
@@ -407,7 +444,7 @@ impl News {
         if let Some(bottom_bar) = self.children[4].downcast_mut::<BottomBar>() {
             bottom_bar.update_name(&title, rq);
         }
-        self.show(&body, rq);
+        self.show(&body, images, rq);
         // `show` starts at the top; the position that was left is better.
         if let Some(image) = self.children[2].downcast_mut::<Image>() {
             if let Some((pixmap, loc)) = self.doc.pixmap(Location::Exact(location), 1.0,
@@ -598,7 +635,7 @@ impl View for News {
                     page.title.clone()
                 };
                 self.set_title(&title, rq);
-                self.show(&page.body, rq);
+                self.show(&page.body, page.images.clone(), rq);
                 true
             },
             // The radio answered. `load` deferred a route rather than spend the
@@ -612,14 +649,16 @@ impl View for News {
             Event::NetUpFailed => {
                 if self.pending.take().is_some() {
                     self.show("<p class=\"info\">Couldn't load this page.</p>\
-                               <p class=\"error\">WiFi didn't come up.</p>", rq);
+                               <p class=\"error\">WiFi didn't come up.</p>",
+                              FxHashMap::default(), rq);
                 }
                 true
             },
             Event::NewsFailed(ref message) => {
                 self.show(&format!("<p class=\"info\">Couldn't load this page.</p>\
                                     <p class=\"error\">{}</p>",
-                                   news::escape_text(message)), rq);
+                                   news::escape_text(message)),
+                          FxHashMap::default(), rq);
                 true
             },
             Event::Page(dir) => {

@@ -85,10 +85,9 @@ impl Source for Feed {
             }
             // The feed moved on while it was being read. Saying so beats an
             // empty page, and the index is one tap away.
-            return Ok(Page {
-                title: self.title.clone(),
-                body: "<p class=\"info\">This entry is no longer in the feed.</p>".to_string(),
-            });
+            return Ok(Page::text(
+                self.title.clone(),
+                "<p class=\"info\">This entry is no longer in the feed.</p>".to_string()));
         }
 
         let mut body = String::with_capacity(8 * 1024);
@@ -135,7 +134,7 @@ impl Source for Feed {
 
         // The feed's own title is nicer than the configured one when they
         // differ, but the configured one is what the user chose to call it.
-        Ok(Page { title: self.title.clone(), body })
+        Ok(Page::text(self.title.clone(), body))
     }
 }
 
@@ -187,7 +186,7 @@ impl Feed {
             None => body.push_str("<p class=\"info\">This entry has no text of its own.</p>"),
         }
 
-        Page { title, body }
+        Page::text(title, body)
     }
 }
 

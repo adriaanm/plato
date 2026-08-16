@@ -196,7 +196,7 @@ fn render_index(search: Search, order: &[String], now: i64) -> Result<Page, Erro
         body.push_str("<p class=\"empty\">The front page came back empty.</p>");
     }
 
-    Ok(Page { title: "Hacker News".to_string(), body })
+    Ok(Page::text("Hacker News".to_string(), body))
 }
 
 fn render_thread(story: Item, now: i64) -> Result<Page, Error> {
@@ -245,7 +245,7 @@ fn render_thread(story: Item, now: i64) -> Result<Page, Error> {
         body.push_str("<p class=\"empty\">No comments yet.</p>");
     }
 
-    Ok(Page { title, body })
+    Ok(Page::text(title, body))
 }
 
 fn render_comment(body: &mut String, item: &Item, depth: usize, now: i64) {

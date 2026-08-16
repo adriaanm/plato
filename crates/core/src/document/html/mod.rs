@@ -35,6 +35,12 @@ pub struct HtmlDocument {
     engine: Engine,
     pages: Vec<Page>,
     parent: PathBuf,
+    /// Resources served from memory, ahead of `parent`. A news article's
+    /// images arrive with the page and live here rather than on disk: no
+    /// cache directory to invent or clean, and a history entry that keeps a
+    /// body can keep its images with it. Empty for every document read from
+    /// a file, which makes the fetcher exactly the old parent-directory read.
+    resources: FxHashMap<String, Vec<u8>>,
     size: usize,
     viewer_stylesheet: PathBuf,
     user_stylesheet: PathBuf,
@@ -44,6 +50,27 @@ pub struct HtmlDocument {
 impl ResourceFetcher for PathBuf {
     fn fetch(&mut self, name: &str) -> Result<Vec<u8>, Error> {
         let mut file = File::open(self.join(name))?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+}
+
+/// The document's fetcher: the in-memory map first, then the directory the
+/// document was loaded from. Split from `HtmlDocument` so the engine can
+/// borrow it mutably while the engine itself is borrowed mutably -- the two
+/// are disjoint fields of the document.
+struct DocumentResources<'a> {
+    resources: &'a FxHashMap<String, Vec<u8>>,
+    parent: &'a Path,
+}
+
+impl ResourceFetcher for DocumentResources<'_> {
+    fn fetch(&mut self, name: &str) -> Result<Vec<u8>, Error> {
+        if let Some(buf) = self.resources.get(name) {
+            return Ok(buf.clone());
+        }
+        let mut file = File::open(self.parent.join(name))?;
         let mut buf = Vec::new();
         file.read_to_end(&mut buf)?;
         Ok(buf)
@@ -69,6 +96,7 @@ impl HtmlDocument {
             engine: Engine::new(),
             pages: Vec::new(),
             parent: parent.to_path_buf(),
+            resources: FxHashMap::default(),
             size,
             viewer_stylesheet: PathBuf::from(VIEWER_STYLESHEET),
             user_stylesheet: PathBuf::from(USER_STYLESHEET),
@@ -87,6 +115,7 @@ impl HtmlDocument {
             engine: Engine::new(),
             pages: Vec::new(),
             parent: PathBuf::default(),
+            resources: FxHashMap::default(),
             size,
             viewer_stylesheet: PathBuf::from(VIEWER_STYLESHEET),
             user_stylesheet: PathBuf::from(USER_STYLESHEET),
@@ -112,8 +141,22 @@ impl HtmlDocument {
         self.pages.clear();
     }
 
+    /// Error-diffuse this document's images to G16 at draw time. A draw-time
+    /// choice, not a layout one, so no built page is invalidated.
+    pub fn set_image_dither(&mut self, enable: bool) {
+        self.engine.dither_images = enable;
+    }
+
     pub fn set_parent<P: AsRef<Path>>(&mut self, path: P) {
         self.parent = path.as_ref().to_path_buf();
+    }
+
+    /// Replace the in-memory resources the fetcher consults before `parent`.
+    /// Clears the built pages: an image's intrinsic size takes part in
+    /// layout, so new bytes mean new geometry.
+    pub fn set_resources(&mut self, resources: FxHashMap<String, Vec<u8>>) {
+        self.resources = resources;
+        self.pages.clear();
     }
 
     pub fn set_viewer_stylesheet<P: AsRef<Path>>(&mut self, path: P) {
@@ -238,7 +281,8 @@ impl HtmlDocument {
 
         pages.push(Vec::new());
 
-        self.engine.build_display_list(self.content.root(), &style, &loop_context, &stylesheet, &root_data, &mut self.parent, &mut draw_state, &mut pages);
+        let mut fetcher = DocumentResources { resources: &self.resources, parent: &self.parent };
+        self.engine.build_display_list(self.content.root(), &style, &loop_context, &stylesheet, &root_data, &mut fetcher, &mut draw_state, &mut pages);
 
         pages.retain(|page| !page.is_empty());
 
@@ -380,7 +424,8 @@ impl Document for HtmlDocument {
         let offset = self.resolve_location(loc)?;
         let page_index = self.page_index(offset)?;
         let page = self.pages[page_index].clone();
-        let pixmap = self.engine.render_page(&page, scale, samples, &mut self.parent)?;
+        let mut fetcher = DocumentResources { resources: &self.resources, parent: &self.parent };
+        let pixmap = self.engine.render_page(&page, scale, samples, &mut fetcher)?;
 
         Some((pixmap, offset))
     }

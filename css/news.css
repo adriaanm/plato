@@ -137,6 +137,27 @@
 	height: 1.2em;
 }
 
+/* An article's images, served from the page's in-memory resources. Block, so
+ * a figure sits on its own line rather than in the middle of a sentence, with
+ * air above and below. No width or height cap is needed here: the engine
+ * already scales an image wider than the column down to the line (the no-fit
+ * fallback in engine.rs) and one taller than the space left down to what
+ * remains of the page -- centering is not supported, so a figure sits at the
+ * left edge like everything else. */
+.article img {
+	display: block;
+	margin-top: 0.8em;
+	margin-bottom: 0.8em;
+}
+
+/* Its caption: right under the picture it names, set like the rest of the
+ * small print. The picture's own bottom margin carries the gap. */
+.article figcaption {
+	font-size: 0.78em;
+	color: #666;
+	margin-bottom: 0.8em;
+}
+
 /* Quoted matter: indented like a reply, slightly smaller like a blurb. */
 .article blockquote {
 	font-size: 0.92em;

@@ -36,9 +36,11 @@ const ALLOWED: &[&str] = &[
     "i", "li", "ol", "p", "pre", "strong", "ul",
 ];
 
-/// Kept, but as empty elements. `img` is deliberately *not* here: nothing in
-/// this reader fetches remote images, and a blurb full of tracking pixels is
-/// exactly what an e-ink reader does not need.
+/// Kept, but as empty elements. `img` is deliberately *not* here: a comment
+/// or a blurb is a stranger's fragment shown unasked, and a blurb full of
+/// tracking pixels is exactly what an e-ink reader does not need. An article
+/// the reader chose to open is the one exception, and it goes through
+/// [`sanitize_article_fragment`] instead.
 const VOID: &[&str] = &["br", "hr"];
 
 /// Block-level elements. An open `<p>` closes when any of these starts, which
@@ -46,16 +48,21 @@ const VOID: &[&str] = &["br", "hr"];
 /// writes `first<p>second<p><pre>code</pre>`, and without this the `<pre>`
 /// would end up inside the paragraph.
 const BLOCKS: &[&str] = &[
-    "blockquote", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "li", "ol", "p", "pre", "ul",
+    "blockquote", "figcaption", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "li", "ol",
+    "p", "pre", "ul",
 ];
 
-/// Elements whose *contents* go too, everywhere. A feed that ships article
-/// HTML ships its image captions with it, and since no image is drawn here the
-/// caption arrives as a non-sequitur at the top of the blurb -- The Verge opens
-/// every entry with "…pop music. | Image: Daniel Randall". The same holds for
-/// a whole article, with `script` as the sharper case: its body is code, and
-/// dropping only the tags would print it as prose.
-const DROPPED_WHOLE: &[&str] = &["caption", "figcaption", "figure", "script", "style"];
+/// Elements whose *contents* go too, everywhere. `script` is the sharp case:
+/// its body is code, and dropping only the tags would print it as prose.
+const DROPPED_WHOLE: &[&str] = &["caption", "script", "style"];
+
+/// Dropped whole only where no image is drawn -- comments and blurbs. There a
+/// caption is a non-sequitur: The Verge opens every entry's `content` with
+/// "…pop music. | Image: Daniel Randall". In an article the image *is* drawn
+/// (readability wraps most of them in `<figure>`), so the figure unwraps like
+/// any other container and its caption survives as a `figcaption` for the
+/// stylesheet to set under the picture.
+const FIGURES: &[&str] = &["figcaption", "figure"];
 
 /// An open element, and where its tag sits in the output -- so that an element
 /// that turns out to contain nothing can be removed again rather than left as
@@ -67,6 +74,23 @@ struct Open {
 }
 
 pub fn sanitize_fragment(input: &str) -> String {
+    sanitize(input, false)
+}
+
+/// The article vocabulary: everything `sanitize_fragment` keeps, plus `img`.
+///
+/// The split exists because the tracking-pixel rationale in [`VOID`] is about
+/// *whose* fragment this is. A stranger's comment or a feed's blurb must not
+/// be able to make this reader phone home, so their `img` still vanishes. An
+/// article is different: the reader deliberately chose to open that page, its
+/// images are part of what was asked for, and the fetching happens once, up
+/// front, through the same injected client as the page itself -- not at
+/// render time on someone else's schedule.
+pub fn sanitize_article_fragment(input: &str) -> String {
+    sanitize(input, true)
+}
+
+fn sanitize(input: &str, allow_img: bool) -> String {
     let mut out = String::with_capacity(input.len() + 16);
     let mut open: Vec<Open> = Vec::new();
     let mut rest = input;
@@ -78,12 +102,31 @@ pub fn sanitize_fragment(input: &str) -> String {
         match parse_tag(rest) {
             Some((tag, closing, after)) => {
                 let lower = tag.name.to_ascii_lowercase();
-                if !closing && DROPPED_WHOLE.contains(&lower.as_str()) {
+                if !closing && (DROPPED_WHOLE.contains(&lower.as_str()) ||
+                                (!allow_img && FIGURES.contains(&lower.as_str()))) {
                     rest = skip_dropped(&lower, after);
                     continue;
                 }
                 rest = after;
-                if let Some(name) = allowed_name(tag.name) {
+                if !closing && lower == "img" {
+                    // `img` is void, so there is nothing to keep open and no
+                    // children to preserve; either it is emitted whole here or
+                    // it vanishes. Only a web URL survives -- the extractor
+                    // has already absolutized its srcs, so a `data:` URI or a
+                    // relative leftover is a src this reader will never fetch,
+                    // and a tag pointing nowhere is better dropped. Every
+                    // other attribute (onerror, width, ...) goes.
+                    if allow_img {
+                        if let Some(src) = tag.src.filter(|src| src.starts_with("https://") ||
+                                                                src.starts_with("http://")) {
+                            out.push_str("<img src=\"");
+                            push_attribute(&mut out, src);
+                            out.push_str("\"/>");
+                        }
+                    }
+                    continue;
+                }
+                if let Some(name) = allowed_name(tag.name, allow_img) {
                     if closing {
                         close_through(&mut out, &mut open, name);
                     } else if VOID.contains(&name) {
@@ -147,6 +190,7 @@ fn close_one(out: &mut String, item: Open) {
 struct Tag<'a> {
     name: &'a str,
     href: Option<&'a str>,
+    src: Option<&'a str>,
 }
 
 /// Parse one tag at the start of `input`. Returns the tag, whether it was a
@@ -169,27 +213,46 @@ fn parse_tag(input: &str) -> Option<(Tag<'_>, bool, &str)> {
     let rest = &body[name_len..];
     let end = rest.find('>')?;
     let attrs = &rest[..end];
-    Some((Tag { name, href: (!closing).then(|| href_of(attrs)).flatten() },
+    Some((Tag { name,
+                href: (!closing).then(|| quoted_attr(attrs, "href")).flatten(),
+                src: (!closing).then(|| quoted_attr(attrs, "src")).flatten() },
           closing,
           &rest[end + 1..]))
 }
 
-/// The one attribute that survives. Quoted values only -- an unquoted `href`
-/// has never appeared in either source, and guessing where one ends is how
-/// sanitizers grow holes.
-fn href_of(attrs: &str) -> Option<&str> {
-    let at = attrs.find("href")?;
-    let rest = attrs[at + 4..].trim_start().strip_prefix('=')?.trim_start();
-    let quote = rest.chars().next().filter(|&c| c == '"' || c == '\'')?;
-    let rest = &rest[1..];
-    let end = rest.find(quote)?;
-    Some(&rest[..end])
+/// The two attributes that survive anywhere (`href` on a link, `src` on an
+/// article's `img`). Quoted values only -- an unquoted value has never
+/// appeared in any source, and guessing where one ends is how sanitizers grow
+/// holes. The boundary check exists for `src`: lazy-loading markup is full of
+/// `data-src`, and matching inside it would resurrect exactly the deferred
+/// image URL the site did not put in `src`.
+fn quoted_attr<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
+    let mut from = 0;
+    loop {
+        let at = from + attrs[from..].find(name)?;
+        from = at + name.len();
+        if at > 0 && attrs[..at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            continue;
+        }
+        let rest = attrs[from..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else { continue };
+        let rest = rest.trim_start();
+        let Some(quote) = rest.chars().next().filter(|&c| c == '"' || c == '\'') else { continue };
+        let rest = &rest[1..];
+        let end = rest.find(quote)?;
+        return Some(&rest[..end]);
+    }
 }
 
 /// Match case-insensitively but return the canonical spelling, so the output
-/// is always lowercase however the input was written.
-fn allowed_name(name: &str) -> Option<&'static str> {
+/// is always lowercase however the input was written. `figcaption` is only a
+/// word in the article vocabulary; in a comment or blurb the whole figure was
+/// skipped before this is ever asked.
+fn allowed_name(name: &str, allow_img: bool) -> Option<&'static str> {
     let lower = name.to_ascii_lowercase();
+    if allow_img && lower == "figcaption" {
+        return Some("figcaption");
+    }
     ALLOWED.iter().chain(VOID).find(|&&a| a == lower).copied()
 }
 
@@ -309,7 +372,9 @@ pub fn text_only(input: &str, max_chars: usize) -> String {
         match parse_tag(rest) {
             Some((tag, closing, after)) => {
                 let lower = tag.name.to_ascii_lowercase();
-                if !closing && DROPPED_WHOLE.contains(&lower.as_str()) {
+                // A blurb draws no image, so figures go whole here, always.
+                if !closing && (DROPPED_WHOLE.contains(&lower.as_str()) ||
+                                FIGURES.contains(&lower.as_str())) {
                     rest = skip_dropped(&lower, after);
                     text.push(' ');
                     continue;
@@ -445,6 +510,45 @@ mod tests {
     fn an_unclosed_figure_swallows_what_follows_rather_than_leaking_its_caption() {
         assert_eq!(sanitize_fragment("<p>seen</p><figure><figcaption>leak?"),
                    "<p>seen</p>");
+    }
+
+    /// In an article the image is drawn, so the figure that readability wraps
+    /// around most images unwraps like any container, and its caption stays --
+    /// as a `figcaption` the stylesheet can set under the picture.
+    #[test]
+    fn an_article_figure_unwraps_and_keeps_its_image_and_caption() {
+        let input = "<figure><img src=\"https://example.com/x.jpg\">\
+                     <figcaption>Photo: A. Somebody</figcaption></figure>";
+        assert_eq!(sanitize_article_fragment(input),
+                   "<img src=\"https://example.com/x.jpg\"/>\
+                    <figcaption>Photo: A. Somebody</figcaption>");
+    }
+
+    /// The article exception: an `img` survives, reduced to its `src`. The
+    /// comment/blurb entry point must keep dropping it -- that difference is
+    /// the whole reason two entry points exist.
+    #[test]
+    fn img_survives_only_in_the_article_vocabulary() {
+        let input = "<p>a</p><img src=\"https://example.com/x.png\" width=\"600\" \
+                     onerror=\"boom()\" loading=\"lazy\">";
+        assert_eq!(sanitize_article_fragment(input),
+                   "<p>a</p><img src=\"https://example.com/x.png\"/>");
+        assert_eq!(sanitize_fragment(input), "<p>a</p>");
+    }
+
+    /// The extractor absolutizes srcs, so anything that is not a web URL --
+    /// a `data:` URI, a relative leftover, no src at all -- is a src this
+    /// reader will never fetch, and the tag goes with it.
+    #[test]
+    fn a_non_web_src_drops_the_img_entirely() {
+        assert_eq!(sanitize_article_fragment("<img src=\"data:image/png;base64,AAAA\">kept"),
+                   "kept");
+        assert_eq!(sanitize_article_fragment("<img src=\"/logo.png\">kept"), "kept");
+        assert_eq!(sanitize_article_fragment("<img alt=\"no src\">kept"), "kept");
+        // `data-src` is not `src`: resurrecting a lazy-loader's deferred URL
+        // would fetch something the page's own `src` did not name.
+        assert_eq!(sanitize_article_fragment("<img data-src=\"https://example.com/x.png\">kept"),
+                   "kept");
     }
 
     #[test]
