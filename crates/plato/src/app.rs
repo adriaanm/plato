@@ -1088,7 +1088,22 @@ pub fn run() -> Result<(), Error> {
                 // plainly up, which is exactly what News did. NetUp is sent
                 // rather than the flag set here, so the one path that reports
                 // a link stays the one path that reports a link.
-                if !context.online {
+                //
+                // The guard asks whether EITHER belief disagrees with the
+                // scripts, not just `online`. Observed 2026-08-22
+                // (`[PLATO-WIFI-BELIEF-STUCK-OFF]`): the reader sat with
+                // `settings.wifi` false and `online` true while the link was up
+                // and its own responder was advertising over it, so the fan
+                // read struck-through and, because the old guard only fired
+                // when Plato thought it was OFFLINE, every further poke was a
+                // no-op and it never healed. A half-corrected pair must not be
+                // able to latch.
+                //
+                // This is not cosmetic: `PrepareSuspend` records
+                // `wifi_before_suspend` from `settings.wifi`, so a reader stuck
+                // this way sleeps believing the radio was already off and wakes
+                // leaving it off.
+                if !context.settings.wifi || !context.online {
                     context.settings.wifi = true;
                     tx.send(Event::Device(DeviceEvent::NetUp)).ok();
                 }
