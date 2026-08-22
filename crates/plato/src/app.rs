@@ -76,6 +76,23 @@ const KOBO_UPDATE_BUNDLE: &str = "/mnt/onboard/.kobo/KoboRoot.tgz";
 
 const CLOCK_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const BATTERY_REFRESH_INTERVAL: Duration = Duration::from_secs(299);
+/// How long to let the radio settle before the FIRST association attempt of a
+/// post-resume restore. A bring-up issued immediately after the wake reaches
+/// the AP and then stalls in `4WAY_HANDSHAKE` for the whole 35 s timeout, and
+/// only `wifi-up.sh`'s reload ladder rescues it -- 66 s instead of 13
+/// (`[WIFI-SETTLE-AFTER-RESUME]` in docs/wifi.md).
+///
+/// **10 s is a first guess, not a measurement** (Adriaan, 2026-08-22). The
+/// observation is n = 1, and the attempt that worked began ~46 s after the
+/// wake only because a 35 s failure and an 8 s settle happened to precede it,
+/// so 46 is an artefact rather than the required settle. Read `wifi.log` after
+/// a few wakes: if `attempt 2/3` no longer appears, this is enough; if it
+/// still does, raise it.
+///
+/// Costs nothing perceptible -- nobody needs the radio in the first seconds
+/// after picking the device up -- and the WiFi indicator animates throughout,
+/// because the busy flag is claimed before the sleep, not after.
+const WIFI_RESUME_SETTLE: Duration = Duration::from_secs(10);
 const AUTO_SUSPEND_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 // One frame of the top bar's WiFi sweep.
 //
@@ -220,7 +237,7 @@ fn resume(id: TaskId, tasks: &mut Vec<Task>, view: &mut dyn View, hub: &Sender<E
         let restore_wifi = context.wifi_before_suspend;
         context.wifi_before_suspend = false;
         if restore_wifi && !context.settings.wifi {
-            set_wifi(true, hub, context);
+            set_wifi_after(WIFI_RESUME_SETTLE, true, hub, context);
         } else if context.settings.wifi {
             // Kindle fork: report the link back, as at startup and in set_wifi.
             // On a thread: a wake that freezes for the whole association is a
@@ -297,6 +314,14 @@ static WIFI_BUSY: AtomicBool = AtomicBool::new(false);
 /// request that was dropped as mid-transition must not start an animation that
 /// nothing will ever stop.
 fn spawn_wifi(enable: bool, hub: &Sender<Event>) -> bool {
+    spawn_wifi_after(Duration::ZERO, enable, hub)
+}
+
+/// As `spawn_wifi`, but lets the radio settle first. The busy flag is taken
+/// BEFORE the sleep on purpose: it stops a second request racing in during the
+/// settle, and it keeps the indicator animating so the wait is visible rather
+/// than looking like nothing happened.
+fn spawn_wifi_after(delay: Duration, enable: bool, hub: &Sender<Event>) -> bool {
     if WIFI_BUSY.swap(true, Ordering::SeqCst) {
         hub.send(Event::Notify("WiFi is still changing state.".to_string())).ok();
         return false;
@@ -304,6 +329,9 @@ fn spawn_wifi(enable: bool, hub: &Sender<Event>) -> bool {
 
     let hub = hub.clone();
     thread::spawn(move || {
+        if !delay.is_zero() {
+            thread::sleep(delay);
+        }
         if !enable {
             crate::mdns::stop();
         }
@@ -335,6 +363,10 @@ fn spawn_wifi(enable: bool, hub: &Sender<Event>) -> bool {
 }
 
 fn set_wifi(enable: bool, hub: &Sender<Event>, context: &mut Context) {
+    set_wifi_after(Duration::ZERO, enable, hub, context)
+}
+
+fn set_wifi_after(delay: Duration, enable: bool, hub: &Sender<Event>, context: &mut Context) {
     if context.settings.wifi == enable {
         return;
     }
@@ -344,7 +376,7 @@ fn set_wifi(enable: bool, hub: &Sender<Event>, context: &mut Context) {
     if !enable {
         context.online = false;
     }
-    context.wifi_busy = spawn_wifi(enable, hub);
+    context.wifi_busy = spawn_wifi_after(delay, enable, hub);
     // Paint the first frame now rather than after the first interval: the whole
     // point is that the tap has a visible consequence immediately.
     hub.send(Event::WifiTick).ok();
