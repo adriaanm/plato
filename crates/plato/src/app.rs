@@ -206,7 +206,22 @@ fn resume(id: TaskId, tasks: &mut Vec<Task>, view: &mut dyn View, hub: &Sender<E
             context.frontlight.set_warmth(levels.warmth);
             context.frontlight.set_intensity(levels.intensity);
         }
-        if context.settings.wifi {
+        // Kindle fork: PrepareSuspend turns the radio off and clears
+        // `settings.wifi`, so nothing brings it back by accident. Adriaan,
+        // 2026-08-22: a sleep that began with the radio on should end with it
+        // on again -- and ONLY that case, which is what the recorded flag is
+        // for. A device put to sleep with WiFi off wakes with WiFi off.
+        //
+        // Taken, not read: the flag describes the sleep that just ended, and
+        // leaving it set would let some later resume restore a radio nobody
+        // asked for. Note this also covers a REFUSED suspend (plugged in, per
+        // E17), which reaches here too -- the radio went off for a sleep that
+        // never happened, and should come straight back.
+        let restore_wifi = context.wifi_before_suspend;
+        context.wifi_before_suspend = false;
+        if restore_wifi && !context.settings.wifi {
+            set_wifi(true, hub, context);
+        } else if context.settings.wifi {
             // Kindle fork: report the link back, as at startup and in set_wifi.
             // On a thread: a wake that freezes for the whole association is a
             // wake the user reads as a crash.
@@ -763,13 +778,20 @@ pub fn run() -> Result<(), Error> {
             Event::PrepareSuspend => {
                 tasks.retain(|task| task.id != TaskId::PrepareSuspend);
                 wait_for_all(&mut updating, &mut context);
-                // Kindle fork: WiFi exists here only to serve a sync, and a
-                // sync asks for it itself. So this turns the radio off and
-                // LEAVES it off -- clearing settings.wifi is what stops the
-                // resume path bringing it straight back up, and it happens
-                // before the settings are written so the decision survives.
+                // Kindle fork: the radio goes off for the sleep, and clearing
+                // settings.wifi is what stops anything bringing it back by
+                // accident -- it happens before the settings are written, so
+                // the decision survives a device that never wakes.
+                //
+                // Remembered here and restored in `resume`, so the wake puts
+                // the radio back the way this sleep found it (Adriaan,
+                // 2026-08-22). Recorded UNCONDITIONALLY: a sleep that starts
+                // with the radio already off must clear a flag left by an
+                // earlier sleep, not inherit it.
+                //
                 // Synchronous on purpose, unlike every other WiFi call: we are
                 // about to suspend, and a thread would simply be frozen too.
+                context.wifi_before_suspend = context.settings.wifi;
                 if context.settings.wifi {
                     // Before the script, never after: a goodbye packet sent
                     // over a dead link is not sent at all.

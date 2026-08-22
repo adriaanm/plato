@@ -51,6 +51,11 @@ pub struct Context {
     /// `settings.wifi` nor `online` describes what the device is doing, and
     /// that gap is exactly what the top bar's indicator animates over.
     pub wifi_busy: bool,
+    /// Whether the radio was on when `PrepareSuspend` turned it off, so that
+    /// waking can put it back the way it was found -- and only then. Not
+    /// persisted: it describes one sleep, not a preference, and a device that
+    /// loses power mid-sleep must wake with the radio off like any cold boot.
+    pub wifi_before_suspend: bool,
 }
 
 impl Context {
@@ -65,7 +70,8 @@ impl Context {
                   keyboard_layouts: BTreeMap::new(), input_history: FxHashMap::default(),
                   battery, frontlight, lightsensor, notification_index: 0,
                   kb_rect: Rectangle::default(), rng, plugged: false, covered: false,
-                  shared: false, online: false, wifi_busy: false }
+                  shared: false, online: false, wifi_busy: false,
+                  wifi_before_suspend: false }
     }
 
     pub fn batch_import(&mut self) {
