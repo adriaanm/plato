@@ -47,6 +47,8 @@ pub trait Link {
     fn list(&mut self) -> Result<Vec<Entry>, String>;
     /// Names deleted from `inbox/`.
     fn sweep(&mut self, cutoff: i64) -> Result<Vec<String>, String>;
+    /// The files the reader's "Export Highlights" wrote into `highlights/`.
+    fn highlights(&mut self) -> Result<Vec<proto::NamedFile>, String>;
     /// End the session cleanly.  Only [`RecvLink`] has anything to close.
     fn finish(&mut self) {}
 }
@@ -230,6 +232,15 @@ impl Link for RecvLink {
         }
     }
 
+    /// An old receiver answers the unknown op byte with Unsupported and
+    /// `describe` names the redeploy — one visible line, never a hang.
+    fn highlights(&mut self) -> Result<Vec<proto::NamedFile>, String> {
+        match self.call(Request::Highlights, None)? {
+            Response::Highlights(files) => Ok(files),
+            other => Err(format!("unexpected answer to HIGHLIGHTS: {:?}", other)),
+        }
+    }
+
     fn finish(&mut self) {
         let _ = self.call(Request::Quit, None);
         // EOF, then reap: ssh stays alive as long as stdin is open.
@@ -326,6 +337,16 @@ impl<'a> Link for ShellLink<'a> {
         Ok(doomed.iter().map(|p| pure::basename(p)).collect())
     }
 
+    /// One anonymous blob rather than named files: the grep format is
+    /// self-describing, and the shell path has no framing to carry names in.
+    fn highlights(&mut self) -> Result<Vec<proto::NamedFile>, String> {
+        let out = self.sess.out(&pure::highlights_command(),
+                                Duration::from_secs(30));
+        if out.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(vec![proto::NamedFile { name: String::new(), data: out.into_bytes() }])
+    }
 }
 
 //
@@ -367,6 +388,10 @@ impl Link for DryLink {
     }
     fn sweep(&mut self, cutoff: i64) -> Result<Vec<String>, String> {
         self.echo(format!("SWEEP inbox older than {}", cutoff));
+        Ok(Vec::new())
+    }
+    fn highlights(&mut self) -> Result<Vec<proto::NamedFile>, String> {
+        self.echo("HIGHLIGHTS".to_string());
         Ok(Vec::new())
     }
 }

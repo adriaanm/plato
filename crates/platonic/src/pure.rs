@@ -603,6 +603,14 @@ pub fn list_command() -> String {
              -exec stat -c '%Y %s %n' {{}} \\; 2>/dev/null", DOCROOT)
 }
 
+/// The legacy path's HIGHLIGHTS: one `cat` over the folder, because the
+/// grep-style format is self-describing (every line already names its file),
+/// so per-file structure buys nothing a shell has to pay for.  Busybox-safe;
+/// no matches means empty output, not an error.
+pub fn highlights_command() -> String {
+    format!("cat {}/highlights/*.md 2>/dev/null", DOCROOT)
+}
+
 pub fn rm_command(paths: &[String]) -> String {
     let quoted: Vec<String> = paths.iter().map(|p| shell_quote(p)).collect();
     format!("rm -f -- {}", quoted.join(" "))

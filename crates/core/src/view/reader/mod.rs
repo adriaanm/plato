@@ -5,13 +5,14 @@ mod margin_cropper;
 mod chapter_label;
 mod results_label;
 
+use std::mem;
 use std::thread;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::path::PathBuf;
 use std::io::prelude::*;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::collections::{VecDeque, BTreeMap};
 use fxhash::{FxHashMap, FxHashSet};
 use chrono::Local;
@@ -50,6 +51,7 @@ use crate::frontlight::LightLevels;
 use crate::gesture::GestureEvent;
 use crate::document::{Document, open, Location, TextLocation, BoundedText, Neighbors, BYTES_PER_PAGE};
 use crate::document::layout;
+use crate::document::markdown;
 use crate::document::{TocEntry, SimpleTocEntry, TocLocation, toc_as_html, annotations_as_html, bookmarks_as_html};
 use crate::document::html::HtmlDocument;
 use crate::metadata::{Info, FileInfo, ReaderInfo, Annotation, TextAlign, ZoomMode, ScrollMode, ColumnMode, PageScheme};
@@ -89,6 +91,10 @@ pub struct Reader {
     target_annotation: Option<[TextLocation; 2]>,
     history: VecDeque<usize>,
     state: State,
+    highlight_mode: bool,     // A plain stroke across text becomes a highlight.
+    swallow_gesture: bool,    // Eat the gesture the last stroke's Up will emit.
+    stroke_held: bool,        // The stroke sat still long enough to be a hold,
+                              // so no gesture follows it (gesture.rs).
     info: Info,
     current_page: usize,
     pages_count: usize,
@@ -127,6 +133,9 @@ enum State {
     Idle,
     Selection(i32),
     AdjustSelection,
+    /// A highlight-mode stroke in flight: like `Selection`, but it began with
+    /// a plain touch and commits on the finger's release, with no menu.
+    HighlightStroke(i32),
 }
 
 #[derive(Debug)]
@@ -599,6 +608,9 @@ impl Reader {
                 target_annotation: None,
                 history: VecDeque::new(),
                 state: State::Idle,
+                highlight_mode: false,
+                swallow_gesture: false,
+                stroke_held: false,
                 info,
                 current_page,
                 pages_count,
@@ -665,6 +677,9 @@ impl Reader {
             target_annotation: None,
             history: VecDeque::new(),
             state: State::Idle,
+            highlight_mode: false,
+            swallow_gesture: false,
+            stroke_held: false,
             info,
             current_page,
             pages_count,
@@ -2363,6 +2378,19 @@ impl Reader {
                 entries.push(EntryKind::Command("Save".to_string(), EntryId::Save));
             }
 
+            if !self.ephemeral {
+                entries.push(EntryKind::CheckBox("Highlight Mode".to_string(),
+                                                 EntryId::ToggleHighlightMode,
+                                                 self.highlight_mode));
+            }
+
+            // Only Markdown has a source file to point line numbers into.
+            if self.info.file.kind == "md" &&
+               self.info.reader.as_ref().map_or(false, |r| !r.annotations.is_empty()) {
+                entries.push(EntryKind::Command("Export Highlights".to_string(),
+                                                EntryId::ExportHighlights));
+            }
+
             if self.info.reader.as_ref().map_or(false, |r| !r.annotations.is_empty()) {
                 entries.push(EntryKind::Command("Annotations".to_string(), EntryId::Annotations));
             }
@@ -3101,6 +3129,65 @@ impl Reader {
         self.selection.as_ref().and_then(|sel| self.text_excerpt([sel.start, sel.end]))
     }
 
+    /// Commit a highlight over `sel`: the shared tail of the selection menu's
+    /// "Highlight" entry and of a highlight-mode stroke's release.
+    fn add_highlight(&mut self, sel: [TextLocation; 2], rq: &mut RenderQueue) {
+        let Some(text) = self.text_excerpt(sel) else { return };
+        if let Some(r) = self.info.reader.as_mut() {
+            r.annotations.push(Annotation {
+                selection: sel,
+                note: String::new(),
+                text,
+                modified: Local::now().naive_local(),
+            });
+        }
+        if let Some(rect) = self.text_rect(sel) {
+            rq.add(RenderData::new(self.id, rect, UpdateMode::Gui));
+        }
+        self.update_annotations();
+    }
+
+    /// Write this document's highlights into `<library>/highlights/<stem>.md`
+    /// as a grep-style listing pointing at Markdown *source* lines.
+    ///
+    /// Markdown only: the annotations' offsets index the XHTML that
+    /// `markdown::to_html` synthesised, and re-deriving that render from the
+    /// source is what makes them resolvable to lines.  The folder is
+    /// deliberately not `inbox/` — the sweep judges inbox by the Mac's clock
+    /// and this file carries the device's.
+    fn export_highlights(&mut self, hub: &Hub, rq: &mut RenderQueue, context: &mut Context) {
+        let result = (|| -> std::io::Result<String> {
+            let src_path = context.library.home.join(&self.info.file.path);
+            let source = fs::read_to_string(&src_path)?;
+            let stem = src_path.file_stem().and_then(|s| s.to_str()).unwrap_or("document");
+            let (_, map) = markdown::to_html_with_map(&source, Some(stem));
+            let mut spans = self.info.reader.as_ref()
+                .map(|r| r.annotations.iter()
+                          .filter_map(|annot| match annot.selection {
+                              [TextLocation::Dynamic(s), TextLocation::Dynamic(e)] =>
+                                  map.line_range([s, e]),
+                              _ => None,
+                          })
+                          .collect::<Vec<(usize, usize)>>())
+                .unwrap_or_default();
+            spans.sort_unstable();
+            spans.dedup();
+            let name = src_path.file_name().and_then(|s| s.to_str()).unwrap_or("document.md");
+            let body = markdown::format_highlights(name, &source, &spans);
+            let dir = context.library.home.join("highlights");
+            fs::create_dir_all(&dir)?;
+            let out = format!("{}.md", stem);
+            fs::write(dir.join(&out), body)?;
+            Ok(format!("Exported {} highlight(s) to highlights/{}.", spans.len(), out))
+        })();
+        let message = match result {
+            Ok(message) => message,
+            Err(e) => format!("Export failed: {}.", e),
+        };
+        let notif = Notification::new(message, hub, rq, context);
+        self.children.push(Box::new(notif) as Box<dyn View>);
+    }
+
     fn text_rect(&self, sel: [TextLocation; 2]) -> Option<Rectangle> {
         let [start, end] = sel;
         let mut result: Option<Rectangle> = None;
@@ -3262,6 +3349,20 @@ impl Reader {
 
 impl View for Reader {
     fn handle_event(&mut self, evt: &Event, hub: &Hub, _bus: &mut Bus, rq: &mut RenderQueue, context: &mut Context) -> bool {
+        // A committed highlight stroke is followed by the gesture its segment
+        // classified as — the raw finger events are forwarded ahead of gesture
+        // recognition (`gesture.rs`), so it arrives right after our Up.  Eat
+        // exactly that one, or the stroke also turns the page.
+        if self.swallow_gesture {
+            if let Event::Gesture(ref ge) = *evt {
+                self.swallow_gesture = false;
+                if matches!(*ge, GestureEvent::Tap(..) | GestureEvent::Swipe { .. } |
+                                 GestureEvent::SlantedSwipe { .. } | GestureEvent::Arrow { .. } |
+                                 GestureEvent::Corner { .. }) {
+                    return true;
+                }
+            }
+        }
         match *evt {
             Event::Gesture(GestureEvent::Rotate { quarter_turns, .. }) if quarter_turns != 0 => {
                 let (_, dir) = CURRENT_DEVICE.mirroring_scheme();
@@ -3269,6 +3370,15 @@ impl View for Reader {
                 hub.send(Event::Select(EntryId::Rotate(n))).ok();
                 true
             },
+            // In highlight mode a stroke over the page is a highlight attempt,
+            // whatever the recognizer made of it.  Strokes that anchored on a
+            // word were swallowed above; this covers the ones that never found
+            // a word (margins, images), which must not turn the page either.
+            Event::Gesture(GestureEvent::Swipe { start, .. }) |
+            Event::Gesture(GestureEvent::SlantedSwipe { start, .. }) |
+            Event::Gesture(GestureEvent::Arrow { start, .. }) |
+            Event::Gesture(GestureEvent::Corner { start, .. })
+                if self.highlight_mode && self.rect.includes(start) => true,
             Event::Gesture(GestureEvent::Swipe { dir, start, end }) if self.rect.includes(start) => {
                 match self.view_port.zoom_mode {
                     ZoomMode::FitToPage | ZoomMode::FitToWidth => {
@@ -3432,7 +3542,42 @@ impl View for Reader {
                 }
                 true
             },
-            Event::Device(DeviceEvent::Finger { position, status: FingerStatus::Motion, id, .. }) if self.state == State::Selection(id) => {
+            // A touch in highlight mode anchors a stroke on the nearest word;
+            // the Motion arm below then grows it exactly as it grows a
+            // hold-initiated selection, and Up commits it with no menu.
+            Event::Device(DeviceEvent::Finger { position, status: FingerStatus::Down, id, .. })
+                if self.highlight_mode && self.state == State::Idle &&
+                   self.selection.is_none() && self.focus.is_none() &&
+                   self.rect.includes(position) => {
+                let mut found = None;
+                let mut dmin = u32::MAX;
+                let dmax = (scale_by_dpi(RECT_DIST_JITTER, CURRENT_DEVICE.dpi) as i32).pow(2) as u32;
+
+                for chunk in &self.chunks {
+                    for word in &self.text[&chunk.location] {
+                        let rect = (word.rect * chunk.scale).to_rect() - chunk.frame.min + chunk.position;
+                        let d = position.rdist2(&rect);
+                        if d < dmax && d < dmin {
+                            dmin = d;
+                            found = Some((word.location, rect));
+                        }
+                    }
+                }
+
+                if let Some((anchor, rect)) = found {
+                    self.selection = Some(Selection {
+                        start: anchor,
+                        end: anchor,
+                        anchor,
+                    });
+                    self.state = State::HighlightStroke(id);
+                    rq.add(RenderData::new(self.id, rect, UpdateMode::Fast));
+                }
+
+                true
+            },
+            Event::Device(DeviceEvent::Finger { position, status: FingerStatus::Motion, id, .. })
+                if self.state == State::Selection(id) || self.state == State::HighlightStroke(id) => {
                 let mut nearest_word = None;
                 let mut dmin = u32::MAX;
                 let dmax = (scale_by_dpi(RECT_DIST_JITTER, CURRENT_DEVICE.dpi) as i32).pow(2) as u32;
@@ -3529,6 +3674,25 @@ impl View for Reader {
                 self.state = State::Idle;
                 let radius = scale_by_dpi(24.0, CURRENT_DEVICE.dpi) as i32;
                 self.toggle_selection_menu(Rectangle::from_disk(position, radius), Some(true), rq, context);
+                true
+            },
+            Event::Device(DeviceEvent::Finger { status: FingerStatus::Up, id, .. }) if self.state == State::HighlightStroke(id) => {
+                self.state = State::Idle;
+                let mut committed = false;
+                if let Some(sel) = self.selection.take() {
+                    if sel.start != sel.end {
+                        self.add_highlight([sel.start, sel.end], rq);
+                        committed = true;
+                    } else if let Some(rect) = self.text_rect([sel.start, sel.end]) {
+                        // A motionless touch highlights nothing: un-paint the
+                        // anchor word and let the tap stay navigation.
+                        rq.add(RenderData::new(self.id, rect, UpdateMode::Gui));
+                    }
+                }
+                // A held stroke produces no trailing gesture (gesture.rs drops
+                // the segment), so there is nothing to swallow after one.
+                let held = mem::take(&mut self.stroke_held);
+                self.swallow_gesture = committed && !held;
                 true
             },
             Event::Gesture(GestureEvent::Tap(center)) if self.state == State::AdjustSelection && self.rect.includes(center) => {
@@ -3836,6 +4000,15 @@ impl View for Reader {
                 true
             },
             Event::Gesture(GestureEvent::HoldFingerShort(center, id)) if self.rect.includes(center) => {
+                if let State::HighlightStroke(sid) = self.state {
+                    // A stroke that paused long enough to read as a hold: note
+                    // it (no gesture will follow the Up) and keep the stroke.
+                    if sid == id {
+                        self.stroke_held = true;
+                    }
+                    return true;
+                }
+
                 if self.focus.is_some() {
                     return true;
                 }
@@ -4197,6 +4370,26 @@ impl View for Reader {
                 }
                 true
             },
+            Event::Select(EntryId::ToggleHighlightMode) => {
+                self.highlight_mode = !self.highlight_mode;
+                if let Some(rect) = self.selection_rect() {
+                    rq.add(RenderData::new(self.id, rect, UpdateMode::Gui));
+                }
+                self.selection = None;
+                self.state = State::Idle;
+                let message = if self.highlight_mode {
+                    "Highlight mode on — drag across text to highlight."
+                } else {
+                    "Highlight mode off."
+                };
+                let notif = Notification::new(message.to_string(), hub, rq, context);
+                self.children.push(Box::new(notif) as Box<dyn View>);
+                true
+            },
+            Event::Select(EntryId::ExportHighlights) => {
+                self.export_highlights(hub, rq, context);
+                true
+            },
             Event::Select(EntryId::Bookmarks) => {
                 self.toggle_bars(Some(false), hub, rq, context);
                 if let Some(bookmarks) = self.info.reader.as_ref().map(|r| &r.bookmarks) {
@@ -4266,19 +4459,7 @@ impl View for Reader {
             },
             Event::Select(EntryId::HighlightSelection) => {
                 if let Some(sel) = self.selection.take() {
-                    let text = self.text_excerpt([sel.start, sel.end]).unwrap();
-                    if let Some(r) = self.info.reader.as_mut() {
-                        r.annotations.push(Annotation {
-                            selection: [sel.start, sel.end],
-                            note: String::new(),
-                            text,
-                            modified: Local::now().naive_local(),
-                        });
-                    }
-                    if let Some(rect) = self.text_rect([sel.start, sel.end]) {
-                        rq.add(RenderData::new(self.id, rect, UpdateMode::Gui));
-                    }
-                    self.update_annotations();
+                    self.add_highlight([sel.start, sel.end], rq);
                 }
 
                 true

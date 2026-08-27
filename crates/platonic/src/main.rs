@@ -45,7 +45,7 @@ use session::{arp_sweep, probe, resolve_all, Probe, Session};
 
 const USAGE: &str = "\
 usage: platonic [FILE ... | URL] [--to NAME] [--quiet] [--title T] [--open FILE]
-                [--list] [--pair] [--days N] [--host H] [--dry-run]
+                [--list] [--highlights] [--pair] [--days N] [--host H] [--dry-run]
 
 push a document to the Kindle and start reading it (docs/platonic.md)
 
@@ -58,6 +58,8 @@ push a document to the Kindle and start reading it (docs/platonic.md)
   --title T     library title (heading) for text/stdin input
   --open FILE   with several files, the one to open
   --list        what is on the reader, and when inbox items expire
+  --highlights  print the highlight files the reader exported (grep-style,
+                file.md:LINE: snippet) to stdout
   --pair        one-time per Mac: tap Applications > Pair a Mac on the
                 reader, then type the code it shows
   --code C      the code, instead of being prompted for it (with --pair).
@@ -96,6 +98,7 @@ struct Args {
     title: Option<String>,
     open: Option<String>,
     list: bool,
+    highlights: bool,
     pair: bool,
     code: Option<String>,
     days: i64,
@@ -111,6 +114,7 @@ fn parse_args(argv: Vec<String>) -> Args {
         title: None,
         open: None,
         list: false,
+        highlights: false,
         pair: false,
         code: None,
         days: DEFAULT_DAYS,
@@ -151,6 +155,7 @@ fn parse_args(argv: Vec<String>) -> Args {
             "--host" => args.host = Some(value("--host")),
             "--quiet" => args.quiet = true,
             "--list" => args.list = true,
+            "--highlights" => args.highlights = true,
             "--pair" => args.pair = true,
             "--code" => args.code = Some(value("--code")),
             "--dry-run" => args.dry_run = true,
@@ -162,14 +167,14 @@ fn parse_args(argv: Vec<String>) -> Args {
         }
     }
 
-    if args.list && args.pair {
-        arg_error("--list and --pair are mutually exclusive");
+    if (args.list as u8) + (args.highlights as u8) + (args.pair as u8) > 1 {
+        arg_error("--list, --highlights and --pair are mutually exclusive");
     }
-    if (args.list || args.pair) && !args.files.is_empty() {
-        arg_error("--list/--pair take no FILE arguments");
+    if (args.list || args.highlights || args.pair) && !args.files.is_empty() {
+        arg_error("--list/--highlights/--pair take no FILE arguments");
     }
-    if !args.list && !args.pair && args.files.is_empty() {
-        arg_error("nothing to do: give FILEs, '-', --list or --pair");
+    if !args.list && !args.highlights && !args.pair && args.files.is_empty() {
+        arg_error("nothing to do: give FILEs, '-', --list, --highlights or --pair");
     }
     args
 }
@@ -624,6 +629,35 @@ fn cmd_list(ctx: &Ctx, args: &Args, now: f64) {
     }
 }
 
+/// Print the reader's exported highlight files to stdout, nothing else: every
+/// line already names its file and line (`plan.md:42: …`), so headers would
+/// only get in the way of grep and of a redirect into a file.
+fn cmd_highlights(ctx: &Ctx, args: &Args) {
+    let (host, probe) = ctx.discover(&args.host);
+    let sess = ctx.session(&host);
+    let mut link = match open_link(&sess, ctx.transport, &probe,
+                                   ctx.restricted_key()) {
+        Ok(link) => link,
+        Err(e) => die(e),
+    };
+    let files = match link.highlights() {
+        Ok(files) => files,
+        Err(e) => die(format!("could not fetch highlights: {}", e)),
+    };
+    link.finish();
+
+    if files.is_empty() && !sess.dry_run {
+        println!("no highlights on the reader");
+        return;
+    }
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    for file in &files {
+        let _ = out.write_all(&file.data);
+    }
+    let _ = out.flush();
+}
+
 fn main() {
     let args = parse_args(std::env::args().skip(1).collect());
     let now = SystemTime::now().duration_since(UNIX_EPOCH)
@@ -633,6 +667,8 @@ fn main() {
 
     if args.list {
         cmd_list(&ctx, &args, now);
+    } else if args.highlights {
+        cmd_highlights(&ctx, &args);
     } else if args.pair {
         pair::cmd_pair(&ctx, &args);
     } else {

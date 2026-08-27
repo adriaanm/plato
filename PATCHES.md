@@ -1308,3 +1308,84 @@ empty there.
 setting this fork has added (`auto-crop`, `auto-columns`,
 `scroll-overlap-lines`, `mdns-name`): it is an upstream file, and editing it
 only makes a rebase fight.
+
+## Stroke highlights, and getting them back to the Mac with line numbers
+
+Files: `crates/core/src/document/markdown.rs`, `crates/core/src/view/reader/mod.rs`,
+`crates/core/src/view/mod.rs` (two `EntryId`s), `crates/platonic-recv/src/{proto,server}.rs`,
+`crates/platonic/src/{link,main,pure}.rs`.
+
+Markdown pushed off the Mac is *proofread* here, and until now the marks died
+on the device. Three pieces close the loop:
+
+- **Highlight Mode** (title menu, a checkbox): while it is on, a plain
+  one-finger stroke across text becomes a highlight the moment the finger
+  lifts — no hold, no popup, and no page turn. The hold-then-drag selection
+  path is untouched and both feed one `add_highlight()`.
+- **Export Highlights** (title menu, Markdown documents with annotations):
+  writes `highlights/<stem>.md`, a grep-style listing pointing at **source**
+  lines — `plan.md:42: snippet`, or `plan.md:57-61:` over indented lines for a
+  range. Snippets are the source lines themselves, not the rendered excerpt.
+- **`platonic --highlights`**: prints those files to stdout, over a new op in
+  the receiver protocol.
+
+### The offset map (`to_html_with_map`)
+
+Annotations store `TextLocation::Dynamic` values, which are **byte offsets
+into the XHTML `markdown::to_html` synthesises** — nothing anywhere remembers
+a source line. Two facts decided the design:
+
+1. The offsets must keep meaning what they meant: existing annotations index
+   today's exact output, so the mapped render has to be **byte-identical** to
+   the unmapped one. That rules out rendering per event (`push_html` once per
+   event resets the `HtmlWriter`'s newline state and the output drifts).
+   Instead there is one `html::write_html_fmt` pass whose writer is a shared
+   buffer, and a wrapper iterator snapshots `buf.len()` as it yields each
+   event — the writer finishes each event before pulling the next, so that
+   length is where the event's output begins. A test renders both ways and
+   asserts equality; if it ever fails, fix the wrapper, never accept the
+   drifted output.
+2. `pulldown-cmark`'s `into_offset_iter()` gives each event its source byte
+   range, so `(xhtml_offset, md_range)` pairs plus a `line_starts` table make
+   `line_of` two binary searches with an interpolation between them. The map
+   is **not stored**: the render is deterministic, so export re-reads the
+   `.md` and rebuilds it, and offsets recorded by any earlier session line up.
+
+### The stroke, and the gesture that follows it
+
+The gesture pipeline (`gesture.rs`) forwards every raw finger event to views
+*before* recognition, and emits the classified gesture right after `Up` — or
+not at all, when the contact was held (`ts.held`). Those two guarantees carry
+the whole mode: Down anchors on the nearest word (`State::HighlightStroke`),
+the existing Motion arm grows the selection unchanged, Up commits — and then
+sets a one-shot `swallow_gesture` flag so the Swipe/Arrow/Tap the same stroke
+classifies as does not also turn the page. A stroke that read as a hold sets
+`stroke_held` instead, because for it no gesture will come and the flag would
+eat the *next* tap. Strokes that never found a word are covered by a blanket
+arm that eats Swipe/SlantedSwipe/Arrow/Corner inside the page while the mode
+is on; taps stay navigation, which is also how the menu is reached to toggle
+the mode off.
+
+### Why `highlights/`, and why op 9 has no fields
+
+The export lands in `highlights/`, not `inbox/`: the sweep judges inbox
+lifetimes against the **Mac's** clock and this file is stamped by the device,
+whose clock reads 2023 — it would be judged ancient and expired on the next
+push. `Sweep` is hard-wired to `inbox`, so `highlights/` is simply outside its
+reach.
+
+`Op::Highlights = 9` carries **no request fields** — deliberately not a
+generic `Get{folder,file}`. The receiver is root behind a forced command and
+its rule is that no client string reaches a decision; a fieldless op reading
+one compiled-in folder (the `SWEEP_FOLDER` pattern) is strictly narrower than
+a read primitive. File bytes travel under a `u32` length capped at `MAX_FILE`
+(1 MiB) checked before allocation on the read side and at encode time on the
+write side, per the module's no-desync rule. Version skew was already paid
+for: an old receiver answers the unknown byte with `Unsupported` and the Mac's
+`describe()` prints the one-line redeploy hint. The legacy `ShellLink` path
+does it with `cat highlights/*.md` — the format is self-describing, so the
+lost per-file naming costs nothing.
+
+Mergeable upstream? The reader half plausibly (highlight mode and the offset
+map are self-contained, though upstream renders no markdown); the transport
+half no — `platonic` and its receiver are this fork's.

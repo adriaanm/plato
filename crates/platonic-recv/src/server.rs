@@ -34,6 +34,7 @@ pub struct Config {
     pub root: PathBuf,
     pub fifo: PathBuf,
     pub sweep_folder: String,
+    pub highlights_folder: String,
 }
 
 impl Config {
@@ -48,6 +49,7 @@ impl Config {
             root: root.canonicalize()?,
             fifo: fifo.to_path_buf(),
             sweep_folder: SWEEP_FOLDER.to_string(),
+            highlights_folder: HIGHLIGHTS_FOLDER.to_string(),
         })
     }
 }
@@ -122,6 +124,7 @@ impl<R: Read, W: Write> Session<R, W> {
             Request::Sweep { cutoff } => self.sweep(cutoff),
             Request::Quit => Response::Done,
             Request::OpenUrl { url, mtime } => self.open_url(&url, mtime),
+            Request::Highlights => self.highlights(),
         }
     }
 
@@ -366,6 +369,55 @@ impl<R: Read, W: Write> Session<R, W> {
             }
         }
         Response::List(entries)
+    }
+
+    /// Hard-wired to `highlights/`, the folder the reader's "Export
+    /// Highlights" writes: like the sweep's folder, it is not a parameter,
+    /// because no client string may reach a decision made by a root program.
+    fn highlights(&mut self) -> Response {
+        let dir = self.cfg.root.join(&self.cfg.highlights_folder);
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            // No highlights folder is a device nothing was exported on, not
+            // an error -- the same shape as sweeping a device with no inbox.
+            Err(_) => return Response::Highlights(Vec::new()),
+        };
+        let mut files = Vec::new();
+        for entry in entries.flatten() {
+            // file_type does not follow symlinks, so a symlinked file is
+            // skipped rather than read from outside the root.
+            let Ok(ft) = entry.file_type() else { continue };
+            if !ft.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.len() > MAX_LISTED {
+                log(&format!("highlights: name over {} bytes skipped", MAX_LISTED));
+                continue;
+            }
+            match fs::metadata(entry.path()) {
+                Ok(meta) if meta.len() > MAX_FILE as u64 => {
+                    log(&format!("highlights: {} over {} bytes skipped",
+                                 quote_for_log(&name), MAX_FILE));
+                    continue;
+                }
+                Ok(_) => {}
+                Err(_) => continue,
+            }
+            let Ok(data) = fs::read(entry.path()) else { continue };
+            if data.len() > MAX_FILE as usize {
+                // Grew between the metadata check and the read; encoding an
+                // oversized file would end the session, skipping it does not.
+                continue;
+            }
+            files.push(NamedFile { name, data });
+            if files.len() >= MAX_ENTRIES as usize {
+                break;
+            }
+        }
+        files.sort_by(|a, b| a.name.cmp(&b.name));
+        log(&format!("HIGHLIGHTS {} file(s)", files.len()));
+        Response::Highlights(files)
     }
 
     /// Hard-wired to `inbox/`: the folder is not a parameter, because the
@@ -659,6 +711,46 @@ mod tests {
         let resp = converse(scratch.cfg(),
                             vec![(Request::Sweep { cutoff: i64::MAX }, Vec::new())]);
         assert_eq!(resp[0], Response::Swept(Vec::new()));
+    }
+
+    #[test]
+    fn highlights_returns_the_folders_files_sorted_and_byte_exact() {
+        let scratch = Scratch::new("highlights");
+        converse(scratch.cfg(), vec![
+            put("highlights", "plan.md", b"plan.md:2: two\n", 1_700_000_000),
+            put("highlights", "notes.md", b"notes.md:9-10:\n    a\n    b\n", 1_700_000_001),
+            put("inbox", "not-a-highlight.md", b"x", 0),
+        ]);
+        // Not a regular file: must be skipped, not walked.
+        fs::create_dir_all(scratch.0.join("highlights/subdir")).unwrap();
+
+        let resp = converse(scratch.cfg(), vec![(Request::Highlights, Vec::new())]);
+        assert_eq!(resp[0], Response::Highlights(vec![
+            NamedFile { name: "notes.md".into(),
+                        data: b"notes.md:9-10:\n    a\n    b\n".to_vec() },
+            NamedFile { name: "plan.md".into(),
+                        data: b"plan.md:2: two\n".to_vec() },
+        ]));
+    }
+
+    #[test]
+    fn highlights_on_a_device_with_no_exports_is_not_an_error() {
+        let scratch = Scratch::new("no-highlights");
+        let resp = converse(scratch.cfg(), vec![(Request::Highlights, Vec::new())]);
+        assert_eq!(resp[0], Response::Highlights(Vec::new()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_highlight_is_skipped_not_followed() {
+        let scratch = Scratch::new("highlight-link");
+        let elsewhere = Scratch::new("highlight-link-target");
+        fs::create_dir_all(scratch.0.join("highlights")).unwrap();
+        let secret = elsewhere.0.join("secret.md");
+        fs::write(&secret, b"not yours\n").unwrap();
+        std::os::unix::fs::symlink(&secret, scratch.0.join("highlights/leak.md")).unwrap();
+        let resp = converse(scratch.cfg(), vec![(Request::Highlights, Vec::new())]);
+        assert_eq!(resp[0], Response::Highlights(Vec::new()));
     }
 
     #[test]

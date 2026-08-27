@@ -640,6 +640,8 @@ pub enum EntryId {
     DefineSelection,
     SearchForSelection,
     AdjustSelection,
+    ToggleHighlightMode,
+    ExportHighlights,
     Annotations,
     Bookmarks,
     RemoveAnnotation([TextLocation; 2]),

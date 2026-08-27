@@ -68,8 +68,20 @@ pub const FIFO_PATH: &str = "/tmp/plato.cmd";
 /// what decides the lifetime, and a named folder means "keep this".
 pub const SWEEP_FOLDER: &str = "inbox";
 
+/// The one folder HIGHLIGHTS may read.  Not a parameter, for the same reason
+/// [`SWEEP_FOLDER`] is not: no client string reaches a decision made by a root
+/// program, and a request with no fields at all cannot smuggle one.  The
+/// reader's "Export Highlights" writes here — and it is deliberately not
+/// `inbox/`: the sweep judges inbox lifetimes against the Mac's clock, and a
+/// file the device stamped (its clock reads 2023) would be judged ancient.
+pub const HIGHLIGHTS_FOLDER: &str = "highlights";
+
 pub const MAX_COMPONENT: usize = 128;
 pub const MAX_PUT: u32 = 64 * 1024 * 1024;
+/// A file HIGHLIGHTS ships back.  These are grep-style text listings of a
+/// document's highlights, kilobytes in real life; a megabyte is the "someone
+/// put something odd in the folder" ceiling, not a target.
+pub const MAX_FILE: u32 = 1024 * 1024;
 pub const MAX_MESSAGE: usize = 512;
 /// A URL for OPEN_URL.  2 KiB is the customary practical ceiling for a URL a
 /// person shares; anything longer is more likely an attack on the FIFO line
@@ -102,6 +114,12 @@ pub enum Op {
     /// ends the session -- one visible line naming the redeploy, never a
     /// hang, and never a frame misread as another frame.
     OpenUrl = 8,
+    /// "Send back every file in `highlights/`."  The request carries no
+    /// fields: which folder, and that the transfer is read-only, are compiled
+    /// into the receiver, so this is strictly narrower than a general GET
+    /// would be.  An old receiver answers the unknown op byte with
+    /// [`Status::Unsupported`] and the Mac prints the redeploy hint.
+    Highlights = 9,
 }
 
 impl Op {
@@ -114,6 +132,7 @@ impl Op {
             5 => Some(Op::Sweep),
             6 => Some(Op::Quit),
             8 => Some(Op::OpenUrl),
+            9 => Some(Op::Highlights),
             _ => None,
         }
     }
@@ -171,6 +190,9 @@ pub enum Request {
     /// clock, for the same reason PUT's is: the sweep judges inbox lifetimes
     /// against it, and the device's own clock reads 2023.
     OpenUrl { url: String, mtime: i64 },
+    /// Fetch the exported highlight files.  No fields on purpose; see
+    /// [`Op::Highlights`].
+    Highlights,
 }
 
 impl Request {
@@ -183,6 +205,7 @@ impl Request {
             Request::Sweep { .. } => Op::Sweep,
             Request::Quit => Op::Quit,
             Request::OpenUrl { .. } => Op::OpenUrl,
+            Request::Highlights => Op::Highlights,
         }
     }
 }
@@ -195,6 +218,13 @@ pub struct Entry {
     pub mtime: i64,
 }
 
+/// One file HIGHLIGHTS ships back: its name in the folder, and its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedFile {
+    pub name: String,
+    pub data: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
     /// Bytes actually written -- the byte-count verification the shell path
@@ -203,6 +233,7 @@ pub enum Response {
     Done,
     List(Vec<Entry>),
     Swept(Vec<String>),
+    Highlights(Vec<NamedFile>),
     Err { status: Status, message: String },
 }
 
@@ -411,7 +442,7 @@ pub fn write_request(w: &mut impl Write, req: &Request) -> io::Result<()> {
             write_str(w, MAX_URL, url)?;
             write_i64(w, *mtime)?;
         }
-        Request::Import | Request::List | Request::Quit => {}
+        Request::Import | Request::List | Request::Quit | Request::Highlights => {}
     }
     Ok(())
 }
@@ -456,6 +487,7 @@ pub fn read_request(r: &mut impl Read) -> io::Result<Option<Request>> {
             url: read_str(r, MAX_URL)?,
             mtime: read_i64(r)?,
         },
+        Op::Highlights => Request::Highlights,
     };
     Ok(Some(req))
 }
@@ -482,6 +514,19 @@ pub fn write_response(w: &mut impl Write, resp: &Response) -> io::Result<()> {
             write_u32(w, names.len().min(MAX_ENTRIES as usize) as u32)?;
             for n in names.iter().take(MAX_ENTRIES as usize) {
                 write_str(w, MAX_LISTED, n)?;
+            }
+        }
+        Response::Highlights(files) => {
+            write_u8(w, Status::Ok as u8)?;
+            write_u32(w, files.len().min(MAX_ENTRIES as usize) as u32)?;
+            for f in files.iter().take(MAX_ENTRIES as usize) {
+                write_str(w, MAX_LISTED, &f.name)?;
+                if f.data.len() > MAX_FILE as usize {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                                              "file over MAX_FILE"));
+                }
+                write_u32(w, f.data.len() as u32)?;
+                w.write_all(&f.data)?;
             }
         }
         Response::Err { status, message } => {
@@ -540,6 +585,26 @@ pub fn read_response(r: &mut impl Read, op: Op) -> io::Result<Response> {
             }
             Response::Swept(names)
         }
+        Op::Highlights => {
+            let n = read_u32(r)?;
+            if n > MAX_ENTRIES {
+                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                                          "too many entries"));
+            }
+            let mut files = Vec::new();
+            for _ in 0..n {
+                let name = read_str(r, MAX_LISTED)?;
+                let len = read_u32(r)?;
+                if len > MAX_FILE {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData,
+                                              "file over MAX_FILE"));
+                }
+                let mut data = vec![0u8; len as usize];
+                r.read_exact(&mut data)?;
+                files.push(NamedFile { name, data });
+            }
+            Response::Highlights(files)
+        }
     };
     Ok(resp)
 }
@@ -581,6 +646,7 @@ mod tests {
             url: "https://example.com/essay?a=1&b=2#top".into(),
             mtime: 1_786_527_005,
         });
+        roundtrip(Request::Highlights);
     }
 
     #[test]
@@ -620,6 +686,11 @@ mod tests {
                 size: 7, mtime: 1_786_000_000,
             }]),
             Response::Swept(vec!["old.md".into()]),
+            Response::Highlights(vec![
+                NamedFile { name: "plan.md".into(), data: b"plan.md:2: two\n".to_vec() },
+                NamedFile { name: "notes.md".into(), data: Vec::new() },
+            ]),
+            Response::Highlights(Vec::new()),
             Response::Err { status: Status::Invalid, message: "folder: empty".into() },
         ] {
             let op = match &resp {
@@ -627,11 +698,40 @@ mod tests {
                 Response::Done => Op::Import,
                 Response::List(_) => Op::List,
                 Response::Swept(_) => Op::Sweep,
+                Response::Highlights(_) => Op::Highlights,
                 Response::Err { .. } => Op::Put,
             };
             let mut buf = Vec::new();
             write_response(&mut buf, &resp).unwrap();
             assert_eq!(read_response(&mut &buf[..], op).unwrap(), resp);
+        }
+    }
+
+    #[test]
+    fn an_oversized_highlight_file_is_refused_at_both_ends() {
+        // At encode time, so the two ends cannot desync mid-stream...
+        let big = NamedFile { name: "big.md".into(),
+                              data: vec![b'x'; MAX_FILE as usize + 1] };
+        let mut buf = Vec::new();
+        assert!(write_response(&mut buf, &Response::Highlights(vec![big])).is_err());
+        // ...and at decode time, before the length is trusted with an
+        // allocation.
+        let mut buf = vec![Status::Ok as u8];
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&6u16.to_be_bytes()); buf.extend_from_slice(b"big.md");
+        buf.extend_from_slice(&(MAX_FILE + 1).to_be_bytes());
+        assert!(read_response(&mut &buf[..], Op::Highlights).is_err());
+    }
+
+    #[test]
+    fn a_truncated_highlight_body_is_an_error() {
+        let mut buf = Vec::new();
+        write_response(&mut buf, &Response::Highlights(vec![
+            NamedFile { name: "plan.md".into(), data: b"plan.md:1: one\n".to_vec() },
+        ])).unwrap();
+        for cut in 1..buf.len() {
+            assert!(read_response(&mut &buf[..cut], Op::Highlights).is_err(),
+                    "truncation at {} accepted", cut);
         }
     }
 
